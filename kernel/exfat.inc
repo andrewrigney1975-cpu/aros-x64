@@ -396,6 +396,17 @@ exfat_dir_list_next:
     cmp al, 0x85
     jne .skip_entry
 
+    ; Bounds check: see the matching comment in exfat_find_root_file --
+    ; the whole entry set must fit in this cluster before reading its
+    ; Stream Extension/FileName fields.
+    movzx eax, byte [rsi+rdx+1]         ; SecondaryCount
+    mov ecx, eax
+    inc ecx
+    shl ecx, 5
+    add ecx, edx
+    cmp ecx, ebx
+    jg .skip_entry
+
     movzx r9d, byte [rsi+rdx+32+3]      ; NameLength (Stream Ext, offset+3)
     mov rax, [rsi+rdx+32+24]            ; DataLength (Stream Ext, offset+24)
     mov [r11], rax
@@ -1359,9 +1370,24 @@ exfat_find_root_file:
     jne .skip_entry
 
     movzx r8d, byte [rsi+rdi+1]         ; SecondaryCount
+
+    ; Bounds check: the WHOLE entry set (this File entry plus its
+    ; SecondaryCount secondary entries) must fit within this cluster --
+    ; NOT just "edi < ebx" (already implied by the loop-top check, so
+    ; checking it again here was a no-op bug: it never caught the real
+    ; case, a File entry landing near a cluster's end whose Stream
+    ; Extension/FileName entries would be read from one cluster too
+    ; early, silently matching against garbage). Cross-cluster entry
+    ; sets are legal per spec but unsupported here -- skip rather than
+    ; read out of bounds.
+    mov eax, r8d
+    inc eax
+    shl eax, 5
+    add eax, edi
+    cmp eax, ebx
+    jg .skip_entry
+
     lea rdx, [rsi+rdi+32]               ; rdx -> Stream Extension entry
-    cmp edi, ebx                        ; guard: stream ext must still be in-buffer
-    jae .skip_entry
     cmp byte [rdx], 0xC0
     jne .skip_entry
 

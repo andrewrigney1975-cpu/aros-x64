@@ -423,6 +423,141 @@ basix_emit_movq_xmm0_rax:
     mov edx, 5
     jmp basix_emit_bytes
 
+basix_i_movsd_xmm2_xmm0: db 0xF2,0x0F,0x10,0xD0                          ; movsd xmm2,xmm0
+basix_i_movsd_xmm0_xmm2: db 0xF2,0x0F,0x10,0xC2                          ; movsd xmm0,xmm2
+
+basix_emit_movsd_xmm2_xmm0:
+    lea rcx, [rel basix_i_movsd_xmm2_xmm0]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_movsd_xmm0_xmm2:
+    lea rcx, [rel basix_i_movsd_xmm0_xmm2]
+    mov edx, 4
+    jmp basix_emit_bytes
+
+; -------------------------------------------------------------------------
+; basix_emit_fmod: emits code computing XMM0 = fmod(XMM0, XMM1) --
+; XMM0 - XMM1*trunc(XMM0/XMM1) -- since SSE2 has no direct remainder
+; instruction. Clobbers RAX and XMM2 at runtime.
+; -------------------------------------------------------------------------
+basix_emit_fmod:
+    call basix_emit_movsd_xmm2_xmm0     ; xmm2 = a (dividend, saved)
+    call basix_emit_divsd               ; xmm0 = a/b
+    call basix_emit_cvttsd2si_rax_x0    ; rax = trunc(a/b)
+    call basix_emit_cvtsi2sd_x0_rax     ; xmm0 = trunc(a/b) as double
+    call basix_emit_mulsd               ; xmm0 = b*trunc(a/b)
+    call basix_emit_mov_xmm1_xmm0       ; xmm1 = b*trunc(a/b)
+    call basix_emit_movsd_xmm0_xmm2     ; xmm0 = a
+    jmp basix_emit_subsd                ; xmm0 = a - b*trunc(a/b)
+
+; =========================================================================
+; Boolean materialization patterns (AND/OR/NOT and bare-value-as-
+; condition support): every comparison/logical-combination now leaves a
+; plain 0/1 in RAX rather than jumping directly, so AND/OR/NOT compose
+; via ordinary integer AND/OR/XOR -- no short-circuit control flow, no
+; duplicated jump-patch plumbing. IF/WHILE still get a single false-jump
+; patch address, via a final TEST RAX,RAX + JE tacked on top.
+; =========================================================================
+basix_i_test_rax_rax: db 0x48,0x85,0xC0             ; test rax,rax
+basix_i_xor_eax_1:    db 0x83,0xF0,0x01             ; xor eax,1
+basix_i_and_rax_rcx:  db 0x48,0x21,0xC8             ; and rax,rcx
+basix_i_or_rax_rcx:   db 0x48,0x09,0xC8             ; or rax,rcx
+basix_i_movzx_eax_al: db 0x0F,0xB6,0xC0              ; movzx eax,al
+basix_i_pxor_xmm1_xmm1: db 0x66,0x0F,0xEF,0xC9       ; pxor xmm1,xmm1
+basix_i_pxor_xmm0_xmm0: db 0x66,0x0F,0xEF,0xC0       ; pxor xmm0,xmm0
+basix_i_movsd_load_rax_x1: db 0xF2,0x0F,0x10,0x08    ; movsd xmm1,[rax]
+basix_i_sqrtsd: db 0xF2,0x0F,0x51,0xC0               ; sqrtsd xmm0,xmm0
+
+basix_emit_pxor_xmm0_xmm0:
+    lea rcx, [rel basix_i_pxor_xmm0_xmm0]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_movsd_load_rax_x1:
+    lea rcx, [rel basix_i_movsd_load_rax_x1]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_sqrtsd:
+    lea rcx, [rel basix_i_sqrtsd]
+    mov edx, 4
+    jmp basix_emit_bytes
+
+basix_i_sete:  db 0x0F,0x94,0xC0                     ; sete al
+basix_i_setne: db 0x0F,0x95,0xC0                     ; setne al
+basix_i_setl:  db 0x0F,0x9C,0xC0                     ; setl al
+basix_i_setge: db 0x0F,0x9D,0xC0                     ; setge al
+basix_i_setle: db 0x0F,0x9E,0xC0                     ; setle al
+basix_i_setg:  db 0x0F,0x9F,0xC0                     ; setg al
+basix_i_setb:  db 0x0F,0x92,0xC0                     ; setb al
+basix_i_setae: db 0x0F,0x93,0xC0                     ; setae al
+basix_i_setbe: db 0x0F,0x96,0xC0                     ; setbe al
+basix_i_seta:  db 0x0F,0x97,0xC0                     ; seta al
+
+basix_emit_test_rax_rax:
+    lea rcx, [rel basix_i_test_rax_rax]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_xor_eax_1:
+    lea rcx, [rel basix_i_xor_eax_1]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_and_rax_rcx:
+    lea rcx, [rel basix_i_and_rax_rcx]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_or_rax_rcx:
+    lea rcx, [rel basix_i_or_rax_rcx]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_movzx_eax_al:
+    lea rcx, [rel basix_i_movzx_eax_al]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_pxor_xmm1_xmm1:
+    lea rcx, [rel basix_i_pxor_xmm1_xmm1]
+    mov edx, 4
+    jmp basix_emit_bytes
+
+basix_emit_sete:
+    lea rcx, [rel basix_i_sete]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_setne:
+    lea rcx, [rel basix_i_setne]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_setl:
+    lea rcx, [rel basix_i_setl]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_setge:
+    lea rcx, [rel basix_i_setge]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_setle:
+    lea rcx, [rel basix_i_setle]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_setg:
+    lea rcx, [rel basix_i_setg]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_setb:
+    lea rcx, [rel basix_i_setb]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_setae:
+    lea rcx, [rel basix_i_setae]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_setbe:
+    lea rcx, [rel basix_i_setbe]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_seta:
+    lea rcx, [rel basix_i_seta]
+    mov edx, 3
+    jmp basix_emit_bytes
+
 ; =========================================================================
 ; Data
 ; =========================================================================

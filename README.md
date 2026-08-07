@@ -9,7 +9,7 @@ BASIX64: a mixed-case-keyword BASIC-inspired language with `sfloat`,
 `dfloat`, matrices, and 3D/GUI-oriented math, compiled directly to native
 machine code by a compiler running inside the kernel itself.
 
-## Status: Phase 8 — keyboard, shell, and a working BASIX64 compiler (with real sfloat/dfloat math)
+## Status: Phase 9 — BASIX64 language polish and vector/matrix math
 
 This is an as-built log: each phase below is implemented, tested (either via
 the boot-time regression suite or interactively through QEMU), and merged.
@@ -112,6 +112,46 @@ kernel are read back correctly by Windows' own exFAT driver.
   assignment, `sfloat` round-tripping, and float comparisons inside both
   `IF` and `WHILE` all produce correct output.
 
+### Phase 9 — BASIX64 language polish and vector/matrix math
+- **Language polish**: single-line `IF cond THEN stmt (ELSE stmt)?` alongside
+  the block form; `AND`/`OR`/`NOT` (comparisons now materialize a plain 0/1
+  int via `SETcc`+`MOVZX` instead of jumping directly, so boolean combinators
+  compose with ordinary integer bitwise ops -- no short-circuit evaluation,
+  fine since expressions have no side effects; a bare arithmetic expression
+  is also now a valid condition, nonzero = true); `MOD` now works on floats
+  too (`a - b*trunc(a/b)`, SSE2 has no direct remainder instruction); float
+  literals accept an exponent suffix (`1.5e10`); `PRINT` of a float trims
+  trailing fractional zeros (`3.5`, not `3.500000`) while always keeping at
+  least one digit (`3.0`, not bare `3`).
+- **Vector/matrix math** (`VECTOR2`/`VECTOR3`/`VECTOR4`/`MATRIX4`) — a new
+  storage class (`basix_var_wide_slots`, a 128-byte slot per variable
+  alongside the existing 8-byte scalar slot) plus statement-level operations:
+  `VSET`, `VADD`, `VSUB`, `VSCALE`, `VDOT`, `VCROSS` (VECTOR3), `VLEN`,
+  `VNORM`, `MIDENT`, `MMUL`, `MVMUL` (MATRIX4 x VECTOR4). Single-component
+  access (`v[0]`, `v[1]`, ...) is a normal expression, both read and write,
+  since one component is just a double -- but vectors/matrices themselves
+  don't flow through the general expression grammar as first-class values
+  the way int/float do (that would need the type system to carry width and
+  route through memory-resident temporaries everywhere; a bigger redesign
+  deferred for now). Every vector/matrix statement is unrolled entirely at
+  compile time: component indices are always compile-time constants, so
+  "looping over components" is the *parser* looping while compiling, not
+  runtime-generated loop code. Verified with real compiled-and-executed
+  programs: every operation above produces mathematically correct results,
+  including `MIDENT` + `MVMUL` round-tripping a vector through an identity
+  transform and `MMUL` composing two identity matrices.
+- One more real bug found and fixed while testing this phase: a genuine
+  bounds-check bug in `exfat_find_root_file`/`exfat_dir_list_next` (present
+  since phase 4) where a File entry landing near a directory cluster's end
+  could read its Stream Extension/FileName fields from one cluster too
+  early -- the existing guard checked the same already-validated offset
+  instead of whether the *rest of the entry set* still fit, so it never
+  actually caught anything. Fixed, though it's not confirmed to be the root
+  cause of a separate, still-unresolved anomaly where one specific file on
+  the well-worn `exfat_test.vhd` test volume is invisible to lookups despite
+  Windows confirming it exists with correct content -- noted for follow-up,
+  not blocking (a fresh file under a different name works perfectly).
+
 Current boot sequence (verified via serial log and QEMU screendumps):
 GDT/IDT/PIC/timer → paging → PMM/VMM/heap self-tests → AHCI + NVMe device
 bring-up and LBA0 read → exFAT mount (GPT or MBR), file lookup, read-back,
@@ -163,10 +203,20 @@ concern once more of the kernel exists.
 - Keyboard driver: no extended-key (arrow keys, right-Ctrl/Alt) support
   yet — the 0xE0 prefix is recognized and safely discarded.
 - Shell: single-line command input only, no history/tab-completion.
-- BASIX64: no matrices/vectors, no 3D/GUI math, no single-line `IF`, no
-  `AND`/`OR`/`NOT`, no float literal exponent notation, `MOD` is int-only,
-  `FOR` loop control values are always truncated to int, names limited to
-  15 ASCII characters, no nested-FOR beyond 8 levels deep, `PRINT` of a
-  float always shows exactly 6 fractional digits (no trimming, no
-  scientific notation). These are explicitly deferred scope, not
-  oversights.
+- BASIX64: `FOR` loop control values are always truncated to int, names
+  limited to 15 ASCII characters, no nested-FOR beyond 8 levels deep, no
+  float literal scientific-notation *display* (only accepted on input), no
+  general 3D/GUI pipeline (perspective divide, quaternions, transform
+  stacks) beyond the raw vector/matrix primitives. Vector/matrix component
+  indices must be compile-time integer literals (`v[0]`, not `v[i]`);
+  vectors/matrices aren't first-class expression values (no `v3 = v1 + v2`
+  -- see the design note atop `basix_parser.inc`); parenthesizing just one
+  side of a top-level comparison doesn't work (`(x+1) = 5` -- wrap the whole
+  comparison instead, `((x+1) = 5)`). These are explicitly deferred scope
+  or documented parser limitations, not oversights.
+- One unresolved anomaly: a specific file on the long-reused
+  `testdata/exfat_test.vhd` test volume became invisible to the kernel's
+  exFAT lookups despite Windows confirming it existed with correct content;
+  root cause unconfirmed (a related bounds-check bug was found and fixed,
+  but didn't resolve this specific case). Not reproduced under a different
+  filename/fresh write.
