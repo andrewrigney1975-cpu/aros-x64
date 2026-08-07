@@ -2,15 +2,27 @@
 ; Minimal IDT + CPU exception handlers.
 ;
 ; Scope: vectors 0-31 (CPU exceptions) get a real handler that dumps
-; vector/error-code/RIP/CR2 over serial and to the screen, then halts.
-; Vectors 32-255 are left "not present" for now -- until the PIC/timer
-; phase enables external interrupts, nothing should ever fire them, and if
+; vector/error-code/RIP/CR2 over serial and to the screen. Vectors
+; 32-255 are left "not present" for now -- until the PIC/timer phase
+; enables external interrupts, nothing should ever fire them, and if
 ; something unexpectedly does, an unhandled-vector #GP/#NP still goes
 ; through this same diagnostic path instead of a silent hang.
 ;
 ; This exists mainly so every subsystem built after it (exFAT, the
 ; allocator, ...) fails LOUDLY instead of the silent hangs that made the
 ; NVMe driver so painful to debug.
+;
+; What happens after the dump depends on whether the scheduler is armed
+; (current_task != NULL, see sched.inc): if not, there's nothing else to
+; run, so the system halts, same as always. If it IS armed, the fault
+; only takes down the ONE task that caused it -- terminate it (same
+; TCB_STATE flag task_exit uses) and switch to the next task via the
+; exact same sched_pick_next the timer ISR uses, rather than halting
+; the whole system over one task's bug. This works because a fault
+; lands on the faulting task's own kernel stack (IST=0, no alternate
+; exception stack) with a GPR frame this handler builds identically to
+; irq0_stub's, so "switch to a different task's saved RSP and pop+iretq"
+; is exactly as valid here as it is on a normal timer preemption.
 ; =============================================================================
 
 ; -------------------------------------------------------------------------
@@ -141,6 +153,34 @@ isr_common:
 
     mov rcx, rsp                        ; RCX = saved-register block pointer
     call exception_dump
+
+    mov rax, [rel current_task]
+    test rax, rax
+    jz .hang                            ; scheduler not armed -- nothing to switch to
+
+    mov dword [rax+TCB_STATE], TCB_STATE_TERMINATED
+    mov [rax+TCB_RSP], rsp              ; save the faulting frame (never resumed,
+                                         ; but sched_pick_next only reads TCB_NEXT)
+    call sched_pick_next                ; rax=outgoing (unchanged); rcx=next
+    mov [rel current_task], rcx
+    mov rsp, [rcx+TCB_RSP]              ; switch to the surviving task's stack
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
 
 .hang:
     cli
