@@ -471,6 +471,73 @@ entry:
     call serial_puts
 .crtest_done:
 
+    ; Verify exfat_write_file: create a new file spanning more than one
+    ; cluster (exercises FAT chain writing on the data itself, not just
+    ; the bitmap/FAT tests above), then read it back and confirm the
+    ; content round-trips. Idempotent across reboots of the same VHD.
+    lea rcx, [rel exfat_wtest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .wftest_verify
+
+    lea rdi, [rel exfat_wtest_src]
+    xor ecx, ecx
+.wftest_fill:
+    cmp ecx, 6000
+    jge .wftest_fill_done
+    mov eax, ecx
+    and eax, 0xFF
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .wftest_fill
+.wftest_fill_done:
+
+    lea rcx, [rel exfat_wtest_name]
+    lea r8, [rel exfat_wtest_src]
+    mov r9, 6000
+    call exfat_write_file
+    test eax, eax
+    jz .wftest_bad
+
+    lea rcx, [rel exfat_wtest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .wftest_bad
+
+.wftest_verify:
+    cmp qword [rel exfat_find_result+8], 6000
+    jne .wftest_bad
+
+    mov ecx, [rel exfat_find_result+0]   ; FirstCluster
+    mov rdx, [rel exfat_find_result+8]   ; DataLength
+    lea r8, [rel exfat_wtest_read]
+    mov r9d, [rel exfat_find_result+16]  ; NoFatChain
+    call exfat_read_file
+    test eax, eax
+    jz .wftest_bad
+
+    lea rsi, [rel exfat_wtest_read]
+    xor ecx, ecx
+.wftest_cmp:
+    cmp ecx, 6000
+    jge .wftest_ok
+    mov al, [rsi+rcx]
+    mov ah, cl
+    cmp al, ah
+    jne .wftest_bad
+    inc ecx
+    jmp .wftest_cmp
+.wftest_ok:
+    lea rcx, [rel msg_wftest_ok]
+    call serial_puts
+    jmp .wftest_done
+.wftest_bad:
+    lea rcx, [rel msg_wftest_bad]
+    call serial_puts
+.wftest_done:
+
     ; Bring up the scheduler: the current flow becomes the "main" task
     ; (its TCB.rsp gets filled in on its own first save -- it doesn't need
     ; a hand-built frame like task_create produces, since it's already
@@ -1084,6 +1151,9 @@ msg_ctest_bad:        db 'exFAT: FAT chain link/follow/free round-trip FAILED', 
 msg_crtest_ok:        db 'exFAT: directory entry creation OK', 13, 10, 0
 msg_crtest_bad:       db 'exFAT: directory entry creation FAILED', 13, 10, 0
 exfat_crtest_name:    db 'CRTEST.TXT', 0
+msg_wftest_ok:        db 'exFAT: exfat_write_file multi-cluster round-trip OK', 13, 10, 0
+msg_wftest_bad:       db 'exFAT: exfat_write_file multi-cluster round-trip FAILED', 13, 10, 0
+exfat_wtest_name:     db 'WFTEST.TXT', 0
 msg_sched_ok:         db 'Scheduler: armed (main + 2 test tasks)', 13, 10, 0
 msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
 msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0
@@ -1101,6 +1171,8 @@ exfat_find_result: times 24 db 0
 
 align 4096
 exfat_test_buf: times 8192 db 0
+exfat_wtest_src:  times 6000 db 0
+exfat_wtest_read: times 6000 db 0
 
 msg_hello:            db 'Hello, kernal!', 13, 10, 0
 msg_ahci_not_found:   db 'AHCI: no controller found', 13, 10, 0

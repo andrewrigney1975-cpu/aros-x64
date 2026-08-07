@@ -831,14 +831,15 @@ exfat_dir_find_slot:
     ret
 
 ; -------------------------------------------------------------------------
-; exfat_create_file: RCX = ptr to a NUL-terminated ASCII filename, <=15
-; characters (one FileName entry's worth -- longer names are future work,
-; as is anything beyond ASCII). Creates an empty (FirstCluster=0,
-; DataLength=0) File/StreamExtension/FileName entry set in the root
-; directory; timestamps are left zeroed (also future work). Returns
-; EAX=1/0.
+; exfat_dir_write_entry_set: RCX = ptr to a NUL-terminated ASCII filename,
+; <=15 characters (one FileName entry's worth -- longer names are future
+; work, as is anything beyond ASCII); EDX = FirstCluster; R8 = DataLength
+; (qword, also used as ValidDataLength); R9B = Stream Extension
+; GeneralSecondaryFlags (bit0 AllocationPossible, bit1 NoFatChain).
+; Builds and writes a File/StreamExtension/FileName entry set in the root
+; directory. Timestamps are left zeroed (future work). Returns EAX=1/0.
 ; -------------------------------------------------------------------------
-exfat_create_file:
+exfat_dir_write_entry_set:
     push rbx
     push rcx
     push rdx
@@ -847,19 +848,26 @@ exfat_create_file:
     push r8
     push r9
     push r10
+    push r11
+    push r12
+    push r13
+    push r14
 
     mov r10, rcx                        ; r10 = name ptr
+    mov r11d, edx                       ; r11d = FirstCluster
+    mov r12, r8                         ; r12 = DataLength
+    mov r13b, r9b                       ; r13b = GeneralSecondaryFlags
 
-    xor r9d, r9d
+    xor r14d, r14d
 .namelen:
-    cmp byte [r10+r9], 0
+    cmp byte [r10+r14], 0
     je .namelen_done
-    inc r9d
-    cmp r9d, 15
+    inc r14d
+    cmp r14d, 15
     ja .fail
     jmp .namelen
 .namelen_done:
-    test r9d, r9d
+    test r14d, r14d
     jz .fail
 
     mov ecx, 3                          ; File + StreamExt + 1 FileName entry
@@ -884,8 +892,11 @@ exfat_create_file:
     mov word [rsi+4], 0x0020            ; FileAttributes: ARCHIVE
 
     mov byte [rsi+32], 0xC0             ; Stream Extension EntryType
-    mov byte [rsi+33], 0x01             ; GeneralSecondaryFlags: AllocationPossible
-    mov byte [rsi+35], r9b              ; NameLength
+    mov [rsi+33], r13b                  ; GeneralSecondaryFlags
+    mov [rsi+35], r14b                  ; NameLength
+    mov [rsi+40], r12                   ; ValidDataLength
+    mov [rsi+52], r11d                  ; FirstCluster
+    mov [rsi+56], r12                   ; DataLength
 
     mov rcx, r10
     call exfat_name_hash
@@ -895,7 +906,7 @@ exfat_create_file:
 
     xor ecx, ecx
 .copy_name:
-    cmp ecx, r9d
+    cmp ecx, r14d
     jge .name_copied
     movzx eax, byte [r10+rcx]
     mov [rsi+66+rcx*2], ax
@@ -922,6 +933,10 @@ exfat_create_file:
 .fail:
     xor eax, eax
 .out:
+    pop r14
+    pop r13
+    pop r12
+    pop r11
     pop r10
     pop r9
     pop r8
@@ -930,6 +945,171 @@ exfat_create_file:
     pop rdx
     pop rcx
     pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_create_file: RCX = ptr to a NUL-terminated ASCII filename, <=15
+; characters. Creates an empty (FirstCluster=0, DataLength=0) file entry
+; in the root directory. Returns EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_create_file:
+    push rdx
+    push r8
+    push r9
+
+    xor edx, edx                        ; FirstCluster = 0
+    xor r8, r8                          ; DataLength = 0
+    mov r9b, 0x01                       ; AllocationPossible=1, NoFatChain=0
+    call exfat_dir_write_entry_set
+
+    pop r9
+    pop r8
+    pop rdx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_write_file: RCX = ptr to a NUL-terminated ASCII filename (<=15
+; chars), R8 = ptr to source data, R9 = data length in bytes. Creates a
+; NEW file -- fails if the name already exists in the root directory (v1
+; has no overwrite/append support). Allocates and FAT-chains enough
+; clusters to hold the data (always via a real FAT chain -- NoFatChain is
+; never set, so allocation need not be contiguous), writes the data, and
+; writes the file's directory entry with the real FirstCluster/
+; DataLength. Returns EAX=1/0; on failure partway through, any clusters
+; already allocated are freed and the chain is left with no entry
+; pointing at it, so nothing is left dangling that a later free-space
+; scan couldn't reclaim on a fresh exfat_alloc_cluster pass regardless.
+; -------------------------------------------------------------------------
+exfat_write_file:
+    push rbp
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r10, rcx                        ; r10 = name ptr
+    mov r11, r8                         ; r11 = source data ptr (advances)
+    mov r12, r9                         ; r12 = remaining bytes
+    mov rbp, r9                         ; rbp = original total length (for the dir entry)
+    xor r13d, r13d                      ; r13d = first_cluster (0 until set)
+    xor r14d, r14d                      ; r14d = previous cluster in chain (0 until set)
+
+    mov rcx, r10
+    lea r8, [rel exfat_wf_scratch]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .fail                           ; already exists -- v1 has no overwrite support
+
+    test r12, r12
+    jz .data_done                       ; zero-length file: no clusters needed
+
+.alloc_loop:
+    test r12, r12
+    jz .data_done
+
+    call exfat_alloc_cluster
+    test eax, eax
+    jz .fail
+    mov ebx, eax                        ; ebx = this iteration's new cluster
+
+    test r13d, r13d
+    jnz .link
+    mov r13d, ebx
+    jmp .after_link
+.link:
+    mov ecx, r14d
+    mov edx, ebx
+    call exfat_fat_set_entry
+    test eax, eax
+    jz .fail
+.after_link:
+    mov r14d, ebx
+
+    mov eax, [rel exfat_sectors_per_cluster]
+    imul eax, [rel exfat_bytes_per_sector]
+    mov r9d, eax                        ; r9d = cluster size, bytes
+
+    cmp r12, r9
+    jbe .copylen_ok
+    mov r15, r9
+    jmp .copylen_set
+.copylen_ok:
+    mov r15, r12
+.copylen_set:
+    lea rdi, [rel exfat_write_buf]
+    mov rsi, r11
+    mov rcx, r15
+    cld
+    rep movsb                           ; copies r15 bytes; rdi/rsi advance
+
+    mov rax, r9
+    sub rax, r15                        ; rax = zero-pad length (0 for a full cluster)
+    jz .no_pad
+    mov rcx, rax
+    xor eax, eax
+    cld
+    rep stosb                           ; rdi already positioned past the copied data
+.no_pad:
+
+    mov ecx, ebx
+    call exfat_cluster_to_lba
+    mov rcx, rax
+    mov edx, [rel exfat_sectors_per_cluster]
+    lea r8, [rel exfat_write_buf]
+    call storage_write_sectors
+    test eax, eax
+    jz .fail
+
+    add r11, r15
+    sub r12, r15
+    jmp .alloc_loop
+
+.data_done:
+    test r13d, r13d
+    jz .write_entry                     ; zero-length file: no chain to terminate
+    mov ecx, r14d
+    mov edx, 0xFFFFFFFF
+    call exfat_fat_set_entry
+    test eax, eax
+    jz .fail
+
+.write_entry:
+    mov rcx, r10
+    mov edx, r13d
+    mov r8, rbp                         ; DataLength = original total length
+    mov r9b, 0x01                       ; AllocationPossible=1, NoFatChain=0
+    call exfat_dir_write_entry_set
+    test eax, eax
+    jz .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rbp
     ret
 
 ; -------------------------------------------------------------------------
@@ -1219,3 +1399,7 @@ exfat_gpt_buf:        times 512 db 0
 align 4096
 exfat_dir_buf:    times 4096 db 0
 exfat_bitmap_buf: times 4096 db 0
+exfat_write_buf:  times 4096 db 0
+
+align 8
+exfat_wf_scratch: times 24 db 0
