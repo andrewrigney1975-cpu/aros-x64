@@ -572,6 +572,344 @@ entry:
     call serial_puts
 .wftest_done:
 
+    ; Verify long-filename support (exfat_lntest_name is 40 characters --
+    ; well past the old 15-char/one-FileName-entry cap, exercising the
+    ; multi-FileName-entry write path). Idempotent across reboots.
+    lea rcx, [rel exfat_lntest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .lntest_verify
+
+    lea rcx, [rel exfat_lntest_name]
+    lea r8, [rel exfat_lntest_content]
+    mov r9, exfat_lntest_content_len
+    call exfat_write_file
+    test eax, eax
+    jz .lntest_bad
+
+    lea rcx, [rel exfat_lntest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .lntest_bad
+
+.lntest_verify:
+    cmp qword [rel exfat_find_result+8], exfat_lntest_content_len
+    jne .lntest_bad
+
+    mov ecx, [rel exfat_find_result+0]
+    mov rdx, [rel exfat_find_result+8]
+    lea r8, [rel exfat_lntest_read]
+    mov r9d, [rel exfat_find_result+16]
+    call exfat_read_file
+    test eax, eax
+    jz .lntest_bad
+
+    lea rsi, [rel exfat_lntest_read]
+    lea rdi, [rel exfat_lntest_content]
+    xor ecx, ecx
+.lntest_cmp:
+    cmp ecx, exfat_lntest_content_len
+    jge .lntest_ok
+    mov al, [rsi+rcx]
+    cmp al, [rdi+rcx]
+    jne .lntest_bad
+    inc ecx
+    jmp .lntest_cmp
+.lntest_ok:
+    lea rcx, [rel msg_lntest_ok]
+    call serial_puts
+    jmp .lntest_done
+.lntest_bad:
+    lea rcx, [rel msg_lntest_bad]
+    call serial_puts
+.lntest_done:
+
+    ; Verify exfat_delete_file: create a temp file, confirm it exists,
+    ; delete it, confirm it's gone. Naturally idempotent across reboots
+    ; -- the file never survives a successful run, so "create" always
+    ; starts fresh next time.
+    lea rcx, [rel exfat_deltest_name]
+    call exfat_create_file
+    test eax, eax
+    jz .deltest_bad
+
+    lea rcx, [rel exfat_deltest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .deltest_bad
+
+    lea rcx, [rel exfat_deltest_name]
+    call exfat_delete_file
+    test eax, eax
+    jz .deltest_bad
+
+    lea rcx, [rel exfat_deltest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .deltest_bad             ; must be gone now
+
+    lea rcx, [rel msg_deltest_ok]
+    call serial_puts
+    jmp .deltest_done
+.deltest_bad:
+    lea rcx, [rel msg_deltest_bad]
+    call serial_puts
+.deltest_done:
+
+    ; Verify exfat_rename_file: write a file under one name, rename it,
+    ; confirm the new name has the same content and the old name is
+    ; gone. Idempotent: if the destination already exists (a prior boot
+    ; already renamed it), skip straight to verification.
+    lea rcx, [rel exfat_rentest_dst]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .rentest_verify
+
+    lea rcx, [rel exfat_rentest_src]
+    lea r8, [rel exfat_rentest_content]
+    mov r9, exfat_rentest_content_len
+    call exfat_write_file
+    test eax, eax
+    jz .rentest_bad
+
+    lea rcx, [rel exfat_rentest_src]
+    lea rdx, [rel exfat_rentest_dst]
+    call exfat_rename_file
+    test eax, eax
+    jz .rentest_bad
+
+.rentest_verify:
+    lea rcx, [rel exfat_rentest_src]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .rentest_bad             ; old name must be gone
+
+    lea rcx, [rel exfat_rentest_dst]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .rentest_bad
+    cmp qword [rel exfat_find_result+8], exfat_rentest_content_len
+    jne .rentest_bad
+
+    mov ecx, [rel exfat_find_result+0]
+    mov rdx, [rel exfat_find_result+8]
+    lea r8, [rel exfat_rentest_read]
+    mov r9d, [rel exfat_find_result+16]
+    call exfat_read_file
+    test eax, eax
+    jz .rentest_bad
+
+    lea rsi, [rel exfat_rentest_read]
+    lea rdi, [rel exfat_rentest_content]
+    xor ecx, ecx
+.rentest_cmp:
+    cmp ecx, exfat_rentest_content_len
+    jge .rentest_ok
+    mov al, [rsi+rcx]
+    cmp al, [rdi+rcx]
+    jne .rentest_bad
+    inc ecx
+    jmp .rentest_cmp
+.rentest_ok:
+    lea rcx, [rel msg_rentest_ok]
+    call serial_puts
+    jmp .rentest_done
+.rentest_bad:
+    lea rcx, [rel msg_rentest_bad]
+    call serial_puts
+.rentest_done:
+
+    ; Verify exfat_truncate_file: write a multi-cluster file, truncate
+    ; it down to a short prefix, confirm the length and content match.
+    ; Idempotent, and tolerant of a prior run that got interrupted
+    ; between creating the file and truncating it (e.g. a build that
+    ; failed mid-development): the file already having the truncated
+    ; (short) length skips straight to verification, and the file
+    ; existing at some OTHER length just means "still needs truncating"
+    ; rather than "something is wrong" -- only a genuinely fresh name
+    ; needs the initial full-size write.
+    lea rcx, [rel exfat_trunctest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .trunctest_create
+    cmp qword [rel exfat_find_result+8], EXFAT_TRUNCTEST_SHORT_LEN
+    je .trunctest_verify
+    jmp .trunctest_do_truncate
+.trunctest_create:
+    lea rdi, [rel exfat_trunctest_src]
+    xor ecx, ecx
+.trunctest_fill:
+    cmp ecx, 5000
+    jge .trunctest_fill_done
+    mov eax, ecx
+    and eax, 0xFF
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .trunctest_fill
+.trunctest_fill_done:
+
+    lea rcx, [rel exfat_trunctest_name]
+    lea r8, [rel exfat_trunctest_src]
+    mov r9, 5000
+    call exfat_write_file
+    test eax, eax
+    jz .trunctest_bad
+
+.trunctest_do_truncate:
+    lea rcx, [rel exfat_trunctest_name]
+    mov rdx, EXFAT_TRUNCTEST_SHORT_LEN
+    call exfat_truncate_file
+    test eax, eax
+    jz .trunctest_bad
+
+.trunctest_verify:
+    lea rcx, [rel exfat_trunctest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .trunctest_bad
+    cmp qword [rel exfat_find_result+8], EXFAT_TRUNCTEST_SHORT_LEN
+    jne .trunctest_bad
+
+    mov ecx, [rel exfat_find_result+0]
+    mov rdx, [rel exfat_find_result+8]
+    lea r8, [rel exfat_trunctest_read]
+    mov r9d, [rel exfat_find_result+16]
+    call exfat_read_file
+    test eax, eax
+    jz .trunctest_bad
+
+    lea rsi, [rel exfat_trunctest_read]
+    xor ecx, ecx
+.trunctest_cmp:
+    cmp ecx, EXFAT_TRUNCTEST_SHORT_LEN
+    jge .trunctest_ok
+    mov al, [rsi+rcx]
+    mov ah, cl
+    cmp al, ah
+    jne .trunctest_bad
+    inc ecx
+    jmp .trunctest_cmp
+.trunctest_ok:
+    lea rcx, [rel msg_trunctest_ok]
+    call serial_puts
+    jmp .trunctest_done
+.trunctest_bad:
+    lea rcx, [rel msg_trunctest_bad]
+    call serial_puts
+.trunctest_done:
+
+    ; Verify exfat_append_file: write a file, append more data spanning
+    ; new clusters, confirm the combined content round-trips. Idempotent,
+    ; and tolerant of a prior run that got interrupted between the
+    ; initial write and the append (a name that exists but isn't yet at
+    ; the full post-append length just means "still needs appending to",
+    ; not "something is wrong").
+    lea rcx, [rel exfat_apptest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .apptest_create
+    cmp qword [rel exfat_find_result+8], EXFAT_APPTEST_TOTAL_LEN
+    je .apptest_verify
+    jmp .apptest_fill2
+.apptest_create:
+    lea rdi, [rel exfat_apptest_part1]
+    xor ecx, ecx
+.apptest_fill1:
+    cmp ecx, EXFAT_APPTEST_PART1_LEN
+    jge .apptest_fill1_done
+    mov eax, ecx
+    and eax, 0xFF
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .apptest_fill1
+.apptest_fill1_done:
+
+    lea rcx, [rel exfat_apptest_name]
+    lea r8, [rel exfat_apptest_part1]
+    mov r9, EXFAT_APPTEST_PART1_LEN
+    call exfat_write_file
+    test eax, eax
+    jz .apptest_bad
+
+.apptest_fill2:
+    lea rdi, [rel exfat_apptest_part2]
+    xor ecx, ecx
+.apptest_fill2_loop:
+    cmp ecx, EXFAT_APPTEST_PART2_LEN
+    jge .apptest_fill2_done
+    mov eax, ecx
+    add eax, 77
+    and eax, 0xFF
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .apptest_fill2_loop
+.apptest_fill2_done:
+
+    lea rcx, [rel exfat_apptest_name]
+    lea r8, [rel exfat_apptest_part2]
+    mov r9, EXFAT_APPTEST_PART2_LEN
+    call exfat_append_file
+    test eax, eax
+    jz .apptest_bad
+
+.apptest_verify:
+    lea rcx, [rel exfat_apptest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .apptest_bad
+    cmp qword [rel exfat_find_result+8], EXFAT_APPTEST_TOTAL_LEN
+    jne .apptest_bad
+
+    mov ecx, [rel exfat_find_result+0]
+    mov rdx, [rel exfat_find_result+8]
+    lea r8, [rel exfat_apptest_read]
+    mov r9d, [rel exfat_find_result+16]
+    call exfat_read_file
+    test eax, eax
+    jz .apptest_bad
+
+    lea rsi, [rel exfat_apptest_read]
+    xor ecx, ecx
+.apptest_cmp:
+    cmp ecx, EXFAT_APPTEST_TOTAL_LEN
+    jge .apptest_ok
+    cmp ecx, EXFAT_APPTEST_PART1_LEN
+    jl .apptest_cmp_part1
+    mov eax, ecx
+    sub eax, EXFAT_APPTEST_PART1_LEN
+    add eax, 77
+    and eax, 0xFF
+    jmp .apptest_cmp_have_expected
+.apptest_cmp_part1:
+    mov eax, ecx
+    and eax, 0xFF
+.apptest_cmp_have_expected:
+    mov ah, al
+    mov al, [rsi+rcx]
+    cmp al, ah
+    jne .apptest_bad
+    inc ecx
+    jmp .apptest_cmp
+.apptest_ok:
+    lea rcx, [rel msg_apptest_ok]
+    call serial_puts
+    jmp .apptest_done
+.apptest_bad:
+    lea rcx, [rel msg_apptest_bad]
+    call serial_puts
+.apptest_done:
+
     ; Bring up the scheduler: the current flow becomes the "main" task
     ; (its TCB.rsp gets filled in on its own first save -- it doesn't need
     ; a hand-built frame like task_create produces, since it's already
@@ -586,7 +924,9 @@ entry:
     jz .sched_bad
     mov r15, rax                        ; r15 = main task's TCB
     mov qword [r15+TCB_RSP], 0
-    mov qword [r15+TCB_STACK], 0
+    mov qword [r15+TCB_CR3], 0          ; no private paging -- runs under
+                                         ; the shared global pml4
+    mov qword [r15+TCB_STACK_PAGES], 0
     mov dword [r15+TCB_STATE], TCB_STATE_ALIVE
 
     mov rcx, test_task_a
@@ -838,13 +1178,27 @@ test_task_crash:
 
 ; -------------------------------------------------------------------------
 ; test_task_overflow: canary-guard demo/regression task. Bumps its counter
-; like the others, then deliberately blows its own stack -- 2200 qword
-; pushes (17600 bytes) against a 16384-byte (2048-qword) allocation, with
-; no matching pops, guaranteed to sink RSP past the canary at the stack's
-; lowest address. Nothing pops it back afterward, so this task never
-; touches its (now invalid) stack again; the very next time sched_pick_next
-; considers it as an outgoing task, the corrupted canary gets caught and
-; it's marked terminated exactly like the crash task.
+; like the others, then deliberately blows its own stack -- exactly 2048
+; qword pushes (16384 bytes) against a 16384-byte (2048-qword)
+; allocation, with no matching pops, landing the last push's write
+; exactly on the canary at the stack's lowest address.
+;
+; The push count is exact, not "comfortably past the canary": each
+; task's private stack (see sched.inc's TASK_STACK_VIRT_BASE) is now
+; individually page-mapped with unmapped guard space immediately below
+; it, not a single kmalloc'd block sitting inside the middle of a larger
+; heap page. Overflowing further than the canary itself would walk off
+; the mapped pages entirely and take a hardware #PF instead of being
+; caught softly by the software canary check this test exists to prove
+; -- a real, if narrower, hardening property of the new design, just
+; not what THIS demo is testing.
+;
+; RSP is restored to a safe position (the stack's top) right after --
+; the canary byte itself stays corrupted (nothing un-writes it, only
+; the pointer moves), but leaving RSP sitting at the very bottom would
+; make the NEXT timer interrupt's own GPR-save push the thing that
+; walks off the mapped pages, before the scheduler ever gets a chance
+; to notice and terminate this task via the software check.
 ; -------------------------------------------------------------------------
 test_task_overflow:
 .loop:
@@ -855,16 +1209,16 @@ test_task_overflow:
     jnz .delay
     cmp qword [rel test_task_overflow_counter], 3
     jl .loop
-    mov rcx, 2200
+    mov rcx, 2048
 .blow:
     push rax
     dec rcx
     jnz .blow
+    add rsp, 2048*8                     ; restore a safe RSP -- the
+                                         ; canary byte is still clobbered
 .hang:
-    hlt                                 ; RSP is wrecked by now; stop here
-    jmp .hang                           ; (rather than looping back and
-                                         ; blowing it again every pass) and
-                                         ; wait to be switched away from --
+    hlt
+    jmp .hang                           ; wait to be switched away from --
                                          ; the canary check ends this task
                                          ; for good on the next context switch
 
@@ -1136,6 +1490,10 @@ fb_clear:
 ; -------------------------------------------------------------------------
 ; fb_draw_char: draw one glyph from font8x16. ECX=column, EDX=row (in 8x16
 ; character cells), R8B=ASCII code. Characters outside 32..126 render blank.
+; Paints both the glyph's set pixels (white) AND its clear ones (black),
+; not just the set ones -- this is what makes it safe to redraw a cell
+; that previously held a *different*, wider/taller-stroked character (the
+; shell's line editor depends on this for backspace/delete/insert redraws).
 ; -------------------------------------------------------------------------
 fb_draw_char:
     push rax
@@ -1167,8 +1525,6 @@ fb_draw_char:
     movzx r12d, byte [rsi + r11]        ; scanline bits, bit7 = leftmost pixel
     mov ecx, 8
 .col_loop:
-    test r12d, 0x80
-    jz .skip_pixel
     mov eax, 8
     sub eax, ecx
     add eax, r9d                        ; eax = x
@@ -1179,8 +1535,13 @@ fb_draw_char:
     shl rdx, 2                          ; * 4 bytes/pixel
     mov rdi, [rbx+FB_BASE]
     add rdi, rdx
+    test r12d, 0x80
+    jz .clear_pixel
     mov dword [rdi], 0xFFFFFFFF         ; white; channel order doesn't matter
-.skip_pixel:
+    jmp .col_next
+.clear_pixel:
+    mov dword [rdi], 0                  ; black -- erases whatever was here before
+.col_next:
     shl r12d, 1
     dec ecx
     jnz .col_loop
@@ -1396,6 +1757,7 @@ console_puts:
 ; =============================================================================
 SHELL_LINE_MAX equ 120
 SHELL_TYPE_BUF_MAX equ 8191             ; exfat_test_buf is 8192 bytes; -1 for NUL
+SHELL_HISTORY_MAX equ 8                 ; recalled via Up/Down, see shell_history_recall
 
 ; -------------------------------------------------------------------------
 ; shell_streq: RCX/RDX = two NUL-terminated ASCII strings. Returns
@@ -1425,16 +1787,422 @@ shell_streq:
     ret
 
 ; -------------------------------------------------------------------------
+; shell_cursor_to: repositions the console's logical cursor (console_col/
+; console_row) to a given index within the line being edited, WITHOUT
+; drawing anything -- used after Left/Right/Home/End and after a redraw
+; already left the video cursor somewhere else. R8D=target index (0..line
+; length), R9D=the line's starting column, R10D=the line's starting row.
+; Does not account for the line wrapping past the bottom of the screen
+; and triggering a scroll mid-edit -- acceptable for SHELL_LINE_MAX (120)
+; against any reasonable console width/height, not a general terminal.
+; -------------------------------------------------------------------------
+shell_cursor_to:
+    push rax
+    push rcx
+    push rdx
+
+    mov eax, r9d
+    add eax, r8d                        ; eax = start_col + index
+    xor edx, edx
+    div dword [rel console_cols]        ; eax = row delta, edx = column
+    add eax, r10d
+    mov [rel console_row], eax
+    mov [rel console_col], edx
+
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_redraw_range: draws shell_line_buf[R8D..R9D-1] via console_putc
+; (so it naturally advances/wraps/scrolls like ordinary typing), then
+; R10D additional trailing spaces (to erase stale characters left behind
+; by a delete/backspace that shortened the line). Does not touch the
+; cursor position afterward -- the caller repositions via shell_cursor_to.
+; -------------------------------------------------------------------------
+shell_redraw_range:
+    push rax
+    push rcx
+    push rsi
+    push rdi
+
+    lea rdi, [rel shell_line_buf]
+    mov esi, r8d
+.chars:
+    cmp esi, r9d
+    jge .trailing
+    movzx eax, byte [rdi+rsi]
+    call console_putc
+    inc esi
+    jmp .chars
+.trailing:
+    mov ecx, r10d
+    test ecx, ecx
+    jz .done
+.spaces:
+    mov al, ' '
+    call console_putc
+    dec ecx
+    jnz .spaces
+.done:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_line_insert: inserts AL at cursor index R12D into shell_line_buf,
+; growing ECX (length) and R12D (cursor) by one, and redraws the (now
+; shifted) tail of the line. R13D/R14D = the line's starting column/row
+; (for repositioning the cursor afterward).
+; -------------------------------------------------------------------------
+shell_line_insert:
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    lea rdi, [rel shell_line_buf]
+    mov r9d, eax                        ; r9d = the character (AL survives calls below)
+    mov esi, ecx                        ; esi = old length, shifting down to r12d
+.shift:
+    cmp esi, r12d
+    je .place
+    dec esi
+    mov dl, [rdi+rsi]
+    mov [rdi+rsi+1], dl
+    jmp .shift
+.place:
+    mov [rdi+r12], r9b
+    inc ecx
+
+    mov r8d, r12d
+    mov r9d, ecx
+    xor r10d, r10d
+    call shell_redraw_range
+
+    inc r12d
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_line_delete_before: removes the character immediately before
+; cursor index R12D (backspace). Shrinks ECX/R12D and redraws the tail
+; plus one trailing space. No-op if R12D==0 (caller already checks, but
+; safe either way).
+; -------------------------------------------------------------------------
+shell_line_delete_before:
+    test r12d, r12d
+    jz .out
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    lea rdi, [rel shell_line_buf]
+    dec r12d
+    mov r9d, ecx
+    dec r9d                             ; r9d = old length - 1 (exclusive bound)
+    mov esi, r12d
+.shift:
+    cmp esi, r9d
+    jge .shifted
+    mov dl, [rdi+rsi+1]
+    mov [rdi+rsi], dl
+    inc esi
+    jmp .shift
+.shifted:
+    dec ecx
+
+    ; the video cursor is still wherever it was before this backspace (the
+    ; PRE-decrement position) -- reposition to the new cursor index first,
+    ; or the redraw below draws one column too far right instead of over
+    ; the character that needs erasing.
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+
+    mov r8d, r12d
+    mov r9d, ecx
+    mov r10d, 1
+    call shell_redraw_range
+
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
+.out:
+    ret
+
+; -------------------------------------------------------------------------
+; shell_line_delete_at: removes the character AT cursor index R12D
+; (forward delete / the Delete key). Shrinks ECX (cursor stays put) and
+; redraws the tail plus one trailing space. No-op if R12D>=ECX.
+; -------------------------------------------------------------------------
+shell_line_delete_at:
+    cmp r12d, ecx
+    jge .out
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    lea rdi, [rel shell_line_buf]
+    mov r9d, ecx
+    dec r9d                             ; r9d = old length - 1 (exclusive bound)
+    mov esi, r12d
+.shift:
+    cmp esi, r9d
+    jge .shifted
+    mov dl, [rdi+rsi+1]
+    mov [rdi+rsi], dl
+    inc esi
+    jmp .shift
+.shifted:
+    dec ecx
+
+    ; cursor index doesn't change for a forward delete, but reposition
+    ; the video cursor explicitly anyway rather than relying on it
+    ; already being in sync -- cheap, and matches delete_before's fix.
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+
+    mov r8d, r12d
+    mov r9d, ecx
+    mov r10d, 1
+    call shell_redraw_range
+
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
+.out:
+    ret
+
+; -------------------------------------------------------------------------
+; shell_history_push: RCX = pointer to a NUL-terminated line just entered.
+; Appends it to shell_history's ring buffer unless it's empty. Overwrites
+; the oldest entry once the ring is full.
+; -------------------------------------------------------------------------
+shell_history_push:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    cmp byte [rcx], 0
+    je .out                             ; don't clutter history with blank lines
+
+    mov eax, [rel shell_history_write]
+    mov edx, eax
+    imul edx, SHELL_LINE_MAX
+    lea rdi, [rel shell_history]
+    add rdi, rdx                        ; rdi = this slot
+    mov rsi, rcx
+.copy:
+    mov dl, [rsi]
+    mov [rdi], dl
+    test dl, dl
+    jz .copied
+    inc rsi
+    inc rdi
+    jmp .copy
+.copied:
+    inc eax
+    cmp eax, SHELL_HISTORY_MAX
+    jl .no_wrap
+    xor eax, eax
+.no_wrap:
+    mov [rel shell_history_write], eax
+
+    mov eax, [rel shell_history_count]
+    cmp eax, SHELL_HISTORY_MAX
+    jge .out
+    inc eax
+    mov [rel shell_history_count], eax
+.out:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_history_recall: R8D = +1 (Up: older) or -1 (Down: newer). Loads a
+; history entry into shell_line_buf, replacing the current in-progress
+; line, and redraws it. In/out via ECX (length), R12D (cursor), R15D
+; (browse depth: 0 = editing a fresh line, N>0 = showing the Nth-most-
+; recent history entry); R13D/R14D = the line's starting column/row.
+; -------------------------------------------------------------------------
+shell_history_recall:
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    push r9
+    push r10
+    push r11
+
+    mov r11d, [rel shell_history_count]
+    test r11d, r11d
+    jz .out                             ; no history at all -- nothing to do
+
+    cmp r8d, 0
+    jg .up
+    ; Down: browsing off the oldest edge just clears back to an empty line.
+    test r15d, r15d
+    jz .out                             ; not browsing -- nothing to come back to
+    dec r15d
+    jmp .load
+.up:
+    cmp r15d, r11d
+    jge .out                            ; already at the oldest entry
+    inc r15d
+
+.load:
+    ; blank out whatever's on screen for the current content first
+    mov eax, ecx
+    xor ecx, ecx
+    xor r12d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    push r8
+    mov r8d, 0
+    call shell_cursor_to
+    pop r8
+
+    test r15d, r15d
+    jnz .load_entry
+    ; back to an empty, fresh line
+    lea rdi, [rel shell_line_buf]
+    mov byte [rdi], 0
+    jmp .redraw
+
+.load_entry:
+    ; slot = (write_index - browse_depth + MAX) mod MAX, i.e. the r15d-th
+    ; most recently written entry
+    mov edx, [rel shell_history_write]
+    sub edx, r15d
+    add edx, SHELL_HISTORY_MAX
+    xor eax, eax
+.mod:
+    cmp edx, SHELL_HISTORY_MAX
+    jl .have_slot
+    sub edx, SHELL_HISTORY_MAX
+    jmp .mod
+.have_slot:
+    imul edx, SHELL_LINE_MAX
+    lea rsi, [rel shell_history]
+    add rsi, rdx
+    lea rdi, [rel shell_line_buf]
+.copy:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .redraw
+    inc rsi
+    inc rdi
+    jmp .copy
+
+.redraw:
+    lea rdi, [rel shell_line_buf]
+    xor esi, esi
+.len:
+    cmp byte [rdi+rsi], 0
+    je .have_len
+    inc esi
+    jmp .len
+.have_len:
+    mov ecx, esi                        ; ecx = new length
+    mov r12d, ecx                       ; cursor lands at end, like a real shell
+
+    mov r8d, 0
+    mov r9d, ecx
+    xor r10d, r10d
+    call shell_redraw_range
+
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+
+.out:
+    pop r11
+    pop r10
+    pop r9
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
 ; shell_read_line: reads keys into shell_line_buf (NUL-terminated, up to
-; SHELL_LINE_MAX-1 chars), echoing each to the console and honoring
-; backspace, until Enter.
+; SHELL_LINE_MAX-1 chars), echoing each to the console, until Enter.
+; Supports mid-line editing (Left/Right/Home/End/Delete/Backspace, with a
+; real insert-at-cursor rather than append-only) and command-history
+; recall (Up/Down) via shell_history.
 ; -------------------------------------------------------------------------
 shell_read_line:
     push rax
     push rcx
     push rdi
+    push r8
+    push r9
+    push r10
+    push r12
+    push r13
+    push r14
+    push r15
 
-    xor ecx, ecx
+    xor ecx, ecx                        ; ecx = line length
+    xor r12d, r12d                      ; r12d = cursor index
+    xor r15d, r15d                      ; r15d = history browse depth
+    mov r13d, [rel console_col]         ; r13d = this line's starting column
+    mov r14d, [rel console_row]         ; r14d = this line's starting row
     lea rdi, [rel shell_line_buf]
 .loop:
     call kbd_read_char
@@ -1442,22 +2210,91 @@ shell_read_line:
     je .enter
     cmp al, 8
     je .backspace
+    cmp al, KBD_KEY_DELETE
+    je .fwd_delete
+    cmp al, KBD_KEY_LEFT
+    je .move_left
+    cmp al, KBD_KEY_RIGHT
+    je .move_right
+    cmp al, KBD_KEY_HOME
+    je .move_home
+    cmp al, KBD_KEY_END
+    je .move_end
+    cmp al, KBD_KEY_UP
+    je .hist_up
+    cmp al, KBD_KEY_DOWN
+    je .hist_down
+    cmp al, ' '
+    jb .loop                            ; other control bytes: ignore
+    cmp al, 0x7E
+    ja .loop                            ; DEL (0x7F) and virtual key codes: ignore
     cmp ecx, SHELL_LINE_MAX-1
     jge .loop                           ; line full -- drop the character
-    mov [rdi+rcx], al
-    inc ecx
-    call console_putc
+    call shell_line_insert
     jmp .loop
 .backspace:
-    test ecx, ecx
+    call shell_line_delete_before
+    jmp .loop
+.fwd_delete:
+    call shell_line_delete_at
+    jmp .loop
+.move_left:
+    test r12d, r12d
     jz .loop
-    dec ecx
-    call console_putc
+    dec r12d
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+    jmp .loop
+.move_right:
+    cmp r12d, ecx
+    jge .loop
+    inc r12d
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+    jmp .loop
+.move_home:
+    xor r12d, r12d
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+    jmp .loop
+.move_end:
+    mov r12d, ecx
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+    jmp .loop
+.hist_up:
+    mov r8d, 1
+    call shell_history_recall
+    jmp .loop
+.hist_down:
+    mov r8d, -1
+    call shell_history_recall
     jmp .loop
 .enter:
     mov byte [rdi+rcx], 0
+    mov r8d, ecx
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
     mov al, 13
     call console_putc
+    lea rcx, [rel shell_line_buf]
+    call shell_history_push
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rcx
     pop rax
@@ -1554,6 +2391,30 @@ shell_dispatch:
     call shell_streq
     test eax, eax
     jnz .do_run
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_del]
+    call shell_streq
+    test eax, eax
+    jnz .do_del
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_rename]
+    call shell_streq
+    test eax, eax
+    jnz .do_rename
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_append]
+    call shell_streq
+    test eax, eax
+    jnz .do_append
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_truncate]
+    call shell_streq
+    test eax, eax
+    jnz .do_truncate
 
     lea rcx, [rel msg_shell_unknown]
     call console_puts
@@ -1769,6 +2630,222 @@ shell_dispatch:
     call console_puts
     jmp .out
 
+.do_del:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.del_copy:
+    mov al, [rsi]
+    test al, al
+    jz .del_arg_done
+    cmp al, ' '
+    je .del_arg_done
+    cmp ecx, 63
+    jge .del_arg_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .del_copy
+.del_arg_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .del_usage
+
+    lea rcx, [rel shell_arg_buf]
+    call exfat_delete_file
+    test eax, eax
+    jz .del_fail
+
+    lea rcx, [rel msg_shell_del_ok]
+    call console_puts
+    jmp .out
+.del_usage:
+    lea rcx, [rel msg_shell_del_usage]
+    call console_puts
+    jmp .out
+.del_fail:
+    lea rcx, [rel msg_shell_del_fail]
+    call console_puts
+    jmp .out
+
+.do_rename:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.rename_copy1:
+    mov al, [rsi]
+    test al, al
+    jz .rename_arg1_done
+    cmp al, ' '
+    je .rename_arg1_done
+    cmp ecx, 63
+    jge .rename_arg1_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .rename_copy1
+.rename_arg1_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .rename_usage
+
+.rename_skip_sp:
+    cmp byte [rsi], ' '
+    jne .rename_copy2_start
+    inc rsi
+    jmp .rename_skip_sp
+.rename_copy2_start:
+    lea rdi, [rel shell_arg_buf2]
+    xor ecx, ecx
+.rename_copy2:
+    mov al, [rsi]
+    test al, al
+    jz .rename_arg2_done
+    cmp al, ' '
+    je .rename_arg2_done
+    cmp ecx, 63
+    jge .rename_arg2_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .rename_copy2
+.rename_arg2_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .rename_usage
+
+    lea rcx, [rel shell_arg_buf]
+    lea rdx, [rel shell_arg_buf2]
+    call exfat_rename_file
+    test eax, eax
+    jz .rename_fail
+
+    lea rcx, [rel msg_shell_rename_ok]
+    call console_puts
+    jmp .out
+.rename_usage:
+    lea rcx, [rel msg_shell_rename_usage]
+    call console_puts
+    jmp .out
+.rename_fail:
+    lea rcx, [rel msg_shell_rename_fail]
+    call console_puts
+    jmp .out
+
+.do_append:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.append_name_copy:
+    mov al, [rsi]
+    test al, al
+    jz .append_name_done
+    cmp al, ' '
+    je .append_name_done
+    cmp ecx, 63
+    jge .append_name_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .append_name_copy
+.append_name_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .append_usage
+
+.append_skip_sp:
+    cmp byte [rsi], ' '
+    jne .append_have_content
+    inc rsi
+    jmp .append_skip_sp
+.append_have_content:
+    mov r10, rsi                        ; r10 = content ptr
+    xor r11d, r11d                      ; r11d = content length
+.append_len:
+    cmp byte [r10+r11], 0
+    je .append_len_done
+    inc r11d
+    jmp .append_len
+.append_len_done:
+
+    lea rcx, [rel shell_arg_buf]
+    mov r8, r10
+    mov r9, r11
+    call exfat_append_file
+    test eax, eax
+    jz .append_fail
+
+    lea rcx, [rel msg_shell_append_ok]
+    call console_puts
+    jmp .out
+.append_usage:
+    lea rcx, [rel msg_shell_append_usage]
+    call console_puts
+    jmp .out
+.append_fail:
+    lea rcx, [rel msg_shell_append_fail]
+    call console_puts
+    jmp .out
+
+.do_truncate:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.truncate_name_copy:
+    mov al, [rsi]
+    test al, al
+    jz .truncate_name_done
+    cmp al, ' '
+    je .truncate_name_done
+    cmp ecx, 63
+    jge .truncate_name_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .truncate_name_copy
+.truncate_name_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .truncate_usage
+
+.truncate_skip_sp:
+    cmp byte [rsi], ' '
+    jne .truncate_parse_num
+    inc rsi
+    jmp .truncate_skip_sp
+.truncate_parse_num:
+    cmp byte [rsi], 0
+    je .truncate_usage
+    xor rdx, rdx                        ; rdx = parsed size
+.truncate_num_loop:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .truncate_num_done
+    cmp al, '0'
+    jb .truncate_usage
+    cmp al, '9'
+    ja .truncate_usage
+    sub al, '0'
+    movzx eax, al
+    imul rdx, rdx, 10
+    add rdx, rax
+    inc rsi
+    jmp .truncate_num_loop
+.truncate_num_done:
+
+    lea rcx, [rel shell_arg_buf]
+    call exfat_truncate_file
+    test eax, eax
+    jz .truncate_fail
+
+    lea rcx, [rel msg_shell_truncate_ok]
+    call console_puts
+    jmp .out
+.truncate_usage:
+    lea rcx, [rel msg_shell_truncate_usage]
+    call console_puts
+    jmp .out
+.truncate_fail:
+    lea rcx, [rel msg_shell_truncate_fail]
+    call console_puts
+    jmp .out
+
 .out:
     pop r11
     pop r10
@@ -1930,6 +3007,35 @@ exfat_crtest_name:    db 'CRTEST.TXT', 0
 msg_wftest_ok:        db 'exFAT: exfat_write_file multi-cluster round-trip OK', 13, 10, 0
 msg_wftest_bad:       db 'exFAT: exfat_write_file multi-cluster round-trip FAILED', 13, 10, 0
 exfat_wtest_name:     db 'WFTEST.TXT', 0
+msg_lntest_ok:        db 'exFAT: long filename (multi-FileName-entry) round-trip OK', 13, 10, 0
+msg_lntest_bad:       db 'exFAT: long filename (multi-FileName-entry) round-trip FAILED', 13, 10, 0
+exfat_lntest_name:    db 'THIS_IS_A_LONG_FILENAME_OVER_15_CHARS.TXT', 0
+exfat_lntest_content: db 'long filename round-trip test payload'
+exfat_lntest_content_len equ $ - exfat_lntest_content
+
+msg_deltest_ok:       db 'exFAT: exfat_delete_file round-trip OK', 13, 10, 0
+msg_deltest_bad:      db 'exFAT: exfat_delete_file round-trip FAILED', 13, 10, 0
+exfat_deltest_name:   db 'DELTEST.TXT', 0
+
+msg_rentest_ok:       db 'exFAT: exfat_rename_file round-trip OK', 13, 10, 0
+msg_rentest_bad:      db 'exFAT: exfat_rename_file round-trip FAILED', 13, 10, 0
+exfat_rentest_src:    db 'RENSRC.TXT', 0
+exfat_rentest_dst:    db 'RENDST.TXT', 0
+exfat_rentest_content: db 'rename round-trip test payload'
+exfat_rentest_content_len equ $ - exfat_rentest_content
+
+msg_trunctest_ok:     db 'exFAT: exfat_truncate_file round-trip OK', 13, 10, 0
+msg_trunctest_bad:    db 'exFAT: exfat_truncate_file round-trip FAILED', 13, 10, 0
+exfat_trunctest_name: db 'TRUNCTS2.TXT', 0
+EXFAT_TRUNCTEST_SHORT_LEN equ 137
+
+msg_apptest_ok:       db 'exFAT: exfat_append_file round-trip OK', 13, 10, 0
+msg_apptest_bad:      db 'exFAT: exfat_append_file round-trip FAILED', 13, 10, 0
+exfat_apptest_name:   db 'APPTEST2.TXT', 0
+EXFAT_APPTEST_PART1_LEN equ 3000
+EXFAT_APPTEST_PART2_LEN equ 5000
+EXFAT_APPTEST_TOTAL_LEN equ EXFAT_APPTEST_PART1_LEN + EXFAT_APPTEST_PART2_LEN
+
 msg_sched_ok:         db 'Scheduler: armed (main + 5 test tasks)', 13, 10, 0
 msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
 msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0
@@ -1948,12 +3054,19 @@ exfat_test_name:      db 'TEST.TXT', 0
 exfat_marker:         db 'END-OF-FILE-MARKER'
 
 align 8
-exfat_find_result: times 24 db 0
+exfat_find_result: times 32 db 0
 
 align 4096
 exfat_test_buf: times 8192 db 0
 exfat_wtest_src:  times 6000 db 0
 exfat_wtest_read: times 6000 db 0
+exfat_lntest_read: times 64 db 0
+exfat_rentest_read: times 64 db 0
+exfat_trunctest_src:  times 5000 db 0
+exfat_trunctest_read: times EXFAT_TRUNCTEST_SHORT_LEN db 0
+exfat_apptest_part1: times EXFAT_APPTEST_PART1_LEN db 0
+exfat_apptest_part2: times EXFAT_APPTEST_PART2_LEN db 0
+exfat_apptest_read:  times EXFAT_APPTEST_TOTAL_LEN db 0
 
 console_col:  dd 0
 console_row:  dd 0
@@ -1966,10 +3079,15 @@ shell_str_clear: db 'clear', 0
 shell_str_type:  db 'type', 0
 shell_str_write: db 'write', 0
 shell_str_run:   db 'run', 0
+shell_str_del:      db 'del', 0
+shell_str_rename:   db 'rename', 0
+shell_str_append:   db 'append', 0
+shell_str_truncate: db 'truncate', 0
 
 msg_shell_banner:      db 'arOS-X64 shell. Type HELP for commands.', 13, 10, 0
 msg_shell_prompt:      db '] ', 0
-msg_shell_help:        db 'Commands: HELP  DIR  TYPE <file>  WRITE <file> <text>  RUN <file.bas>  CLEAR', 13, 10, 0
+msg_shell_help:        db 'Commands: HELP  DIR  TYPE <file>  WRITE <file> <text>  APPEND <file> <text>', 13, 10
+                       db '  DEL <file>  RENAME <old> <new>  TRUNCATE <file> <size>  RUN <file.bas>  CLEAR', 13, 10, 0
 msg_shell_unknown:     db 'Unknown command. Type HELP for a list.', 13, 10, 0
 msg_shell_nl:          db 13, 10, 0
 msg_shell_type_usage:  db 'Usage: TYPE <filename>', 13, 10, 0
@@ -1981,10 +3099,26 @@ msg_shell_write_ok:    db 'File written.', 13, 10, 0
 msg_shell_write_fail:  db 'Write failed (name may already exist).', 13, 10, 0
 msg_shell_run_usage:       db 'Usage: RUN <filename.bas>', 13, 10, 0
 msg_shell_run_compilefail: db 'BASIX64 compile error.', 13, 10, 0
+msg_shell_del_usage:  db 'Usage: DEL <filename>', 13, 10, 0
+msg_shell_del_ok:     db 'File deleted.', 13, 10, 0
+msg_shell_del_fail:   db 'Delete failed (file may not exist).', 13, 10, 0
+msg_shell_rename_usage: db 'Usage: RENAME <oldname> <newname>', 13, 10, 0
+msg_shell_rename_ok:    db 'File renamed.', 13, 10, 0
+msg_shell_rename_fail:  db 'Rename failed (old name missing or new name already exists).', 13, 10, 0
+msg_shell_append_usage: db 'Usage: APPEND <filename> <text>', 13, 10, 0
+msg_shell_append_ok:    db 'Appended.', 13, 10, 0
+msg_shell_append_fail:  db 'Append failed (file may not exist).', 13, 10, 0
+msg_shell_truncate_usage: db 'Usage: TRUNCATE <filename> <newsize>', 13, 10, 0
+msg_shell_truncate_ok:    db 'File truncated.', 13, 10, 0
+msg_shell_truncate_fail:  db 'Truncate failed (file may not exist, or newsize > current size).', 13, 10, 0
 
 shell_line_buf:     times SHELL_LINE_MAX db 0
+shell_history:      times (SHELL_HISTORY_MAX * SHELL_LINE_MAX) db 0
+shell_history_count: dd 0
+shell_history_write: dd 0
 shell_cmd_buf:      times 16 db 0
 shell_arg_buf:       times 64 db 0
+shell_arg_buf2:      times 64 db 0
 shell_dir_name_buf: times 256 db 0
 shell_dir_datalen:  dq 0
 

@@ -157,6 +157,73 @@ vmm_map_page:
     ret
 
 ; -------------------------------------------------------------------------
+; vmm_map_page_at: RCX = virtual address, RDX = physical address (both
+; 4KB-aligned), R8 = physical address of the PML4 to map into (instead
+; of always using the global `pml4` -- this is what lets each task have
+; its own page tables while sharing the same vmm_next_level walk logic).
+; Builds any missing PDPT/PD/PT levels and installs a present|writable
+; leaf entry. Returns EAX=1/0.
+; -------------------------------------------------------------------------
+vmm_map_page_at:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    mov rsi, rcx                        ; rsi = virtual address
+    mov rbx, rdx                        ; rbx = physical address
+
+    mov rax, rsi
+    shr rax, 39
+    and eax, 0x1FF
+    mov rdi, r8                         ; rdi = this task's PML4
+    call vmm_next_level
+    test rax, rax
+    jz .fail
+    mov rdi, rax
+
+    mov rax, rsi
+    shr rax, 30
+    and eax, 0x1FF
+    call vmm_next_level
+    test rax, rax
+    jz .fail
+    mov rdi, rax
+
+    mov rax, rsi
+    shr rax, 21
+    and eax, 0x1FF
+    call vmm_next_level
+    test rax, rax
+    jz .fail
+    mov rdi, rax
+
+    mov rax, rsi
+    shr rax, 12
+    and eax, 0x1FF
+    mov rcx, rax
+    shl rcx, 3
+    add rdi, rcx                        ; rdi = &pt[index]
+    mov rax, rbx
+    or rax, 0x03                        ; present | writable
+    mov [rdi], rax
+
+    invlpg [rsi]
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
 ; vmm_translate: RCX = virtual address. Returns RAX = the physical address
 ; it's mapped to, or 0 if unmapped.
 ; -------------------------------------------------------------------------
@@ -168,6 +235,64 @@ vmm_translate:
     mov rsi, rcx
 
     lea rdi, [rel pml4]
+    mov rax, rsi
+    shr rax, 39
+    and eax, 0x1FF
+    call vmm_find_level
+    test rax, rax
+    jz .out
+    mov rdi, rax
+
+    mov rax, rsi
+    shr rax, 30
+    and eax, 0x1FF
+    call vmm_find_level
+    test rax, rax
+    jz .out
+    mov rdi, rax
+
+    mov rax, rsi
+    shr rax, 21
+    and eax, 0x1FF
+    call vmm_find_level
+    test rax, rax
+    jz .out
+    mov rdi, rax
+
+    mov rax, rsi
+    shr rax, 12
+    and eax, 0x1FF
+    mov rcx, rax
+    shl rcx, 3
+    add rdi, rcx
+    mov rax, [rdi]
+    test rax, 1
+    jz .not_present
+    and rax, 0xFFFFFFFFFFFFF000
+    jmp .out
+.not_present:
+    xor eax, eax
+.out:
+    pop rcx
+    pop rsi
+    pop rdi
+    ret
+
+; -------------------------------------------------------------------------
+; vmm_translate_at: RCX = virtual address, R8 = physical address of the
+; PML4 to translate against (instead of the global `pml4`) -- used to
+; find a task's own private physical stack pages when reaping it (see
+; sched_reap_zombies), since only that task's own page tables know
+; where they are. Returns RAX = physical address, or 0 if unmapped.
+; -------------------------------------------------------------------------
+vmm_translate_at:
+    push rdi
+    push rsi
+    push rcx
+
+    mov rsi, rcx
+
+    mov rdi, r8
     mov rax, rsi
     shr rax, 39
     and eax, 0x1FF

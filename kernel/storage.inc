@@ -42,4 +42,22 @@ storage_write_sectors:
 .use_ahci:
     jmp ahci_write_sectors
 
+; -------------------------------------------------------------------------
+; storage_sector_size: returns EAX = the active driver's native sector
+; size in bytes (as reported by IDENTIFY), or 0 if no driver is active.
+; -------------------------------------------------------------------------
+storage_sector_size:
+    cmp dword [rel storage_active_driver], STORAGE_NVME
+    je .use_nvme
+    cmp dword [rel storage_active_driver], STORAGE_AHCI
+    je .use_ahci
+    xor eax, eax
+    ret
+.use_nvme:
+    mov eax, [rel nvme_sector_size]
+    ret
+.use_ahci:
+    mov eax, [rel ahci_sector_size]
+    ret
+
 storage_active_driver: dd STORAGE_NONE

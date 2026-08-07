@@ -76,8 +76,8 @@ exfat_mount:
     test eax, eax
     jz .try_mbr
 
+    call storage_sector_size             ; eax = the device's native sector size
     xor edx, edx
-    mov eax, 512
     mov ecx, [rel exfat_gpt_entry_size]
     test ecx, ecx
     jz .try_mbr
@@ -177,17 +177,36 @@ exfat_mount:
     mov [rel exfat_root_dir_cluster], eax
 
     movzx ecx, byte [rsi+108]           ; BytesPerSectorShift
+    mov [rel exfat_sector_shift], cl
     mov eax, 1
     shl eax, cl
     mov [rel exfat_bytes_per_sector], eax
+    dec eax
+    mov [rel exfat_sector_mask], eax    ; bytes_per_sector - 1
 
     movzx ecx, byte [rsi+109]           ; SectorsPerClusterShift
     mov eax, 1
     shl eax, cl
     mov [rel exfat_sectors_per_cluster], eax
 
+    ; Every LBA/count this file computes for storage_read_sectors/
+    ; storage_write_sectors is expressed in units of exFAT sectors
+    ; (BytesPerSectorShift), but those calls hand that number straight to
+    ; the device driver, which interprets it in units of the device's own
+    ; native sector size. That's only correct if the two actually match --
+    ; true for every real volume/device combination seen so far (Windows'
+    ; own exFAT formatter always matches the device's reported logical
+    ; sector size), but silently wrong data corruption is a much worse
+    ; failure mode than refusing to mount, so check it explicitly.
+    call storage_sector_size
+    cmp eax, [rel exfat_bytes_per_sector]
+    jne .sector_size_mismatch
+
     mov eax, 1
     jmp .out
+.sector_size_mismatch:
+    lea rcx, [rel msg_exfat_sector_mismatch]
+    call serial_puts
 .fail:
     xor eax, eax
 .out:
@@ -247,12 +266,16 @@ exfat_fat_next_cluster:
     push r8
 
     mov ebx, ecx                        ; ebx = cluster
-    ; byte offset within the FAT = cluster*4; sector = FatOffset + offset/512
+    ; byte offset within the FAT = cluster*4; sector = FatOffset +
+    ; offset/bytes_per_sector (the volume's own sector size, not a
+    ; hardcoded 512 -- see the mount-time check in exfat_mount for why
+    ; that's also required to equal the device's native sector size)
     mov eax, ebx
     shl eax, 2
     mov edx, eax
-    shr edx, 9                          ; edx = sector index within the FAT
-    and eax, 0x1FF                      ; eax = byte offset within that sector
+    movzx ecx, byte [rel exfat_sector_shift]
+    shr edx, cl                         ; edx = sector index within the FAT
+    and eax, [rel exfat_sector_mask]    ; eax = byte offset within that sector
 
     push rax                            ; save in-sector byte offset
     mov ecx, [rel exfat_fat_offset]
@@ -296,8 +319,9 @@ exfat_fat_set_entry:
     mov eax, ebx
     shl eax, 2
     mov edx, eax
-    shr edx, 9                          ; edx = sector index within the FAT
-    and eax, 0x1FF                      ; eax = byte offset within that sector
+    movzx ecx, byte [rel exfat_sector_shift]
+    shr edx, cl                         ; edx = sector index within the FAT
+    and eax, [rel exfat_sector_mask]    ; eax = byte offset within that sector
     mov esi, eax                        ; esi = in-sector byte offset
 
     mov ecx, [rel exfat_fat_offset]
@@ -965,17 +989,21 @@ exfat_dir_find_slot:
     pop rcx
     ret
 
+EXFAT_MAX_NAME_LEN equ 64               ; matches shell_arg_buf's own cap
+
 ; -------------------------------------------------------------------------
 ; exfat_dir_write_entry_set: RCX = ptr to a NUL-terminated ASCII filename,
-; <=15 characters (one FileName entry's worth -- longer names are future
-; work, as is anything beyond ASCII); EDX = FirstCluster; R8 = DataLength
-; (qword, also used as ValidDataLength); R9B = Stream Extension
-; GeneralSecondaryFlags (bit0 AllocationPossible, bit1 NoFatChain).
-; Builds and writes a File/StreamExtension/FileName entry set in the root
-; directory. Timestamps are left zeroed (future work). Returns EAX=1/0.
+; <= EXFAT_MAX_NAME_LEN characters (ASCII only -- full Unicode is future
+; work); EDX = FirstCluster; R8 = DataLength (qword, also used as
+; ValidDataLength); R9B = Stream Extension GeneralSecondaryFlags (bit0
+; AllocationPossible, bit1 NoFatChain). Builds and writes a File/
+; StreamExtension/FileName... entry set (one FileName entry per 15
+; characters of the name, per spec) in the root directory. Timestamps
+; are left zeroed (future work). Returns EAX=1/0.
 ; -------------------------------------------------------------------------
 exfat_dir_write_entry_set:
     push rbx
+    push rbp
     push rcx
     push rdx
     push rsi
@@ -987,6 +1015,7 @@ exfat_dir_write_entry_set:
     push r12
     push r13
     push r14
+    push r15
 
     mov r10, rcx                        ; r10 = name ptr
     mov r11d, edx                       ; r11d = FirstCluster
@@ -998,32 +1027,49 @@ exfat_dir_write_entry_set:
     cmp byte [r10+r14], 0
     je .namelen_done
     inc r14d
-    cmp r14d, 15
+    cmp r14d, EXFAT_MAX_NAME_LEN
     ja .fail
     jmp .namelen
 .namelen_done:
     test r14d, r14d
     jz .fail
 
-    mov ecx, 3                          ; File + StreamExt + 1 FileName entry
+    mov eax, r14d
+    add eax, 14
+    mov ecx, 15
+    xor edx, edx
+    div ecx
+    mov r15d, eax                       ; r15d = FileName entries needed
+
+    mov ecx, r15d
+    add ecx, 2                          ; + File + StreamExt
     call exfat_dir_find_slot
     test eax, eax
     jz .fail
     ; ebx = directory cluster, edx = byte offset within exfat_dir_buf
+    mov ebp, ebx                        ; ebp = directory cluster (kept
+                                         ; safe across ebx's later reuse
+                                         ; as the FileName-entry loop index)
 
     lea rsi, [rel exfat_dir_buf]
     add rsi, rdx                        ; rsi -> primary (File) entry
 
+    mov r9d, r15d
+    add r9d, 2                          ; r9d = total entry count
+
     push rsi
     mov rdi, rsi
     xor eax, eax
-    mov ecx, 96
+    mov ecx, r9d
+    shl ecx, 5                          ; total entry count * 32 bytes
     cld
     rep stosb
     pop rsi
 
     mov byte [rsi+0], 0x85              ; EntryType: File
-    mov byte [rsi+1], 2                 ; SecondaryCount: StreamExt + 1 FileName
+    mov eax, r15d
+    inc eax                             ; SecondaryCount: StreamExt + N FileName
+    mov [rsi+1], al
     mov word [rsi+4], 0x0020            ; FileAttributes: ARCHIVE
 
     mov byte [rsi+32], 0xC0             ; Stream Extension EntryType
@@ -1037,24 +1083,43 @@ exfat_dir_write_entry_set:
     call exfat_name_hash
     mov [rsi+36], ax                    ; NameHash
 
-    mov byte [rsi+64], 0xC1             ; FileName EntryType
+    ; FileName entries: one per 15 characters, zero-padded in the last one
+    xor ebx, ebx                        ; ebx = FileName entry index
+.name_entry_loop:
+    cmp ebx, r15d
+    jge .name_entries_done
+    mov eax, ebx
+    imul eax, 15                        ; eax = index of this entry's first char
+    lea rdi, [rsi+64]
+    mov edx, ebx
+    imul edx, 32
+    add rdi, rdx                        ; rdi -> this FileName entry
+    mov byte [rdi], 0xC1
 
     xor ecx, ecx
-.copy_name:
-    cmp ecx, r14d
-    jge .name_copied
-    movzx eax, byte [r10+rcx]
-    mov [rsi+66+rcx*2], ax
+.copy_name_chars:
+    cmp ecx, 15
+    jge .name_entry_next
+    mov edx, eax
+    add edx, ecx
+    cmp edx, r14d
+    jge .copy_name_chars_next           ; past the real name -- leave zero
+    movzx r8d, byte [r10+rdx]
+    mov [rdi+2+rcx*2], r8w
+.copy_name_chars_next:
     inc ecx
-    jmp .copy_name
-.name_copied:
+    jmp .copy_name_chars
+.name_entry_next:
+    inc ebx
+    jmp .name_entry_loop
+.name_entries_done:
 
     mov rcx, rsi
-    mov edx, 3
+    mov edx, r9d
     call exfat_checksum_entries
     mov [rsi+2], ax                     ; SetChecksum
 
-    mov ecx, ebx
+    mov ecx, ebp
     call exfat_cluster_to_lba
     mov rcx, rax
     mov edx, [rel exfat_sectors_per_cluster]
@@ -1068,6 +1133,7 @@ exfat_dir_write_entry_set:
 .fail:
     xor eax, eax
 .out:
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -1079,13 +1145,14 @@ exfat_dir_write_entry_set:
     pop rsi
     pop rdx
     pop rcx
+    pop rbp
     pop rbx
     ret
 
 ; -------------------------------------------------------------------------
-; exfat_create_file: RCX = ptr to a NUL-terminated ASCII filename, <=15
-; characters. Creates an empty (FirstCluster=0, DataLength=0) file entry
-; in the root directory. Returns EAX=1/0.
+; exfat_create_file: RCX = ptr to a NUL-terminated ASCII filename, <=
+; EXFAT_MAX_NAME_LEN characters. Creates an empty (FirstCluster=0,
+; DataLength=0) file entry in the root directory. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
 exfat_create_file:
     push rdx
@@ -1103,10 +1170,11 @@ exfat_create_file:
     ret
 
 ; -------------------------------------------------------------------------
-; exfat_write_file: RCX = ptr to a NUL-terminated ASCII filename (<=15
-; chars), R8 = ptr to source data, R9 = data length in bytes. Creates a
-; NEW file -- fails if the name already exists in the root directory (v1
-; has no overwrite/append support). Allocates and FAT-chains enough
+; exfat_write_file: RCX = ptr to a NUL-terminated ASCII filename (<=
+; EXFAT_MAX_NAME_LEN chars), R8 = ptr to source data, R9 = data length
+; in bytes. Creates a NEW file -- fails if the name already exists in
+; the root directory (see exfat_append_file for extending an existing
+; one). Allocates and FAT-chains enough
 ; clusters to hold the data (always via a real FAT chain -- NoFatChain is
 ; never set, so allocation need not be contiguous), writes the data, and
 ; writes the file's directory entry with the real FirstCluster/
@@ -1329,7 +1397,15 @@ exfat_name_matches:
 ;   R8  = pointer to a result struct: [0]=FirstCluster(dd), [8]=DataLength(dq),
 ;         [16]=NoFatChain(dd, nonzero if the file is contiguously allocated
 ;         with no real FAT chain -- common for freshly-written files, and
-;         confirmed against a real Windows-written exFAT volume)
+;         confirmed against a real Windows-written exFAT volume),
+;         [24]=EntryDirCluster(dd), [28]=EntryOffset(dd) -- the on-disk
+;         location of the File entry itself, for callers that need to
+;         edit or delete it in place (exfat_delete_file/exfat_rename_file/
+;         exfat_truncate_file/exfat_append_file). Needs a 32-byte buffer;
+;         older callers that only care about the first three fields can
+;         still pass a smaller one as long as nothing else follows it in
+;         memory, but every caller in this codebase uses the same shared,
+;         32-byte exfat_find_result buffer.
 ; Returns EAX=1/0.
 ; -------------------------------------------------------------------------
 exfat_find_root_file:
@@ -1404,6 +1480,8 @@ exfat_find_root_file:
     movzx eax, byte [rdx+1]             ; GeneralSecondaryFlags
     and eax, 0x02                       ; bit1 = NoFatChain
     mov [r12+16], eax
+    mov [r12+24], r10d                  ; EntryDirCluster (for delete/rename)
+    mov [r12+28], edi                   ; EntryOffset within that cluster
     mov eax, 1
     jmp .out
 
@@ -1519,6 +1597,799 @@ exfat_read_file:
     pop rbx
     ret
 
+; -------------------------------------------------------------------------
+; exfat_chain_advance: ECX = starting cluster, EDX = number of steps
+; forward, R10D = NoFatChain flag. Returns EAX = the cluster reached
+; (ECX itself if EDX==0), or 0 on error (ran off the end of the chain).
+; NoFatChain files are contiguous, so this is just cluster+steps; a real
+; FAT chain is walked one exfat_fat_next_cluster call per step.
+; -------------------------------------------------------------------------
+exfat_chain_advance:
+    push rbx
+    push rcx
+    push rdx
+
+    mov ebx, ecx                        ; ebx = current cluster
+    test r10d, r10d
+    jz .use_fat_steps
+    add ebx, edx                        ; NoFatChain: contiguous
+    jmp .done
+.use_fat_steps:
+    test edx, edx
+    jz .done
+.step:
+    mov ecx, ebx
+    call exfat_fat_next_cluster
+    test eax, eax
+    jz .fail
+    cmp eax, 0xFFFFFFF8
+    jae .fail
+    mov ebx, eax
+    dec edx
+    jnz .step
+.done:
+    mov eax, ebx
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_free_cluster_run: ECX = starting cluster, R9 = count (>=1),
+; R10D = NoFatChain flag. Frees exactly `count` consecutive clusters
+; starting at ECX (contiguous +1 for NoFatChain, or following the real
+; FAT chain otherwise). Returns EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_free_cluster_run:
+    push rbx
+    push rcx
+    push r9
+
+    mov ebx, ecx                        ; ebx = current cluster
+.loop:
+    test r9, r9
+    jz .ok
+    mov ecx, ebx
+    call exfat_free_cluster
+    test eax, eax
+    jz .fail
+    dec r9
+    test r9, r9
+    jz .ok
+
+    test r10d, r10d
+    jz .use_fat
+    inc ebx
+    jmp .loop
+.use_fat:
+    mov ecx, ebx
+    call exfat_fat_next_cluster
+    test eax, eax
+    jz .fail
+    cmp eax, 0xFFFFFFF8
+    jae .fail
+    mov ebx, eax
+    jmp .loop
+
+.ok:
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r9
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_data_length_to_clusters: RDX = data length in bytes. Returns
+; EAX = ceil(length / cluster_size), or 0 for a zero length.
+; -------------------------------------------------------------------------
+exfat_data_length_to_clusters:
+    push rcx
+    push rdx
+
+    test rdx, rdx
+    jz .zero
+    mov eax, [rel exfat_sectors_per_cluster]
+    imul eax, [rel exfat_bytes_per_sector]
+    mov ecx, eax
+    mov rax, rdx
+    add rax, rcx
+    dec rax
+    xor edx, edx
+    div rcx
+    jmp .out
+.zero:
+    xor eax, eax
+.out:
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_free_file_clusters: ECX = FirstCluster, RDX = DataLength (bytes),
+; R9D = NoFatChain flag. Frees every cluster belonging to a file. No-op
+; if FirstCluster==0 (an empty file with nothing allocated). Returns
+; EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_free_file_clusters:
+    push rbx
+    push rcx
+    push rdx
+    push r9
+    push r10
+
+    test ecx, ecx
+    jz .ok                               ; empty file: nothing to free
+    mov ebx, ecx                         ; ebx = FirstCluster
+    mov r10d, r9d                        ; r10d = NoFatChain flag
+
+    call exfat_data_length_to_clusters
+    test eax, eax
+    jnz .have_count
+    mov eax, 1                           ; a nonzero FirstCluster always
+                                          ; owns >=1 cluster even if
+                                          ; DataLength somehow reads 0
+.have_count:
+    mov r9, rax
+
+    mov ecx, ebx
+    call exfat_free_cluster_run
+    jmp .out
+
+.ok:
+    mov eax, 1
+    jmp .out
+.out:
+    pop r10
+    pop r9
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_mark_entries_unused: EBX = directory cluster (already loaded into
+; exfat_dir_buf, e.g. by a prior exfat_find_root_file call), EDX = byte
+; offset of the primary File entry within it. Clears the InUse bit
+; (0x80) of the File entry and every one of its secondary entries, then
+; writes the cluster back. Used by delete (permanently) and rename
+; (immediately followed by writing a fresh entry set elsewhere).
+; Returns EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_mark_entries_unused:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+
+    lea rsi, [rel exfat_dir_buf]
+    add rsi, rdx                        ; rsi -> primary (File) entry
+
+    movzx ecx, byte [rsi+1]             ; SecondaryCount
+    inc ecx                             ; + the primary entry itself
+    xor r8d, r8d
+.clear_loop:
+    cmp r8d, ecx
+    jge .clear_done
+    mov eax, r8d
+    shl eax, 5
+    and byte [rsi+rax], 0x7F            ; clear InUse (bit 7)
+    inc r8d
+    jmp .clear_loop
+.clear_done:
+
+    mov ecx, ebx
+    call exfat_cluster_to_lba
+    mov rcx, rax
+    mov edx, [rel exfat_sectors_per_cluster]
+    lea r8, [rel exfat_dir_buf]
+    call storage_write_sectors
+
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_delete_file: RCX = ptr to a NUL-terminated ASCII filename. Frees
+; the file's data clusters and marks its directory entries unused.
+; Returns EAX=1/0 (0 if the file doesn't exist, or on I/O failure).
+; -------------------------------------------------------------------------
+exfat_delete_file:
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .fail
+
+    ; exfat_dir_buf still holds the cluster exfat_find_root_file just
+    ; matched in (it stopped scanning right there), so mark it in place
+    ; before anything else has a chance to reuse that buffer.
+    mov ebx, [rel exfat_find_result+24]  ; EntryDirCluster
+    mov edx, [rel exfat_find_result+28]  ; EntryOffset
+    call exfat_mark_entries_unused
+    test eax, eax
+    jz .fail
+
+    mov ecx, [rel exfat_find_result+0]   ; FirstCluster
+    mov rdx, [rel exfat_find_result+8]   ; DataLength
+    mov r9d, [rel exfat_find_result+16]  ; NoFatChain
+    call exfat_free_file_clusters
+    test eax, eax
+    jz .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_rename_file: RCX = old NUL-terminated ASCII name, RDX = new one
+; (<= EXFAT_MAX_NAME_LEN chars). Fails if the old name doesn't exist or
+; the new one already does. The file's data (FirstCluster/DataLength/
+; NoFatChain) is carried over unchanged -- only the directory entries
+; change, by deleting the old entry set and writing a fresh one (the new
+; name may need a different number of FileName entries than the old one,
+; so editing in place isn't generally possible). Returns EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_rename_file:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    mov r10, rcx                        ; r10 = old name
+    mov r11, rdx                        ; r11 = new name
+
+    mov rcx, r11
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .fail                           ; new name already exists
+
+    mov rcx, r10
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .fail                            ; old name doesn't exist
+
+    mov ebx, [rel exfat_find_result+0]  ; ebx = FirstCluster (saved --
+                                         ; exfat_mark_entries_unused
+                                         ; doesn't touch it, but the
+                                         ; upcoming dir_find_slot call
+                                         ; will overwrite exfat_dir_buf)
+    mov rsi, [rel exfat_find_result+8]  ; rsi = DataLength
+    mov r9d, [rel exfat_find_result+16] ; r9d = NoFatChain
+
+    push rbx
+    push rsi
+    push r9
+
+    mov ebx, [rel exfat_find_result+24] ; EntryDirCluster
+    mov edx, [rel exfat_find_result+28] ; EntryOffset
+    call exfat_mark_entries_unused
+    test eax, eax
+    jnz .marked
+    add rsp, 24
+    jmp .fail
+.marked:
+
+    pop r9                              ; NoFatChain
+    pop r8                              ; DataLength (into r8 for the call below)
+    pop rdx                             ; FirstCluster (into edx for the call below)
+
+    mov ecx, r9d                        ; GeneralSecondaryFlags: reuse
+                                         ; NoFatChain as bit1, AllocationPossible
+                                         ; (bit0) whenever there's any data
+    shl ecx, 1
+    test rdx, rdx
+    jz .no_alloc_bit
+    or ecx, 0x01
+.no_alloc_bit:
+    mov r9b, cl
+
+    mov rcx, r11                        ; new name
+    call exfat_dir_write_entry_set
+    test eax, eax
+    jz .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_truncate_file: RCX = ptr to a NUL-terminated ASCII filename,
+; RDX = new length in bytes (must be <= the file's current DataLength --
+; this only shrinks; see exfat_append_file to grow). Frees whichever
+; trailing clusters the new length no longer needs and updates the
+; Stream Extension entry's DataLength/ValidDataLength in place. Returns
+; EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_truncate_file:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+
+    mov r11, rdx                        ; r11 = new length
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .fail
+
+    mov r10, [rel exfat_find_result+8]  ; r10 = current DataLength
+    cmp r11, r10
+    ja .fail                           ; growing isn't this function's job
+
+    mov rdx, r11
+    call exfat_data_length_to_clusters
+    mov r12d, eax                       ; r12d = clusters to keep
+
+    mov ebx, [rel exfat_find_result+0]  ; ebx = FirstCluster
+    mov r9d, [rel exfat_find_result+16] ; r9d = NoFatChain
+    test ebx, ebx
+    jz .resize_entry                    ; already empty -- nothing to free
+    test r12d, r12d
+    jz .free_all
+
+    mov rdx, r10
+    call exfat_data_length_to_clusters
+    mov esi, eax                        ; esi = clusters currently used
+    cmp r12d, esi
+    jae .resize_entry                   ; shrinking within the last kept
+                                         ; cluster -- nothing to free
+
+    ; Find the first cluster to free BEFORE touching any FAT links --
+    ; walking r12d steps from FirstCluster needs the very link that
+    ; terminating the chain (below) would destroy if done first.
+    mov r10d, r9d                       ; exfat_chain_advance's NoFatChain input
+    mov ecx, ebx
+    mov edx, r12d
+    call exfat_chain_advance            ; eax = first cluster to free
+    test eax, eax
+    jz .fail
+    mov r8d, eax                        ; r8d = first cluster to free (kept
+                                         ; safe across the calls below)
+
+    ; terminate the chain at the last kept cluster (real FAT chains only
+    ; -- a NoFatChain file just relies on DataLength to bound how much
+    ; of its contiguous run is "the file", no in-chain marker to fix)
+    test r9d, r9d
+    jnz .free_tail
+    mov ecx, ebx
+    mov edx, r12d
+    dec edx
+    mov r10d, r9d
+    call exfat_chain_advance
+    test eax, eax
+    jz .fail
+    mov ecx, eax
+    mov edx, 0xFFFFFFFF
+    call exfat_fat_set_entry
+    test eax, eax
+    jz .fail
+
+.free_tail:
+    mov ecx, r8d
+    mov r9d, esi
+    sub r9d, r12d                       ; r9d = clusters to free
+    mov r10d, [rel exfat_find_result+16] ; NoFatChain, for the run-freer
+    call exfat_free_cluster_run
+    test eax, eax
+    jz .fail
+    jmp .resize_entry
+
+.free_all:
+    mov ecx, ebx
+    mov rdx, r10
+    mov r9d, [rel exfat_find_result+16]
+    call exfat_free_file_clusters
+    test eax, eax
+    jz .fail
+    xor ebx, ebx                        ; FirstCluster becomes 0
+
+.resize_entry:
+    mov ecx, [rel exfat_find_result+24] ; EntryDirCluster
+    lea r8, [rel exfat_dir_buf]
+    call exfat_read_cluster             ; re-fetch: earlier calls in this
+                                         ; function may have reused the buffer
+    test eax, eax
+    jz .fail
+
+    mov edx, [rel exfat_find_result+28] ; EntryOffset
+    lea rsi, [rel exfat_dir_buf]
+    add rsi, rdx                        ; rsi -> File entry (Stream
+                                         ; Extension fields below are at
+                                         ; rsi+N, matching the layout
+                                         ; exfat_dir_write_entry_set uses
+                                         ; -- rsi+32 is where the Stream
+                                         ; Extension entry itself starts,
+                                         ; but its FIELDS are addressed
+                                         ; from rsi, not from rsi+32)
+
+    test r12d, r12d
+    jnz .keep_first_cluster
+    mov dword [rsi+52], 0               ; FirstCluster = 0 (fully truncated)
+    jmp .set_lengths
+.keep_first_cluster:
+    mov eax, [rel exfat_find_result+0]
+    mov [rsi+52], eax                   ; FirstCluster unchanged
+.set_lengths:
+    mov [rsi+40], r11                   ; ValidDataLength
+    mov [rsi+56], r11                   ; DataLength
+
+    movzx ecx, byte [rsi+1]
+    inc ecx                             ; SecondaryCount + primary entry
+    mov edx, ecx
+    mov rcx, rsi
+    call exfat_checksum_entries
+    mov [rsi+2], ax
+
+    mov ecx, [rel exfat_find_result+24]
+    call exfat_cluster_to_lba
+    mov rcx, rax
+    mov edx, [rel exfat_sectors_per_cluster]
+    lea r8, [rel exfat_dir_buf]
+    call storage_write_sectors
+    test eax, eax
+    jz .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_append_file: RCX = ptr to a NUL-terminated ASCII filename
+; (must already exist -- use exfat_write_file to create), R8 = ptr to
+; data to append, R9 = length in bytes. Fills any unused space in the
+; file's last cluster first, then allocates and FAT-chains new clusters
+; for the rest. If the file was NoFatChain (contiguously allocated, no
+; real FAT links -- the common case for a freshly-written file) and new
+; clusters are needed, the existing run is first retrofitted with real
+; FAT links (a newly allocated cluster has no reason to land adjacent to
+; the old run) and the flag is cleared; if everything still fits in
+; existing + newly *contiguous* space this retrofit is skipped. Returns
+; EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_append_file:
+    push rbx
+    push rbp
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r13, r8                         ; r13 = source data ptr (advances)
+    mov r14, r9                         ; r14 = remaining bytes (consumed)
+    mov rbp, r9                         ; rbp = original append length (kept)
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .fail                            ; appending to a nonexistent file
+
+    mov ebx, [rel exfat_find_result+0]  ; ebx = FirstCluster
+    mov r15, [rel exfat_find_result+8]  ; r15 = old DataLength
+    mov r10d, [rel exfat_find_result+16]; r10d = NoFatChain
+
+    mov eax, [rel exfat_sectors_per_cluster]
+    imul eax, [rel exfat_bytes_per_sector]
+    mov r12d, eax                       ; r12d = cluster size, bytes
+
+    test r14, r14
+    jz .append_done_no_data             ; appending zero bytes: no-op
+
+    test ebx, ebx
+    jz .no_last_cluster                 ; empty file: nothing to top up
+
+    ; find the last existing cluster and how much of it is already used
+    mov rdx, r15
+    call exfat_data_length_to_clusters
+    mov esi, eax                        ; esi = clusters currently used
+    mov ecx, ebx
+    mov edx, esi
+    dec edx
+    call exfat_chain_advance
+    test eax, eax
+    jz .fail
+    mov edi, eax                        ; edi = last existing cluster
+
+    mov eax, r15d
+    xor edx, edx
+    mov ecx, r12d
+    div ecx                             ; edx = bytes used in the last cluster
+    test edx, edx
+    jz .have_last_cluster               ; exactly full -- nothing to top up,
+                                         ; edi (set above) is already correct
+
+    mov eax, r12d
+    sub eax, edx                        ; eax = leftover space in last cluster
+    cmp rax, r14
+    jbe .topup_amt_ok
+    mov rax, r14
+.topup_amt_ok:
+    push rax                            ; save top-up amount
+
+    mov ecx, edi
+    lea r8, [rel exfat_write_buf]
+    call exfat_read_cluster
+    test eax, eax
+    jz .topup_fail_pop
+
+    pop rax                             ; top-up amount
+    push rax
+    mov r9d, edi                        ; save the cluster number -- the
+                                         ; copy below clobbers edi (used as
+                                         ; the destination pointer)
+    lea rdi, [rel exfat_write_buf]
+    add rdi, rdx                        ; rdx still holds bytes-used-in-cluster
+    mov rsi, r13
+    mov rcx, rax
+    cld
+    rep movsb
+
+    mov ecx, r9d
+    call exfat_cluster_to_lba
+    mov rcx, rax
+    mov edx, [rel exfat_sectors_per_cluster]
+    lea r8, [rel exfat_write_buf]
+    call storage_write_sectors
+    test eax, eax
+    jz .topup_fail_pop
+    mov edi, r9d                        ; restore -- still "the last
+                                         ; existing cluster" for the
+                                         ; alloc_loop below, if reached
+
+    pop rax                             ; top-up amount
+    add r13, rax
+    sub r14, rax
+    jmp .have_last_cluster
+.topup_fail_pop:
+    add rsp, 8
+    jmp .fail
+
+.no_last_cluster:
+    xor edi, edi                        ; no cluster to link the first
+                                         ; new one from
+.have_last_cluster:
+    test r14, r14
+    jz .update_entry                    ; the top-up satisfied everything
+
+    ; more data remains: allocate new clusters. If the file was
+    ; NoFatChain, retrofit real FAT links across the existing run first
+    ; (a new cluster has no reason to land contiguous with it) -- skip
+    ; entirely if there was no existing run (ebx==0) or none is needed.
+    test ebx, ebx
+    jz .alloc_loop
+    test r10d, r10d
+    jz .alloc_loop                      ; already a real chain
+    mov esi, ebx                        ; esi = retrofit walker
+    mov rdx, [rel exfat_find_result+8]  ; original DataLength, full qword
+    call exfat_data_length_to_clusters
+    mov r9d, eax                        ; r9d = clusters in the old run
+    dec r9d
+    test r9d, r9d
+    jz .retrofit_done                   ; only one cluster -- no links needed
+.retrofit_loop:
+    lea edx, [esi+1]                    ; edx = next cluster (link target)
+    mov ecx, esi                        ; ecx = current cluster (link source)
+    push rdx
+    call exfat_fat_set_entry
+    pop rdx
+    test eax, eax
+    jz .fail
+    mov esi, edx
+    dec r9d
+    jnz .retrofit_loop
+.retrofit_done:
+    xor r10d, r10d                      ; no longer NoFatChain
+
+.alloc_loop:
+    test r14, r14
+    jz .update_entry
+
+    call exfat_alloc_cluster
+    test eax, eax
+    jz .fail
+    mov r9d, eax                        ; r9d = this new cluster
+
+    test edi, edi
+    jz .first_new_cluster
+    push r9
+    mov ecx, edi
+    mov edx, r9d
+    call exfat_fat_set_entry
+    pop r9
+    test eax, eax
+    jz .fail
+    jmp .after_link
+.first_new_cluster:
+    mov ebx, r9d                        ; file had no clusters at all: this
+                                         ; new one becomes FirstCluster
+.after_link:
+    mov edi, r9d
+
+    mov r8d, r12d                       ; r8d = cluster size
+    cmp r14, r8
+    jbe .copylen_ok
+    mov r11, r8
+    jmp .copylen_set
+.copylen_ok:
+    mov r11, r14
+.copylen_set:
+    lea rdi, [rel exfat_write_buf]
+    mov rsi, r13
+    mov rcx, r11
+    cld
+    rep movsb
+
+    mov rax, r8
+    sub rax, r11
+    jz .no_pad
+    mov rcx, rax
+    xor eax, eax
+    cld
+    rep stosb
+.no_pad:
+    mov edi, r9d                        ; restore edi = current cluster
+                                         ; (rep stosb clobbered it)
+
+    mov ecx, r9d
+    call exfat_cluster_to_lba
+    mov rcx, rax
+    mov edx, [rel exfat_sectors_per_cluster]
+    lea r8, [rel exfat_write_buf]
+    call storage_write_sectors
+    test eax, eax
+    jz .fail
+
+    add r13, r11
+    sub r14, r11
+    jmp .alloc_loop
+
+.update_entry:
+    test ebx, ebx
+    jz .append_done_no_data             ; nothing was ever allocated
+    ; terminate the chain at the final cluster if it's a real FAT chain
+    test r10d, r10d
+    jnz .no_terminate
+    mov ecx, edi
+    mov edx, 0xFFFFFFFF
+    call exfat_fat_set_entry
+    test eax, eax
+    jz .fail
+.no_terminate:
+
+    mov ecx, [rel exfat_find_result+24] ; EntryDirCluster
+    lea r8, [rel exfat_dir_buf]
+    call exfat_read_cluster
+    test eax, eax
+    jz .fail
+
+    mov edx, [rel exfat_find_result+28] ; EntryOffset
+    lea rsi, [rel exfat_dir_buf]
+    add rsi, rdx                        ; rsi -> File entry (Stream
+                                         ; Extension fields are at rsi+N,
+                                         ; matching exfat_dir_write_entry_set)
+
+    mov [rsi+52], ebx                   ; FirstCluster (may have just been set)
+    mov rax, r15                        ; original DataLength
+    add rax, rbp                        ; + the total length appended
+    mov [rsi+40], rax                   ; ValidDataLength
+    mov [rsi+56], rax                   ; DataLength
+
+    movzx ecx, byte [rsi+33]            ; GeneralSecondaryFlags
+    and ecx, 0xFD                       ; clear NoFatChain (bit1)
+    test r10d, r10d
+    jz .flags_set
+    or ecx, 0x02
+.flags_set:
+    or ecx, 0x01                        ; AllocationPossible
+    mov [rsi+33], cl
+
+    movzx ecx, byte [rsi+1]
+    inc ecx
+    mov edx, ecx
+    mov rcx, rsi
+    call exfat_checksum_entries
+    mov [rsi+2], ax
+
+    mov ecx, [rel exfat_find_result+24]
+    call exfat_cluster_to_lba
+    mov rcx, rax
+    mov edx, [rel exfat_sectors_per_cluster]
+    lea r8, [rel exfat_dir_buf]
+    call storage_write_sectors
+    test eax, eax
+    jz .fail
+
+    mov eax, 1
+    jmp .out
+.append_done_no_data:
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbp
+    pop rbx
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================
@@ -1529,8 +2400,12 @@ exfat_cluster_heap_offset: dd 0
 exfat_cluster_count:       dd 0
 exfat_root_dir_cluster:    dd 0
 exfat_bytes_per_sector:    dd 0
+exfat_sector_shift:        db 0
+exfat_sector_mask:         dd 0
 exfat_sectors_per_cluster: dd 0
 exfat_gpt_entry_size:      dd 0
+
+msg_exfat_sector_mismatch: db 'exFAT: volume sector size does not match device native sector size, refusing to mount', 13, 10, 0
 
 exfat_list_cluster:           dd 0
 exfat_list_offset:            dd 0
@@ -1542,9 +2417,14 @@ exfat_bitmap_cache_chain_idx: dd 0
 exfat_bitmap_cache_cluster:   dd 0
 
 align 512
-exfat_vbr_buf:        times 512 db 0
-exfat_fat_sector_buf: times 512 db 0
-exfat_gpt_buf:        times 512 db 0
+; Sized for the largest native device sector size these drivers report
+; (4096, e.g. NVMe 4Kn or Advanced Format), not just the common 512 --
+; each of these is filled by a single storage_read_sectors(count=1)
+; call, which reads exactly one *device* sector, so a 512-byte buffer
+; would overflow on hardware with a larger native sector size.
+exfat_vbr_buf:        times 4096 db 0
+exfat_fat_sector_buf: times 4096 db 0
+exfat_gpt_buf:        times 4096 db 0
 
 ; NOTE: sized for our test volume's 4096-byte clusters. Real volumes can
 ; use larger clusters (up to 32MB per spec); once the heap allocator

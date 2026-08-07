@@ -72,10 +72,11 @@ pit_init:
 ; RSP (which by now points at a complete GPR+interrupt frame on its own
 ; stack, built either by this same prologue or by task_create), ask
 ; sched_pick_next for the next task to run (skipping/reaping any
-; terminated ones found along the way), load its RSP, and let the shared
-; pop+iretq tail resume it. Interrupts stay off for the whole handler
-; (interrupt-gate entry clears IF automatically), so no nested timer tick
-; can land mid-switch.
+; terminated ones found along the way), switch to its own page tables
+; (TCB_CR3, or the shared global ones for a task with no private paging),
+; load its RSP, and let the shared pop+iretq tail resume it. Interrupts
+; stay off for the whole handler (interrupt-gate entry clears IF
+; automatically), so no nested timer tick can land mid-switch.
 ; -------------------------------------------------------------------------
 irq0_stub:
     push rax
@@ -111,6 +112,20 @@ irq0_stub:
     mov [rax+TCB_RSP], rsp              ; save the outgoing task's context
     call sched_pick_next                ; rax=outgoing (unchanged); rcx=next
     mov [rel current_task], rcx
+
+    ; Switch to the incoming task's own page tables (its private stack
+    ; mapping only exists there) before touching its RSP -- 0 means "no
+    ; private paging" (the main task), which uses the shared global
+    ; pml4. No stack access happens between this and the RSP load right
+    ; below, so there's no window where CR3 and RSP could disagree about
+    ; which task's stack is current.
+    mov rdx, [rcx+TCB_CR3]
+    test rdx, rdx
+    jnz .use_task_cr3
+    lea rdx, [rel pml4]
+.use_task_cr3:
+    mov cr3, rdx
+
     mov rsp, [rcx+TCB_RSP]              ; switch to the incoming task's stack
 
 .no_switch:
