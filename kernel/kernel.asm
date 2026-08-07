@@ -40,6 +40,7 @@ entry:
     call gdt_install
     call idt_install
     call irq_install
+    call kbd_install
     sti
     call paging_init
 
@@ -1227,3 +1228,4 @@ gdt_descriptor:
 %include "nvme.inc"
 %include "storage.inc"
 %include "exfat.inc"
+%include "keyboard.inc"
