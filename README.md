@@ -9,7 +9,7 @@ BASIX64: a mixed-case-keyword BASIC-inspired language with `sfloat`,
 `dfloat`, matrices, and 3D/GUI-oriented math, compiled directly to native
 machine code by a compiler running inside the kernel itself.
 
-## Status: Phase 10 — process termination and kernel hardening
+## Status: Phase 11 — extended keyboard, exFAT write-path completion, per-task paging
 
 This is an as-built log: each phase below is implemented, tested (either via
 the boot-time regression suite or interactively through QEMU), and merged.
@@ -199,13 +199,71 @@ kernel are read back correctly by Windows' own exFAT driver.
   allocation that must return the exact address of the earlier of the two
   merged blocks. Confirmed stable across multiple consecutive full boots.
 
+### Phase 11 — extended keyboard, exFAT write-path completion, per-task paging
+- **Keyboard extended keys** (`keyboard.inc`) — decodes the 0xE0-prefixed
+  scancode set instead of just discarding it: arrow keys, Home/End/Delete,
+  and right-Ctrl/right-Alt (tracked as modifier state for future use).
+  Extended keys with no ASCII form are pushed into the existing byte-stream
+  buffer as values in an otherwise-unused range.
+- **Shell: real line editing + history** — `shell_read_line` rewritten
+  around a cursor index instead of append-only typing: Left/Right/Home/End
+  move the cursor, Backspace/Delete/typed characters operate at the cursor
+  with proper insert/shift, and Up/Down recall previous commands from a
+  ring-buffer history. Also fixed a real latent bug in `fb_draw_char` (it
+  only ever painted a glyph's "on" pixels, never its "off" ones, so
+  redrawing a cell that previously held different content left stray
+  pixels behind — invisible before, but exactly what the new editor's
+  mid-line insert/delete does constantly).
+- **exFAT sector-size hardening** — fixed two real correctness bugs found
+  while auditing the "assumes volume and device sector size match"
+  limitation: FAT-entry sector math and GPT partition-entry math were both
+  hardcoded to 512 bytes regardless of the volume's/device's actual
+  reported sizes. The remaining "volume sector size equals device native
+  sector size" assumption (inherent to how LBAs are computed throughout
+  this file) is now checked explicitly at mount time and refuses to mount
+  rather than silently computing wrong LBAs if it's ever false.
+- **exFAT write path completion**: filenames longer than 15 characters
+  (one FileName entry per 15 chars instead of hardcoding exactly one, up
+  to `EXFAT_MAX_NAME_LEN`=64); `exfat_delete_file`, `exfat_rename_file`,
+  `exfat_truncate_file`, and `exfat_append_file`, all operating on a
+  file's existing directory entry in place. Wired into the shell as `DEL`,
+  `RENAME`, `APPEND`, and `TRUNCATE`. Verified with a dedicated boot-time
+  regression test per operation plus interactive end-to-end shell testing.
+- **Per-task page tables** (`sched.inc`, `vmm.inc`, `pic.inc`, `idt.inc`)
+  — each task now gets its own PML4 instead of all sharing the kernel's
+  single global page tables. Every slot is a copy of the shared global
+  entries (identity map, kmalloc heap) except one new slot
+  (`TASK_STACK_VIRT_BASE`) holding that task's own kernel stack and
+  nobody else's, mapped via a new `vmm_map_page_at` parameterized to
+  target an arbitrary PML4. The payoff: the same virtual address resolves
+  to a different physical stack depending on which task's CR3 is active,
+  so a stray pointer that happens to guess another task's stack address
+  can no longer accidentally alias into it — structurally impossible now,
+  not just unlikely (deliberate access via the still-shared identity map
+  isn't stopped; that needs ring 3 + syscalls, out of scope here). Both
+  context-switch paths (timer preemption and exception recovery) reload
+  CR3 to the incoming task's own tables immediately before loading its
+  RSP; `sched_reap_zombies` frees a zombie's physical stack pages (found
+  via a new `vmm_translate_at`) and PML4 alongside its TCB.
+- One more real bug found while testing this phase: with per-page-mapped
+  private stacks bounded by genuinely unmapped guard space (unlike the old
+  shared-heap-backed stacks, where overflowing just spilled into adjacent
+  mapped memory), `test_task_overflow`'s deliberate stack-smash needed
+  retuning — landing exactly on the canary instead of well past it, and
+  restoring RSP to a safe position afterward so the next timer interrupt's
+  own GPR-save push doesn't itself walk off the guard boundary before the
+  software canary check gets a chance to catch it. Root-caused via QEMU's
+  `-d int` CPU-level interrupt trace after a couple of misleading serial-
+  print debugging detours.
+
 Current boot sequence (verified via serial log and QEMU screendumps):
 GDT/IDT/PIC/timer → paging → PMM/VMM/heap self-tests (including
 split/coalesce) → AHCI + NVMe device bring-up and LBA0 read → exFAT mount
-(GPT or MBR), file lookup, read-back, write-path self-tests
-(bitmap/FAT-chain/directory/file write) → scheduler bring-up, preemption
-proof, and process-termination/canary-guard verification → BASIX64
-compile-and-run smoke test → drops into the interactive shell.
+(GPT or MBR), file lookup, read-back, write-path self-tests (bitmap/FAT-
+chain/directory/file write, long filenames, delete/rename/truncate/append)
+→ scheduler bring-up, preemption proof, process-termination/canary-guard
+verification (now exercising per-task page tables) → BASIX64 compile-and-
+run smoke test → drops into the interactive shell.
 
 ## Toolchain
 
@@ -243,17 +301,14 @@ concern once more of the kernel exists.
 ## Known limitations (tracked, not forgotten)
 
 - Physical memory tracked up to 128GB; identity map covers up to 1TB.
-- Tasks are kernel-only (ring 0) and share one address space — no per-task
-  CR3/page tables yet, so isolation is cooperative (a fault or bad canary
-  ends a task) rather than memory-protected (nothing stops one task's code
-  from directly reading/writing another's memory).
-- exFAT reader/writer assumes the volume's sector size matches the
-  underlying device's native sector size (true almost always in practice).
-- exFAT write path: file names capped at 15 ASCII characters (one
-  FileName directory entry); no file delete/rename/truncate/append yet.
-- Keyboard driver: no extended-key (arrow keys, right-Ctrl/Alt) support
-  yet — the 0xE0 prefix is recognized and safely discarded.
-- Shell: single-line command input only, no history/tab-completion.
+- Tasks are kernel-only (ring 0) and share code/data/heap in one address
+  space, but each now gets its own private page-table mapping for its
+  stack (see Phase 11) — that stops *accidental* cross-task stack
+  aliasing via a stray pointer, not *deliberate* access via the still-
+  shared identity map or a task reloading CR3 itself. Real hard isolation
+  needs ring 3 + syscalls, out of scope here.
+- exFAT write path: file names capped at 64 ASCII characters
+  (`EXFAT_MAX_NAME_LEN`).
 - BASIX64: `FOR` loop control values are always truncated to int, names
   limited to 15 ASCII characters, no nested-FOR beyond 8 levels deep, no
   float literal scientific-notation *display* (only accepted on input), no
@@ -265,9 +320,3 @@ concern once more of the kernel exists.
   side of a top-level comparison doesn't work (`(x+1) = 5` -- wrap the whole
   comparison instead, `((x+1) = 5)`). These are explicitly deferred scope
   or documented parser limitations, not oversights.
-- One unresolved anomaly: a specific file on the long-reused
-  `testdata/exfat_test.vhd` test volume became invisible to the kernel's
-  exFAT lookups despite Windows confirming it existed with correct content;
-  root cause unconfirmed (a related bounds-check bug was found and fixed,
-  but didn't resolve this specific case). Not reproduced under a different
-  filename/fresh write.
