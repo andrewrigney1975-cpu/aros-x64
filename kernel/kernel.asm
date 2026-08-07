@@ -47,8 +47,10 @@ entry:
     call pmm_init
 
     call fb_clear
+    call draw_logo
+
     mov ecx, 4                          ; column
-    mov edx, 2                          ; row
+    mov edx, 29                          ; row
     lea r8, [rel msg_hello]
     call fb_draw_string
 
@@ -94,7 +96,7 @@ entry:
     lea rcx, [rel msg_exfat_ok]
     call serial_puts
     mov ecx, 4
-    mov edx, 11
+    mov edx, 38
     lea r8, [rel msg_exfat_ok]
     call fb_draw_string
     jmp .exfat_done
@@ -102,7 +104,7 @@ entry:
     lea rcx, [rel msg_exfat_bad]
     call serial_puts
     mov ecx, 4
-    mov edx, 11
+    mov edx, 38
     lea r8, [rel msg_exfat_bad]
     call fb_draw_string
 .exfat_done:
@@ -123,7 +125,7 @@ entry:
     mov rax, [rel timer_ticks]
     call dbg_hex64
     mov ecx, 4
-    mov edx, 13
+    mov edx, 40
     lea r8, [rel msg_timer_ok]
     call fb_draw_string
     jmp .timer_done
@@ -131,7 +133,7 @@ entry:
     lea rcx, [rel msg_timer_bad]
     call serial_puts
     mov ecx, 4
-    mov edx, 13
+    mov edx, 40
     lea r8, [rel msg_timer_bad]
     call fb_draw_string
 .timer_done:
@@ -160,7 +162,7 @@ entry:
     lea rcx, [rel msg_pmm_ok]
     call serial_puts
     mov ecx, 4
-    mov edx, 15
+    mov edx, 42
     lea r8, [rel msg_pmm_ok]
     call fb_draw_string
     jmp .pmm_done
@@ -168,7 +170,7 @@ entry:
     lea rcx, [rel msg_pmm_bad]
     call serial_puts
     mov ecx, 4
-    mov edx, 15
+    mov edx, 42
     lea r8, [rel msg_pmm_bad]
     call fb_draw_string
 .pmm_done:
@@ -211,7 +213,7 @@ entry:
     lea rcx, [rel msg_vmm_ok]
     call serial_puts
     mov ecx, 4
-    mov edx, 16
+    mov edx, 43
     lea r8, [rel msg_vmm_ok]
     call fb_draw_string
     jmp .vmm_done
@@ -219,7 +221,7 @@ entry:
     lea rcx, [rel msg_vmm_bad]
     call serial_puts
     mov ecx, 4
-    mov edx, 16
+    mov edx, 43
     lea r8, [rel msg_vmm_bad]
     call fb_draw_string
 .vmm_done:
@@ -287,7 +289,7 @@ entry:
     lea rcx, [rel msg_kheap_ok]
     call serial_puts
     mov ecx, 4
-    mov edx, 17
+    mov edx, 44
     lea r8, [rel msg_kheap_ok]
     call fb_draw_string
     jmp .kheap_done
@@ -295,7 +297,7 @@ entry:
     lea rcx, [rel msg_kheap_bad]
     call serial_puts
     mov ecx, 4
-    mov edx, 17
+    mov edx, 44
     lea r8, [rel msg_kheap_bad]
     call fb_draw_string
 .kheap_done:
@@ -353,7 +355,7 @@ storage_init_and_test:
     lea rcx, [rel msg_ahci_ok]
     call serial_puts
     mov ecx, 4
-    mov edx, 4
+    mov edx, 31
     lea r8, [rel msg_ahci_ok]
     call fb_draw_string
 
@@ -363,7 +365,7 @@ storage_init_and_test:
     lea rcx, [rel msg_sig_ok]
     call serial_puts
     mov ecx, 4
-    mov edx, 5
+    mov edx, 32
     lea r8, [rel msg_sig_ok]
     call fb_draw_string
     jmp .done
@@ -372,7 +374,7 @@ storage_init_and_test:
     lea rcx, [rel msg_sig_bad]
     call serial_puts
     mov ecx, 4
-    mov edx, 5
+    mov edx, 32
     lea r8, [rel msg_sig_bad]
     call fb_draw_string
     jmp .done
@@ -381,7 +383,7 @@ storage_init_and_test:
     lea rcx, [rel msg_ahci_read_fail]
     call serial_puts
     mov ecx, 4
-    mov edx, 4
+    mov edx, 31
     lea r8, [rel msg_ahci_read_fail]
     call fb_draw_string
     jmp .done
@@ -390,7 +392,7 @@ storage_init_and_test:
     lea rcx, [rel msg_ahci_no_port]
     call serial_puts
     mov ecx, 4
-    mov edx, 4
+    mov edx, 31
     lea r8, [rel msg_ahci_no_port]
     call fb_draw_string
     jmp .done
@@ -399,7 +401,7 @@ storage_init_and_test:
     lea rcx, [rel msg_ahci_not_found]
     call serial_puts
     mov ecx, 4
-    mov edx, 4
+    mov edx, 31
     lea r8, [rel msg_ahci_not_found]
     call fb_draw_string
 
@@ -473,7 +475,7 @@ nvme_init_and_test:
     lea rcx, [rel msg_nvme_ok]
     call serial_puts
     mov ecx, 4
-    mov edx, 7
+    mov edx, 34
     lea r8, [rel msg_nvme_ok]
     call fb_draw_string
 
@@ -483,7 +485,7 @@ nvme_init_and_test:
     lea rcx, [rel msg_sig_ok]
     call serial_puts
     mov ecx, 4
-    mov edx, 8
+    mov edx, 35
     lea r8, [rel msg_sig_ok]
     call fb_draw_string
     jmp .done
@@ -492,7 +494,7 @@ nvme_init_and_test:
     lea rcx, [rel msg_sig_bad]
     call serial_puts
     mov ecx, 4
-    mov edx, 8
+    mov edx, 35
     lea r8, [rel msg_sig_bad]
     call fb_draw_string
     jmp .done
@@ -501,7 +503,7 @@ nvme_init_and_test:
     lea rcx, [rel msg_nvme_read_fail]
     call serial_puts
     mov ecx, 4
-    mov edx, 7
+    mov edx, 34
     lea r8, [rel msg_nvme_read_fail]
     call fb_draw_string
     jmp .done
@@ -510,7 +512,7 @@ nvme_init_and_test:
     lea rcx, [rel msg_nvme_init_fail]
     call serial_puts
     mov ecx, 4
-    mov edx, 7
+    mov edx, 34
     lea r8, [rel msg_nvme_init_fail]
     call fb_draw_string
     jmp .done
@@ -519,7 +521,7 @@ nvme_init_and_test:
     lea rcx, [rel msg_nvme_not_found]
     call serial_puts
     mov ecx, 4
-    mov edx, 7
+    mov edx, 34
     lea r8, [rel msg_nvme_not_found]
     call fb_draw_string
 
@@ -671,6 +673,38 @@ fb_draw_string:
     ret
 
 ; -------------------------------------------------------------------------
+; draw_logo: draws the boot-splash ASCII art (logo.inc, generated from
+; arOS.txt) at the top of the screen, one source line per text row
+; starting at row 0.
+; -------------------------------------------------------------------------
+draw_logo:
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r9
+
+    lea rsi, [rel logo_lines]
+    xor r9d, r9d                        ; r9d = row
+.next_line:
+    cmp r9d, LOGO_LINE_COUNT
+    jge .done
+    xor ecx, ecx                        ; column 0
+    mov edx, r9d
+    mov r8, [rsi]
+    call fb_draw_string
+    add rsi, 8
+    inc r9d
+    jmp .next_line
+.done:
+    pop r9
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
 ; serial_init: initialise COM1 (0x3F8) to 38400 8N1 with FIFO enabled.
 ; -------------------------------------------------------------------------
 serial_init:
@@ -807,6 +841,7 @@ gdt_descriptor:
     dq gdt_start                         ; base (absolute: fixed load addr)
 
 %include "font8x16.inc"
+%include "logo.inc"
 %include "idt.inc"
 %include "pic.inc"
 %include "paging.inc"
