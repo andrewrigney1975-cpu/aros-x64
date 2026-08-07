@@ -163,6 +163,17 @@ isr_common:
                                          ; but sched_pick_next only reads TCB_NEXT)
     call sched_pick_next                ; rax=outgoing (unchanged); rcx=next
     mov [rel current_task], rcx
+
+    ; Switch to the surviving task's own page tables before touching its
+    ; RSP -- see the matching comment in pic.inc's irq0_stub, which this
+    ; mirrors exactly.
+    mov rdx, [rcx+TCB_CR3]
+    test rdx, rdx
+    jnz .use_task_cr3
+    lea rdx, [rel pml4]
+.use_task_cr3:
+    mov cr3, rdx
+
     mov rsp, [rcx+TCB_RSP]              ; switch to the surviving task's stack
 
     pop r15

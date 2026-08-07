@@ -924,7 +924,9 @@ entry:
     jz .sched_bad
     mov r15, rax                        ; r15 = main task's TCB
     mov qword [r15+TCB_RSP], 0
-    mov qword [r15+TCB_STACK], 0
+    mov qword [r15+TCB_CR3], 0          ; no private paging -- runs under
+                                         ; the shared global pml4
+    mov qword [r15+TCB_STACK_PAGES], 0
     mov dword [r15+TCB_STATE], TCB_STATE_ALIVE
 
     mov rcx, test_task_a
@@ -1176,13 +1178,27 @@ test_task_crash:
 
 ; -------------------------------------------------------------------------
 ; test_task_overflow: canary-guard demo/regression task. Bumps its counter
-; like the others, then deliberately blows its own stack -- 2200 qword
-; pushes (17600 bytes) against a 16384-byte (2048-qword) allocation, with
-; no matching pops, guaranteed to sink RSP past the canary at the stack's
-; lowest address. Nothing pops it back afterward, so this task never
-; touches its (now invalid) stack again; the very next time sched_pick_next
-; considers it as an outgoing task, the corrupted canary gets caught and
-; it's marked terminated exactly like the crash task.
+; like the others, then deliberately blows its own stack -- exactly 2048
+; qword pushes (16384 bytes) against a 16384-byte (2048-qword)
+; allocation, with no matching pops, landing the last push's write
+; exactly on the canary at the stack's lowest address.
+;
+; The push count is exact, not "comfortably past the canary": each
+; task's private stack (see sched.inc's TASK_STACK_VIRT_BASE) is now
+; individually page-mapped with unmapped guard space immediately below
+; it, not a single kmalloc'd block sitting inside the middle of a larger
+; heap page. Overflowing further than the canary itself would walk off
+; the mapped pages entirely and take a hardware #PF instead of being
+; caught softly by the software canary check this test exists to prove
+; -- a real, if narrower, hardening property of the new design, just
+; not what THIS demo is testing.
+;
+; RSP is restored to a safe position (the stack's top) right after --
+; the canary byte itself stays corrupted (nothing un-writes it, only
+; the pointer moves), but leaving RSP sitting at the very bottom would
+; make the NEXT timer interrupt's own GPR-save push the thing that
+; walks off the mapped pages, before the scheduler ever gets a chance
+; to notice and terminate this task via the software check.
 ; -------------------------------------------------------------------------
 test_task_overflow:
 .loop:
@@ -1193,16 +1209,16 @@ test_task_overflow:
     jnz .delay
     cmp qword [rel test_task_overflow_counter], 3
     jl .loop
-    mov rcx, 2200
+    mov rcx, 2048
 .blow:
     push rax
     dec rcx
     jnz .blow
+    add rsp, 2048*8                     ; restore a safe RSP -- the
+                                         ; canary byte is still clobbered
 .hang:
-    hlt                                 ; RSP is wrecked by now; stop here
-    jmp .hang                           ; (rather than looping back and
-                                         ; blowing it again every pass) and
-                                         ; wait to be switched away from --
+    hlt
+    jmp .hang                           ; wait to be switched away from --
                                          ; the canary check ends this task
                                          ; for good on the next context switch
 
