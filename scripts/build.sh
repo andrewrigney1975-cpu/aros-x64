@@ -11,7 +11,7 @@ mkdir -p "$ROOT/build" "$ROOT/disk/EFI/BOOT" "$ROOT/disk/AROS"
 cp "$ROOT/build/BOOTX64.EFI" "$ROOT/disk/EFI/BOOT/BOOTX64.EFI"
 
 if [[ -f "$ROOT/kernel/kernel.asm" ]]; then
-  "$NASM" -f bin "$ROOT/kernel/kernel.asm" -o "$ROOT/build/KERNEL.BIN"
+  "$NASM" -f bin -I "$ROOT/kernel/" "$ROOT/kernel/kernel.asm" -o "$ROOT/build/KERNEL.BIN"
   cp "$ROOT/build/KERNEL.BIN" "$ROOT/disk/AROS/KERNEL.BIN"
 fi
 

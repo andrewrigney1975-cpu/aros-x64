@@ -22,6 +22,9 @@ ARGS=(
 if [[ "${1:-}" == "--headless" ]]; then
   shift
   ARGS+=(-display none -serial stdio)
+elif [[ "${1:-}" == "--snapshot" ]]; then
+  shift
+  ARGS+=(-display none -serial file:"$(cygpath -w "$ROOT/build/serial.log")" -monitor tcp:127.0.0.1:4444,server,nowait)
 else
   ARGS+=(-serial stdio)
 fi

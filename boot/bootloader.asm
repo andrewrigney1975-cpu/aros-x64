@@ -18,6 +18,7 @@ ORG 0
 %define SECT_ALIGN       0x20
 %define FILE_ALIGN       0x20
 %define KERNEL_LOAD_ADDR 0x200000
+%define MAP_BUF_SIZE     8192
 
 ; -----------------------------------------------------------------------
 ; DOS header (64 bytes) -- only 'MZ' and e_lfanew matter to the PE loader
@@ -203,10 +204,74 @@ entry:
     call serial_puts
 
     ; ---------------------------------------------------------------
-    ; Hand off to the kernel: RCX=ImageHandle, RDX=SystemTable
+    ; Locate GOP and fill in boot_info with the current framebuffer.
     ; ---------------------------------------------------------------
-    mov rcx, r12
-    mov rdx, rbx
+    mov rax, [rbx+0x60]                 ; BootServices
+    lea rcx, [rel guid_gop]
+    xor rdx, rdx                          ; Registration = NULL
+    lea r8,  [rel var_gop]
+    call qword [rax+320]                    ; BS->LocateProtocol
+    test eax, eax
+    jnz .efi_fail
+
+    mov rax, [rel var_gop]                ; EFI_GRAPHICS_OUTPUT_PROTOCOL*
+    mov rax, [rax+24]                       ; -> Mode
+    mov rcx, [rax+24]                        ; Mode->FrameBufferBase
+    mov [rel boot_info+0], rcx
+    mov rcx, [rax+32]                         ; Mode->FrameBufferSize
+    mov [rel boot_info+8], rcx
+    mov rdx, [rax+8]                           ; Mode->Info
+    mov ecx, [rdx+4]                            ; Info->HorizontalResolution
+    mov [rel boot_info+16], ecx
+    mov ecx, [rdx+8]                             ; Info->VerticalResolution
+    mov [rel boot_info+20], ecx
+    mov ecx, [rdx+32]                             ; Info->PixelsPerScanLine
+    mov [rel boot_info+24], ecx
+    mov ecx, [rdx+12]                              ; Info->PixelFormat
+    mov [rel boot_info+28], ecx
+
+    lea rcx, [rel msg_gop_ok]
+    call serial_puts
+
+    ; ---------------------------------------------------------------
+    ; GetMemoryMap + ExitBootServices. The map key can go stale between
+    ; the two calls (e.g. if firmware reclaims memory), so retry a few
+    ; times as the UEFI spec recommends.
+    ; ---------------------------------------------------------------
+    mov r13, 3                            ; retry budget
+.get_map:
+    mov qword [rel var_map_size], MAP_BUF_SIZE
+    mov rax, [rbx+0x60]
+    lea rcx, [rel var_map_size]
+    lea rdx, [rel var_map_buf]
+    lea r8,  [rel var_map_key]
+    lea r9,  [rel var_desc_size]
+    lea r10, [rel var_desc_ver]
+    mov [rsp+32], r10                     ; 5th arg (DescriptorVersion*), on stack
+    call qword [rax+56]                    ; BS->GetMemoryMap
+    test eax, eax
+    jnz .efi_fail
+
+    mov rax, [rbx+0x60]
+    mov rcx, r12                           ; ImageHandle
+    mov rdx, [rel var_map_key]
+    call qword [rax+232]                    ; BS->ExitBootServices
+    test eax, eax
+    jz .ebs_done
+    dec r13
+    jnz .get_map
+    jmp .efi_fail
+
+.ebs_done:
+    ; Boot Services (and ConOut) are gone from here on -- serial I/O
+    ; (plain port I/O, no firmware involved) still works.
+    lea rcx, [rel msg_ebs_ok]
+    call serial_puts
+
+    ; ---------------------------------------------------------------
+    ; Hand off to the kernel: RCX = pointer to boot_info
+    ; ---------------------------------------------------------------
+    lea rcx, [rel boot_info]
     mov rax, [rel var_kernel_addr]
     jmp rax
 
@@ -333,6 +398,8 @@ serial_puts:
 msg_banner:     db 'arOS-X64 bootloader: UEFI entry OK (serial)', 13, 10, 0
 msg_jumping:    db 'arOS-X64 bootloader: kernel loaded, jumping to it...', 13, 10, 0
 msg_efi_fail:   db 'arOS-X64 bootloader: an EFI call failed, halting.', 13, 10, 0
+msg_gop_ok:     db 'arOS-X64 bootloader: GOP framebuffer located.', 13, 10, 0
+msg_ebs_ok:     db 'arOS-X64 bootloader: ExitBootServices OK.', 13, 10, 0
 
 msg_banner_u16:
     db __utf16le__(`arOS-X64 bootloader: UEFI entry OK\r\n`), 0, 0
@@ -358,6 +425,13 @@ guid_file_info:
     dw 0x11d2
     db 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B
 
+; EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID {9042A9DE-23DC-4A38-96FB-7ADED080516A}
+guid_gop:
+    dd 0x9042A9DE
+    dw 0x23DC
+    dw 0x4A38
+    db 0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A
+
 kernel_path_u16:
     db __utf16le__(`\\AROS\\KERNEL.BIN`), 0, 0
 
@@ -369,7 +443,23 @@ var_info_size:            dq 0
 var_kernel_size_io:        dq 0
 var_pages:                   dq 0
 var_kernel_addr:              dq 0
+var_gop:                        dq 0
+var_map_size:                    dq 0
+var_map_key:                      dq 0
+var_desc_size:                     dq 0
+var_desc_ver:                       dq 0
 var_info_buf:                   times 512 db 0
+var_map_buf:                    times MAP_BUF_SIZE db 0
+
+; boot_info passed to the kernel (RCX) once Boot Services are gone.
+align 8
+boot_info:
+    dq 0            ; +0  FramebufferBase
+    dq 0            ; +8  FramebufferSize
+    dd 0            ; +16 Width
+    dd 0            ; +20 Height
+    dd 0            ; +24 PixelsPerScanLine
+    dd 0            ; +28 PixelFormat (0=RGB,1=BGR,2=BitMask,3=BltOnly)
 
 code_end:
     align FILE_ALIGN, db 0
