@@ -375,6 +375,70 @@ entry:
     call serial_puts
 .btest_done:
 
+    ; Verify FAT chain writing: allocate two clusters, link A->B, terminate
+    ; B with an end-of-chain marker, confirm exfat_fat_next_cluster follows
+    ; the link and then the EOC, then clear both FAT entries and free both
+    ; clusters again -- a net no-op on the real volume, safe every boot.
+    call exfat_alloc_cluster
+    test eax, eax
+    jz .ctest_bad
+    mov ebx, eax                        ; ebx = cluster A
+
+    call exfat_alloc_cluster
+    test eax, eax
+    jz .ctest_bad
+    mov esi, eax                        ; esi = cluster B
+
+    mov ecx, ebx
+    mov edx, esi
+    call exfat_fat_set_entry            ; A -> B
+    test eax, eax
+    jz .ctest_bad
+
+    mov ecx, esi
+    mov edx, 0xFFFFFFFF
+    call exfat_fat_set_entry            ; B -> EOC
+    test eax, eax
+    jz .ctest_bad
+
+    mov ecx, ebx
+    call exfat_fat_next_cluster
+    cmp eax, esi
+    jne .ctest_bad
+
+    mov ecx, esi
+    call exfat_fat_next_cluster
+    cmp eax, 0xFFFFFFFF
+    jne .ctest_bad
+
+    mov ecx, ebx
+    xor edx, edx
+    call exfat_fat_set_entry
+    test eax, eax
+    jz .ctest_bad
+    mov ecx, esi
+    xor edx, edx
+    call exfat_fat_set_entry
+    test eax, eax
+    jz .ctest_bad
+
+    mov ecx, ebx
+    call exfat_free_cluster
+    test eax, eax
+    jz .ctest_bad
+    mov ecx, esi
+    call exfat_free_cluster
+    test eax, eax
+    jz .ctest_bad
+
+    lea rcx, [rel msg_ctest_ok]
+    call serial_puts
+    jmp .ctest_done
+.ctest_bad:
+    lea rcx, [rel msg_ctest_bad]
+    call serial_puts
+.ctest_done:
+
     ; Bring up the scheduler: the current flow becomes the "main" task
     ; (its TCB.rsp gets filled in on its own first save -- it doesn't need
     ; a hand-built frame like task_create produces, since it's already
@@ -983,6 +1047,8 @@ msg_wtest_ok:         db 'storage_write_sectors: scratch write/read-back OK', 13
 msg_wtest_bad:        db 'storage_write_sectors: scratch write/read-back FAILED', 13, 10, 0
 msg_btest_ok:         db 'exFAT: allocation bitmap alloc/free round-trip OK', 13, 10, 0
 msg_btest_bad:        db 'exFAT: allocation bitmap alloc/free round-trip FAILED', 13, 10, 0
+msg_ctest_ok:         db 'exFAT: FAT chain link/follow/free round-trip OK', 13, 10, 0
+msg_ctest_bad:        db 'exFAT: FAT chain link/follow/free round-trip FAILED', 13, 10, 0
 msg_sched_ok:         db 'Scheduler: armed (main + 2 test tasks)', 13, 10, 0
 msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
 msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0

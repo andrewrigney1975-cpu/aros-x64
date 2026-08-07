@@ -279,6 +279,63 @@ exfat_fat_next_cluster:
     ret
 
 ; -------------------------------------------------------------------------
+; exfat_fat_set_entry: ECX = cluster number, EDX = value to store in its
+; FAT entry (a next-cluster number, or an end-of-chain marker such as
+; 0xFFFFFFFF). Returns EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_fat_set_entry:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r9
+
+    mov r9d, edx                        ; save value to store
+    mov ebx, ecx                        ; ebx = cluster
+    mov eax, ebx
+    shl eax, 2
+    mov edx, eax
+    shr edx, 9                          ; edx = sector index within the FAT
+    and eax, 0x1FF                      ; eax = byte offset within that sector
+    mov esi, eax                        ; esi = in-sector byte offset
+
+    mov ecx, [rel exfat_fat_offset]
+    add ecx, edx
+    add ecx, [rel exfat_base_lba]
+    mov ebx, ecx                        ; ebx = FAT sector LBA
+
+    mov edx, 1
+    lea r8, [rel exfat_fat_sector_buf]
+    call storage_read_sectors
+    test eax, eax
+    jz .fail
+
+    lea rax, [rel exfat_fat_sector_buf]
+    add rax, rsi
+    mov [rax], r9d
+
+    mov rcx, rbx
+    mov edx, 1
+    lea r8, [rel exfat_fat_sector_buf]
+    call storage_write_sectors
+    test eax, eax
+    jz .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r9
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
 ; exfat_bitmap_mount: locates the volume's Allocation Bitmap directory
 ; entry (EntryType 0x81) in the root directory and records its first
 ; cluster + length. Must be called after a successful exfat_mount.
