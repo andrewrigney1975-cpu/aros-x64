@@ -590,11 +590,20 @@ entry:
     jz .sched_bad
     mov r11, rax                        ; r11 = crash-demo task's TCB
 
-    mov [r15+TCB_NEXT], r13             ; ring: main -> A -> B -> exit -> crash -> main
+    mov rcx, test_task_overflow
+    xor edx, edx
+    mov r8, 16384
+    call task_create
+    test rax, rax
+    jz .sched_bad
+    mov r9, rax                         ; r9 = overflow-demo task's TCB
+
+    mov [r15+TCB_NEXT], r13             ; ring: main -> A -> B -> exit -> crash -> overflow -> main
     mov [r13+TCB_NEXT], r14
     mov [r14+TCB_NEXT], r10
     mov [r10+TCB_NEXT], r11
-    mov [r11+TCB_NEXT], r15
+    mov [r11+TCB_NEXT], r9
+    mov [r9+TCB_NEXT], r15
 
     mov [rel current_task], r15         ; arms the scheduler (irq0_stub
                                          ; starts switching on the next tick)
@@ -645,18 +654,22 @@ entry:
     call fb_draw_string
 .sched_verify_done:
 
-    ; Verify process termination: by now test_task_exit and
-    ; test_task_crash should each have hit their counter bound (3) and
-    ; ended themselves -- one voluntarily, one via a deliberate #DE
-    ; exception. Capture their counters, wait again, and confirm: (a)
+    ; Verify process termination: by now test_task_exit, test_task_crash,
+    ; and test_task_overflow should each have hit their counter bound (3)
+    ; and ended themselves -- voluntarily, via a deliberate #DE exception,
+    ; and via a deliberate stack overflow caught by the canary guard,
+    ; respectively. Capture their counters, wait again, and confirm: (a)
     ; they stopped exactly at 3 (never got a 4th increment, proving they
     ; really terminated rather than just running slowly), and (b) A/B
-    ; kept advancing throughout (proving neither termination path took
-    ; the rest of the system down with it).
+    ; kept advancing throughout (proving none of the termination paths
+    ; took the rest of the system down with it).
     mov rax, [rel test_task_exit_counter]
     cmp rax, 3
     jne .term_verify_bad
     mov rax, [rel test_task_crash_counter]
+    cmp rax, 3
+    jne .term_verify_bad
+    mov rax, [rel test_task_overflow_counter]
     cmp rax, 3
     jne .term_verify_bad
 
@@ -671,6 +684,8 @@ entry:
     cmp qword [rel test_task_exit_counter], 3
     jne .term_verify_bad                ; must not have incremented again
     cmp qword [rel test_task_crash_counter], 3
+    jne .term_verify_bad
+    cmp qword [rel test_task_overflow_counter], 3
     jne .term_verify_bad
 
     mov rax, [rel test_task_a_counter]
@@ -789,6 +804,38 @@ test_task_crash:
     xor ecx, ecx
     div ecx                             ; the exception handler terminates
     jmp .loop                           ; us here; never actually reached
+
+; -------------------------------------------------------------------------
+; test_task_overflow: canary-guard demo/regression task. Bumps its counter
+; like the others, then deliberately blows its own stack -- 2200 qword
+; pushes (17600 bytes) against a 16384-byte (2048-qword) allocation, with
+; no matching pops, guaranteed to sink RSP past the canary at the stack's
+; lowest address. Nothing pops it back afterward, so this task never
+; touches its (now invalid) stack again; the very next time sched_pick_next
+; considers it as an outgoing task, the corrupted canary gets caught and
+; it's marked terminated exactly like the crash task.
+; -------------------------------------------------------------------------
+test_task_overflow:
+.loop:
+    inc qword [rel test_task_overflow_counter]
+    mov rcx, 5000000
+.delay:
+    dec rcx
+    jnz .delay
+    cmp qword [rel test_task_overflow_counter], 3
+    jl .loop
+    mov rcx, 2200
+.blow:
+    push rax
+    dec rcx
+    jnz .blow
+.hang:
+    hlt                                 ; RSP is wrecked by now; stop here
+    jmp .hang                           ; (rather than looping back and
+                                         ; blowing it again every pass) and
+                                         ; wait to be switched away from --
+                                         ; the canary check ends this task
+                                         ; for good on the next context switch
 
 ; -------------------------------------------------------------------------
 ; storage_init_and_test: locate an AHCI controller over PCI, bring up its
@@ -1852,7 +1899,7 @@ exfat_crtest_name:    db 'CRTEST.TXT', 0
 msg_wftest_ok:        db 'exFAT: exfat_write_file multi-cluster round-trip OK', 13, 10, 0
 msg_wftest_bad:       db 'exFAT: exfat_write_file multi-cluster round-trip FAILED', 13, 10, 0
 exfat_wtest_name:     db 'WFTEST.TXT', 0
-msg_sched_ok:         db 'Scheduler: armed (main + 4 test tasks)', 13, 10, 0
+msg_sched_ok:         db 'Scheduler: armed (main + 5 test tasks)', 13, 10, 0
 msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
 msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0
 msg_sched_verify_bad: db 'Scheduler: a test task made no progress (preemption FAILED)', 13, 10, 0
@@ -1865,6 +1912,7 @@ test_task_a_counter: dq 0
 test_task_b_counter: dq 0
 test_task_exit_counter:  dq 0
 test_task_crash_counter: dq 0
+test_task_overflow_counter: dq 0
 exfat_test_name:      db 'TEST.TXT', 0
 exfat_marker:         db 'END-OF-FILE-MARKER'
 

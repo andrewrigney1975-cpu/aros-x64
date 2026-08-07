@@ -13,20 +13,23 @@
 ; Tasks are kernel-only (ring 0, flat GDT selectors already in use
 ; elsewhere), share the one kernel address space (no per-task CR3 yet).
 ;
-; Termination: a task can end itself (task_exit) or be ended by the
-; kernel (an unhandled CPU exception while the scheduler is armed marks
-; the faulting task terminated instead of halting the whole system --
-; see idt.inc's isr_common). Either way this just sets TCB_STATE and
-; leaves the task's own execution stopped (a terminated task's saved
-; RSP is simply never chosen again); the actual kfree of its TCB+stack
-; happens later, from ordinary (non-interrupt) context, via
-; sched_reap_zombies -- freeing memory from inside an ISR/exception
-; handler is avoidable complexity this design just sidesteps by
-; deferring it. sched_pick_next is the one place that walks the ready
-; ring looking for the next task to run; it's also where terminated
-; tasks get spliced out and queued for reaping, so both the timer ISR
-; and the exception handler share it instead of duplicating the skip
-; logic.
+; Termination: a task can end itself (task_exit), be ended by the kernel
+; (an unhandled CPU exception while the scheduler is armed marks the
+; faulting task terminated instead of halting the whole system -- see
+; idt.inc's isr_common), or be ended by a corrupted stack canary
+; (task_create writes a known value at the lowest address of every
+; task's kernel stack; sched_pick_next checks the outgoing task's canary
+; on every scheduling decision and terminates it if a stack overflow has
+; clobbered it). All three just set TCB_STATE and leave the task's own
+; execution stopped (a terminated task's saved RSP is simply never
+; chosen again); the actual kfree of its TCB+stack happens later, from
+; ordinary (non-interrupt) context, via sched_reap_zombies -- freeing
+; memory from inside an ISR/exception handler is avoidable complexity
+; this design just sidesteps by deferring it. sched_pick_next is the one
+; place that walks the ready ring looking for the next task to run; it's
+; also where terminated tasks get spliced out and queued for reaping, so
+; both the timer ISR and the exception handler share it instead of
+; duplicating the skip logic.
 ;
 ; Internal calling convention for this file only: plain registers as
 ; documented per routine, not the MS x64 ABI.
@@ -45,6 +48,8 @@ TCB_STATE_ALIVE      equ 0
 TCB_STATE_TERMINATED equ 1
 
 SCHED_QUANTUM equ 2   ; timer ticks per task (~20ms at the 100Hz PIT rate)
+
+SCHED_STACK_CANARY equ 0xDEADC0DEDEADC0DE
 
 ; -------------------------------------------------------------------------
 ; task_create: RCX = entry point, RDX = argument (delivered in RDI when the
@@ -75,6 +80,11 @@ task_create:
     test rax, rax
     jz .fail_free_tcb
     mov [rbx+TCB_STACK], rax
+    mov rdx, SCHED_STACK_CANARY
+    mov [rax], rdx                      ; canary at the stack's lowest
+                                         ; address -- the first thing an
+                                         ; overflow (stack grows down)
+                                         ; would clobber
 
     mov rsi, rax
     add rsi, r14                        ; rsi = stack top
@@ -139,6 +149,23 @@ sched_pick_next:
     push rbx
     push rdx
     push r8
+
+    ; Stack-overflow guard: verify the outgoing task's canary (written
+    ; at the lowest address of its stack by task_create) is still
+    ; intact. Skipped for tasks with no kmalloc'd stack of their own
+    ; (TCB_STACK==0 -- the main task runs on the kernel's own boot
+    ; stack, which this doesn't bound or own). A corrupted canary means
+    ; that task overflowed its stack into adjacent heap memory at some
+    ; point during its last time slice; terminate it now rather than
+    ; let it keep running (and corrupting more) or resume it later.
+    mov rdx, [rax+TCB_STACK]
+    test rdx, rdx
+    jz .no_canary_check
+    mov rbx, SCHED_STACK_CANARY
+    cmp qword [rdx], rbx
+    je .no_canary_check
+    mov dword [rax+TCB_STATE], TCB_STATE_TERMINATED
+.no_canary_check:
 
     mov rcx, [rax+TCB_NEXT]
 .check:
