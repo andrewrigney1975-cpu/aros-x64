@@ -309,6 +309,13 @@ concern once more of the kernel exists.
   needs ring 3 + syscalls, out of scope here.
 - exFAT write path: file names capped at 64 ASCII characters
   (`EXFAT_MAX_NAME_LEN`).
+- One unresolved anomaly: a file written to a freshly-formatted
+  `testdata/exfat_test.vhd` by Windows (PowerShell, before the kernel ever
+  boots) is invisible to the kernel's own exFAT lookups, reproduced on two
+  separate from-scratch VHDs -- not a worn-volume artifact as previously
+  suspected. Files created by the kernel itself are unaffected and found
+  reliably every time; only pre-seeded, externally-written files are hit.
+  Root cause unconfirmed.
 - BASIX64: `FOR` loop control values are always truncated to int, names
   limited to 15 ASCII characters, no nested-FOR beyond 8 levels deep, no
   float literal scientific-notation *display* (only accepted on input), no
