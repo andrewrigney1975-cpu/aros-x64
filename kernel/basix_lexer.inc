@@ -43,6 +43,9 @@ TOK_SFLOAT  equ 28
 TOK_DFLOAT  equ 29
 TOK_END     equ 30
 TOK_MOD     equ 31
+TOK_AND     equ 32
+TOK_OR      equ 33
+TOK_NOT     equ 34
 
 TOK_PLUS    equ 40
 TOK_MINUS   equ 41
@@ -415,7 +418,8 @@ basix_lex_next:
 
 .number_lit:
     xor r8, r8                          ; r8 = accumulated integer value
-    pxor xmm0, xmm0                     ; xmm0 = accumulated double value (int part)
+    pxor xmm0, xmm0                     ; xmm0 = accumulated double value (mantissa)
+    xor r9d, r9d                        ; r9d = is_float flag (0/1)
 .int_digits:
     movzx eax, byte [rsi]
     call basix_is_digit
@@ -434,11 +438,12 @@ basix_lex_next:
     jmp .int_digits
 .after_int:
     cmp byte [rsi], '.'
-    jne .int_done
+    jne .check_exp
     movzx eax, byte [rsi+1]
     call basix_is_digit
     test eax, eax
-    jz .int_done                        ; a lone '.' isn't a float literal here
+    jz .check_exp                       ; a lone '.' isn't part of the number
+    mov r9d, 1                          ; has a fractional part -> float
     inc rsi                             ; consume '.'
     pxor xmm2, xmm2                     ; xmm2 = fractional value
     movsd xmm3, [rel basix_const_1]     ; xmm3 = scale
@@ -458,13 +463,82 @@ basix_lex_next:
 .frac_done:
     divsd xmm2, xmm3
     addsd xmm0, xmm2
-    movsd [rel basix_tok_dval], xmm0
-    mov dword [rel basix_tok_type], TOK_FLOAT
-    mov [rel basix_cursor], rsi
-    jmp .out
-.int_done:
+
+.check_exp:
+    ; Optional exponent suffix: [eE][+-]?digits. Only consumed if a real
+    ; digit follows the optional sign -- otherwise leave the source
+    ; alone (e.g. a bare identifier starting with 'e' right after a
+    ; number, however unlikely, must not be swallowed).
+    movzx eax, byte [rsi]
+    cmp al, 'e'
+    je .has_exp_char
+    cmp al, 'E'
+    jne .finish_number
+.has_exp_char:
+    xor ebx, ebx                        ; ebx = offset of first digit to check
+    inc ebx
+    movzx eax, byte [rsi+1]
+    cmp al, '+'
+    je .exp_has_sign
+    cmp al, '-'
+    jne .exp_check_digit
+.exp_has_sign:
+    mov ebx, 2
+.exp_check_digit:
+    movzx eax, byte [rsi+rbx]
+    call basix_is_digit
+    test eax, eax
+    jz .finish_number                   ; not a real exponent -- don't consume
+
+    mov r9d, 1                          ; an exponent always makes this a float
+    inc rsi                             ; consume 'e'/'E'
+    xor ebx, ebx                        ; ebx = exponent sign (0=+, 1=-)
+    cmp byte [rsi], '+'
+    je .exp_skip_sign
+    cmp byte [rsi], '-'
+    jne .exp_digits
+    mov ebx, 1
+.exp_skip_sign:
+    inc rsi
+.exp_digits:
+    xor edi, edi                        ; edi = exponent magnitude
+.exp_digit_loop:
+    movzx eax, byte [rsi]
+    call basix_is_digit
+    test eax, eax
+    jz .exp_apply
+    movzx eax, byte [rsi]
+    sub eax, '0'
+    imul edi, edi, 10
+    add edi, eax
+    inc rsi
+    jmp .exp_digit_loop
+.exp_apply:
+    test edi, edi
+    jz .finish_number
+.exp_scale_loop:
+    test edi, edi
+    jz .finish_number
+    test ebx, ebx
+    jnz .exp_div
+    mulsd xmm0, [rel basix_const_10]
+    jmp .exp_scale_next
+.exp_div:
+    divsd xmm0, [rel basix_const_10]
+.exp_scale_next:
+    dec edi
+    jmp .exp_scale_loop
+
+.finish_number:
+    test r9d, r9d
+    jnz .is_float
     mov [rel basix_tok_ival], r8
     mov dword [rel basix_tok_type], TOK_INT
+    mov [rel basix_cursor], rsi
+    jmp .out
+.is_float:
+    movsd [rel basix_tok_dval], xmm0
+    mov dword [rel basix_tok_type], TOK_FLOAT
     mov [rel basix_cursor], rsi
     jmp .out
 
@@ -604,5 +678,17 @@ basix_keywords:
     db 3
     dd TOK_MOD
     db 'MOD', 0,0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 3
+    dd TOK_AND
+    db 'AND', 0,0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 2
+    dd TOK_OR
+    db 'OR', 0,0,0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 3
+    dd TOK_NOT
+    db 'NOT', 0,0,0,0,0,0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table

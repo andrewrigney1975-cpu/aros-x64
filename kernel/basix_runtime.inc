@@ -96,13 +96,16 @@ basix_rt_print_str:
 
 ; -------------------------------------------------------------------------
 ; basix_rt_print_double: XMM0 = double value. Prints sign, integer part
-; (reusing basix_rt_print_int), a decimal point, and a fixed 6 fractional
-; digits (no trailing-zero trimming or scientific notation -- v1
-; simplification, not a general-purpose float formatter).
+; (reusing basix_rt_print_int), a decimal point, and up to 6 fractional
+; digits with trailing zeros trimmed (but always at least one digit, so
+; a whole value like 3.0 still reads as a float, not "3"). Fixed 6-digit
+; precision, no scientific notation -- v1 simplification, not a general-
+; purpose float formatter.
 ; -------------------------------------------------------------------------
 basix_rt_print_double:
     push rax
     push rcx
+    push rsi
     push r8
 
     xorpd xmm1, xmm1
@@ -123,21 +126,47 @@ basix_rt_print_double:
     cvtsi2sd xmm1, rcx
     subsd xmm0, xmm1            ; xmm0 = fractional part, 0 <= frac < 1
 
+    lea rsi, [rel basix_rt_frac_buf]
     mov r8d, 6
 .digit_loop:
     test r8d, r8d
-    jz .done
+    jz .digits_done
     mulsd xmm0, [rel basix_rt_ten]
     cvttsd2si rcx, xmm0
     mov eax, ecx
     add al, '0'
-    call console_putc
+    mov [rsi], al
+    inc rsi
     cvtsi2sd xmm1, rcx
     subsd xmm0, xmm1
     dec r8d
     jmp .digit_loop
+.digits_done:
+    ; trim trailing '0's, but keep at least one digit
+    lea rax, [rel basix_rt_frac_buf]
+    dec rsi
+.trim_loop:
+    cmp rsi, rax
+    jle .print_frac
+    cmp byte [rsi], '0'
+    jne .print_frac
+    dec rsi
+    jmp .trim_loop
+.print_frac:
+    lea rax, [rel basix_rt_frac_buf]
+    sub rsi, rax
+    inc rsi                     ; rsi = number of digits to print
+    xor ecx, ecx
+.print_loop:
+    cmp ecx, esi
+    jge .done
+    movzx eax, byte [rel basix_rt_frac_buf + rcx]
+    call console_putc
+    inc ecx
+    jmp .print_loop
 .done:
     pop r8
+    pop rsi
     pop rcx
     pop rax
     ret
@@ -161,3 +190,4 @@ basix_rt_digit_buf: times 20 db 0
 
 align 8
 basix_rt_ten: dq 10.0
+basix_rt_frac_buf: times 6 db 0

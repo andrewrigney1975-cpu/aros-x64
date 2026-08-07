@@ -11,23 +11,31 @@
 ;              | ident ':'                              (label)
 ;              | PRINT printitem (',' printitem)*
 ;              | IF condition THEN NEWLINE block (ELSE NEWLINE block)? ENDIF
+;              | IF condition THEN statement (ELSE statement)?  (single-line)
 ;              | FOR ident '=' expr TO expr (STEP expr)? NEWLINE block NEXT ident?
 ;              | WHILE condition NEWLINE block WEND
 ;              | GOTO ident | GOSUB ident | RETURN
 ;              | DIM ident AS (INTEGER|SFLOAT|DFLOAT)
 ;              | END
 ;   printitem := expr | STRING
-;   condition := expr relop expr                         (exactly one relop)
+;   condition := bool_or
+;   bool_or   := bool_and ('OR' bool_and)*
+;   bool_and  := bool_unary ('AND' bool_unary)*
+;   bool_unary:= 'NOT' bool_unary | comparison
+;   comparison:= expr relop expr | expr     (bare expr: nonzero = true)
 ;   expr      := term (('+'|'-') term)*
 ;   term      := unary (('*'|'/'|MOD) unary)*
 ;   unary     := '-' unary | primary
 ;   primary   := INT | FLOAT | ident | '(' expr ')'
 ;
-; No boolean-valued expressions: relops are only legal as the entire
-; condition of IF/WHILE, compiled directly to a conditional jump rather
-; than a materialized 0/1 value. No single-line IF, no AND/OR/NOT, no
-; nested-FOR temp collision (each FOR nesting level gets its own hidden
-; end/step slot, up to BASIX_MAX_FOR_DEPTH).
+; Comparisons materialize a plain 0/1 int (SETcc+MOVZX) rather than
+; jumping directly, so AND/OR/NOT compose with ordinary integer bitwise
+; ops -- no short-circuit evaluation (every operand is always fully
+; evaluated, which is fine as long as expressions have no side effects,
+; true in this language as of stage 2). basix_parse_condition adds one
+; final TEST+JE on top to get back to a single false-jump patch address
+; for IF/WHILE. No nested-FOR temp collision (each FOR nesting level
+; gets its own hidden end/step slot, up to BASIX_MAX_FOR_DEPTH).
 ; =============================================================================
 
 ; -------------------------------------------------------------------------
@@ -292,7 +300,7 @@ basix_parse_term:
 .domod:
     cmp r10d, 0
     je .domod_int
-    mov dword [rel basix_compile_ok], 0  ; MOD requires both operands int
+    call basix_emit_fmod
     jmp .loop
 .domod_int:
     call basix_emit_cqo
@@ -351,18 +359,18 @@ basix_parse_arith:
     ret
 
 ; -------------------------------------------------------------------------
-; basix_parse_condition: parses "arith relop arith", emits the comparison
-; (integer CMP or float COMISD, per the combined operand type) and an
-; inverted conditional jump (taken when the condition is FALSE). Returns
-; RAX = absolute address of the jump's rel32 field, to be patched later
-; with the false-branch target via basix_patch_rel32.
+; basix_parse_comparison: parses "arith relop arith", or a bare arith
+; expression used as a boolean (nonzero/true). Leaves a plain 0/1 in RAX
+; (via SETcc + MOVZX, not a jump -- AND/OR/NOT compose on top of this
+; with ordinary integer bitwise ops, so there's no short-circuit control
+; flow to thread through here). R11D is always 0 on return (booleans are
+; plain ints).
 ; -------------------------------------------------------------------------
-basix_parse_condition:
+basix_parse_comparison:
     push r10
     push r12
     call basix_parse_arith
     mov r10d, r11d
-    call basix_emit_push_operand
 
     mov r12d, [rel basix_tok_type]
     cmp r12d, TOK_EQ
@@ -377,82 +385,177 @@ basix_parse_condition:
     je .relop_ok
     cmp r12d, TOK_GE
     je .relop_ok
-    mov dword [rel basix_compile_ok], 0
-    jmp .after_relop
-.relop_ok:
-    call basix_lex_next
-.after_relop:
+    jmp .bare_value              ; no relop -- the value itself is the boolean
 
+.relop_ok:
+    call basix_emit_push_operand
+    call basix_lex_next
     call basix_parse_arith               ; r11d = right's type
     call basix_combine_operands          ; eax = combined type
 
     cmp eax, 0
     jne .float_cmp
     call basix_emit_cmp_rax_rcx
-    jmp .pick_jcc_int
+    jmp .pick_setcc_int
 .float_cmp:
     call basix_emit_comisd
-
     cmp r12d, TOK_EQ
-    je .finv_ne
+    je .fs_eq
     cmp r12d, TOK_NE
-    je .finv_eq
+    je .fs_ne
     cmp r12d, TOK_LT
-    je .finv_ge
+    je .fs_lt
     cmp r12d, TOK_GT
-    je .finv_le
+    je .fs_gt
     cmp r12d, TOK_LE
-    je .finv_gt
-    mov al, 0x82                        ; TOK_GE -> JB
-    jmp .emit_jcc
-.finv_ne:
-    mov al, 0x85                        ; JNE
-    jmp .emit_jcc
-.finv_eq:
-    mov al, 0x84                        ; JE
-    jmp .emit_jcc
-.finv_ge:
-    mov al, 0x83                        ; JAE
-    jmp .emit_jcc
-.finv_le:
-    mov al, 0x86                        ; JBE
-    jmp .emit_jcc
-.finv_gt:
-    mov al, 0x87                        ; JA
-    jmp .emit_jcc
+    je .fs_le
+    call basix_emit_setae                ; TOK_GE
+    jmp .finish_set
+.fs_eq:
+    call basix_emit_sete
+    jmp .finish_set
+.fs_ne:
+    call basix_emit_setne
+    jmp .finish_set
+.fs_lt:
+    call basix_emit_setb
+    jmp .finish_set
+.fs_gt:
+    call basix_emit_seta
+    jmp .finish_set
+.fs_le:
+    call basix_emit_setbe
+    jmp .finish_set
 
-.pick_jcc_int:
+.pick_setcc_int:
     cmp r12d, TOK_EQ
-    je .inv_ne
+    je .is_eq
     cmp r12d, TOK_NE
-    je .inv_eq
+    je .is_ne
     cmp r12d, TOK_LT
-    je .inv_ge
+    je .is_lt
     cmp r12d, TOK_GT
-    je .inv_le
+    je .is_gt
     cmp r12d, TOK_LE
-    je .inv_gt
-    mov al, 0x8C                        ; TOK_GE -> JL
-    jmp .emit_jcc
-.inv_ne:
-    mov al, 0x85                        ; JNE
-    jmp .emit_jcc
-.inv_eq:
-    mov al, 0x84                        ; JE
-    jmp .emit_jcc
-.inv_ge:
-    mov al, 0x8D                        ; JGE
-    jmp .emit_jcc
-.inv_le:
-    mov al, 0x8E                        ; JLE
-    jmp .emit_jcc
-.inv_gt:
-    mov al, 0x8F                        ; JG
-.emit_jcc:
-    call basix_emit_jcc_placeholder
+    je .is_le
+    call basix_emit_setge                ; TOK_GE
+    jmp .finish_set
+.is_eq:
+    call basix_emit_sete
+    jmp .finish_set
+.is_ne:
+    call basix_emit_setne
+    jmp .finish_set
+.is_lt:
+    call basix_emit_setl
+    jmp .finish_set
+.is_gt:
+    call basix_emit_setg
+    jmp .finish_set
+.is_le:
+    call basix_emit_setle
+
+.finish_set:
+    call basix_emit_movzx_eax_al
+    xor r11d, r11d
     pop r12
     pop r10
     ret
+
+.bare_value:
+    cmp r10d, 0
+    jne .bare_float
+    call basix_emit_test_rax_rax
+    call basix_emit_setne
+    jmp .bare_finish
+.bare_float:
+    call basix_emit_pxor_xmm1_xmm1
+    call basix_emit_comisd
+    call basix_emit_setne
+.bare_finish:
+    call basix_emit_movzx_eax_al
+    xor r11d, r11d
+    pop r12
+    pop r10
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_bool_unary: 'NOT' bool_unary | '(' condition ')' | comparison
+;
+; A leading '(' here is always treated as wrapping a full boolean
+; sub-expression (so "NOT (a < b)" and "(a < b) AND (c < d)" work). The
+; one known gap: parenthesizing just *one side* of a comparison at the
+; outermost condition position -- e.g. "(x+1) = 5" -- doesn't work,
+; since the paren content gets evaluated and materialized as a boolean
+; (nonzero-is-true) before the trailing "= 5" is ever seen; resolving
+; that in general needs backtracking this parser doesn't have. Wrap the
+; *whole* comparison instead: "((x+1) = 5)" works fine, since by the
+; time the outer '(' is seen here, the inner one is handled by
+; basix_parse_primary's ordinary arithmetic-paren case instead.
+; -------------------------------------------------------------------------
+basix_parse_bool_unary:
+    cmp dword [rel basix_tok_type], TOK_NOT
+    jne .check_paren
+    call basix_lex_next
+    call basix_parse_bool_unary
+    jmp basix_emit_xor_eax_1
+.check_paren:
+    cmp dword [rel basix_tok_type], TOK_LPAREN
+    jne basix_parse_comparison
+    call basix_lex_next
+    call basix_parse_bool_or
+    mov eax, TOK_RPAREN
+    call basix_expect
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_bool_and: bool_unary ('AND' bool_unary)*
+; -------------------------------------------------------------------------
+basix_parse_bool_and:
+    call basix_parse_bool_unary
+.loop:
+    cmp dword [rel basix_tok_type], TOK_AND
+    jne .done
+    call basix_emit_push_rax
+    call basix_lex_next
+    call basix_parse_bool_unary
+    call basix_emit_mov_rcx_rax
+    call basix_emit_pop_rax
+    call basix_emit_and_rax_rcx
+    jmp .loop
+.done:
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_bool_or: bool_and ('OR' bool_and)*
+; -------------------------------------------------------------------------
+basix_parse_bool_or:
+    call basix_parse_bool_and
+.loop:
+    cmp dword [rel basix_tok_type], TOK_OR
+    jne .done
+    call basix_emit_push_rax
+    call basix_lex_next
+    call basix_parse_bool_and
+    call basix_emit_mov_rcx_rax
+    call basix_emit_pop_rax
+    call basix_emit_or_rax_rcx
+    jmp .loop
+.done:
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_condition: parses a full boolean expression (comparisons
+; combined with AND/OR/NOT) and emits a single conditional jump, taken
+; when the condition is FALSE. Returns RAX = absolute address of the
+; jump's rel32 field, to be patched later with the false-branch target
+; via basix_patch_rel32.
+; -------------------------------------------------------------------------
+basix_parse_condition:
+    call basix_parse_bool_or             ; leaves a final 0/1 in RAX
+    call basix_emit_test_rax_rax
+    mov al, 0x84                         ; JE -- jump when RAX==0 (false)
+    jmp basix_emit_jcc_placeholder
 
 ; -------------------------------------------------------------------------
 ; basix_parse_block: EAX = terminator1, EDX = terminator2 (0xFFFFFFFF if
@@ -523,7 +626,10 @@ basix_parse_assignment:
     ret
 
 ; -------------------------------------------------------------------------
-; basix_parse_if: IF keyword already consumed.
+; basix_parse_if: IF keyword already consumed. Supports both forms:
+;   block form:       IF cond THEN NEWLINE block (ELSE NEWLINE block)? ENDIF
+;   single-line form:  IF cond THEN stmt (ELSE stmt)?
+; distinguished by whether a NEWLINE immediately follows THEN.
 ; -------------------------------------------------------------------------
 basix_parse_if:
     push r12
@@ -532,8 +638,11 @@ basix_parse_if:
 
     mov eax, TOK_THEN
     call basix_expect
-    mov eax, TOK_NEWLINE
-    call basix_expect
+
+    cmp dword [rel basix_tok_type], TOK_NEWLINE
+    jne .single_line
+
+    call basix_lex_next                 ; consume NEWLINE
 
     mov eax, TOK_ELSE
     mov edx, TOK_ENDIF
@@ -573,6 +682,38 @@ basix_parse_if:
 .expect_endif:
     mov eax, TOK_ENDIF
     call basix_expect
+    pop r12
+    ret
+
+.single_line:
+    call basix_parse_statement
+    cmp dword [rel basix_tok_type], TOK_ELSE
+    jne .single_no_else
+
+    call basix_emit_jmp_placeholder
+    push rax
+
+    call basix_emit_here
+    mov rcx, r12
+    mov rdx, rax
+    call basix_patch_rel32
+
+    call basix_lex_next                 ; consume ELSE
+    call basix_parse_statement
+
+    pop rcx
+    call basix_emit_here
+    mov rdx, rax
+    call basix_patch_rel32
+    jmp .single_out
+
+.single_no_else:
+    call basix_emit_here
+    mov rcx, r12
+    mov rdx, rax
+    call basix_patch_rel32
+
+.single_out:
     pop r12
     ret
 
