@@ -1746,3 +1746,4 @@ gdt_descriptor:
 %include "storage.inc"
 %include "exfat.inc"
 %include "keyboard.inc"
+%include "basix_lexer.inc"
