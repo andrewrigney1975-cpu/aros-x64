@@ -624,6 +624,8 @@ entry:
     call fb_draw_string
 .sched_verify_done:
 
+    call shell_main                     ; never returns
+
 .hang:
     hlt
     jmp .hang
@@ -1024,10 +1026,495 @@ fb_draw_string:
     ret
 
 ; -------------------------------------------------------------------------
-; draw_logo: draws the boot-splash ASCII art (logo.inc, generated from
-; arOS.txt) at the top of the screen, one source line per text row
-; starting at row 0.
+; console_init: clears the screen and resets the scrolling text console
+; (used by the shell) to the top-left, computing its size in 8x16 cells
+; from the framebuffer's actual resolution.
 ; -------------------------------------------------------------------------
+console_init:
+    push rax
+    push rcx
+    push rdx
+
+    call fb_clear
+
+    mov eax, [rbx+FB_WIDTH]
+    xor edx, edx
+    mov ecx, 8
+    div ecx
+    mov [rel console_cols], eax
+
+    mov eax, [rbx+FB_HEIGHT]
+    xor edx, edx
+    mov ecx, 16
+    div ecx
+    mov [rel console_rows], eax
+
+    mov dword [rel console_col], 0
+    mov dword [rel console_row], 0
+
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; console_scroll_up: shifts the whole framebuffer up by one text row (16
+; scanlines) and clears the newly-exposed bottom row.
+; -------------------------------------------------------------------------
+console_scroll_up:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    mov edx, [rbx+FB_STRIDE]            ; edx = pixels (== dwords) per scanline
+
+    mov eax, [rbx+FB_HEIGHT]
+    sub eax, 16
+    imul eax, edx                       ; eax = dwords to move (rest of screen)
+    mov ecx, eax
+
+    mov rsi, [rbx+FB_BASE]
+    mov rax, rdx
+    shl rax, 4                          ; 16 scanlines worth of dwords
+    lea rsi, [rsi + rax*4]              ; rsi = fb_base + 16 scanlines (src)
+    mov rdi, [rbx+FB_BASE]              ; rdi = fb_base (dst)
+    cld
+    rep movsd
+
+    ; rdi now points at the start of the newly-exposed bottom row; clear it
+    mov eax, edx
+    shl eax, 4                          ; 16 scanlines worth of dwords
+    mov ecx, eax
+    xor eax, eax
+    rep stosd
+
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; console_putc: AL = character. Handles CR/LF (newline), backspace
+; (erase within the current line only -- no cross-line backspace in v1),
+; and ordinary printable characters, including cursor advance, wrap, and
+; scroll.
+; -------------------------------------------------------------------------
+console_putc:
+    push rax
+    push rcx
+    push rdx
+    push r8
+
+    call serial_putc                    ; mirror everything to serial too
+
+    cmp al, 13
+    je .newline
+    cmp al, 10
+    je .newline
+    cmp al, 8
+    je .backspace
+
+    mov r8b, al
+    mov ecx, [rel console_col]
+    mov edx, [rel console_row]
+    call fb_draw_char
+    inc dword [rel console_col]
+    mov eax, [rel console_col]
+    cmp eax, [rel console_cols]
+    jl .out
+    jmp .newline
+
+.backspace:
+    cmp dword [rel console_col], 0
+    je .out
+    dec dword [rel console_col]
+    mov r8b, ' '
+    mov ecx, [rel console_col]
+    mov edx, [rel console_row]
+    call fb_draw_char
+    jmp .out
+
+.newline:
+    mov dword [rel console_col], 0
+    inc dword [rel console_row]
+    mov eax, [rel console_row]
+    cmp eax, [rel console_rows]
+    jl .out
+    call console_scroll_up
+    mov eax, [rel console_rows]
+    dec eax
+    mov [rel console_row], eax
+
+.out:
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; console_puts: RCX = pointer to a NUL-terminated ASCII string.
+; -------------------------------------------------------------------------
+console_puts:
+    push rax
+    push rcx
+    push rsi
+
+    mov rsi, rcx
+.loop:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .done
+    call console_putc
+    inc rsi
+    jmp .loop
+.done:
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+
+; =============================================================================
+; Basic interactive shell: reads a command line from the keyboard, echoes
+; it to the scrolling text console, and dispatches HELP / DIR / TYPE /
+; WRITE / CLEAR. Runs as the tail of the "main" task (see the scheduler
+; bring-up above), so rbx (boot_info*) is already valid here.
+; =============================================================================
+SHELL_LINE_MAX equ 120
+SHELL_TYPE_BUF_MAX equ 8191             ; exfat_test_buf is 8192 bytes; -1 for NUL
+
+; -------------------------------------------------------------------------
+; shell_streq: RCX/RDX = two NUL-terminated ASCII strings. Returns
+; EAX=1/0.
+; -------------------------------------------------------------------------
+shell_streq:
+    push rcx
+    push rdx
+.loop:
+    mov al, [rcx]
+    mov ah, [rdx]
+    cmp al, ah
+    jne .neq
+    test al, al
+    jz .eq
+    inc rcx
+    inc rdx
+    jmp .loop
+.eq:
+    mov eax, 1
+    jmp .out
+.neq:
+    xor eax, eax
+.out:
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; shell_read_line: reads keys into shell_line_buf (NUL-terminated, up to
+; SHELL_LINE_MAX-1 chars), echoing each to the console and honoring
+; backspace, until Enter.
+; -------------------------------------------------------------------------
+shell_read_line:
+    push rax
+    push rcx
+    push rdi
+
+    xor ecx, ecx
+    lea rdi, [rel shell_line_buf]
+.loop:
+    call kbd_read_char
+    cmp al, 13
+    je .enter
+    cmp al, 8
+    je .backspace
+    cmp ecx, SHELL_LINE_MAX-1
+    jge .loop                           ; line full -- drop the character
+    mov [rdi+rcx], al
+    inc ecx
+    call console_putc
+    jmp .loop
+.backspace:
+    test ecx, ecx
+    jz .loop
+    dec ecx
+    call console_putc
+    jmp .loop
+.enter:
+    mov byte [rdi+rcx], 0
+    mov al, 13
+    call console_putc
+    pop rdi
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_dispatch: RCX = ptr to a NUL-terminated command line. Parses the
+; first whitespace-delimited word as the command (case-folded to
+; lowercase) and dispatches on it.
+; -------------------------------------------------------------------------
+shell_dispatch:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    mov rsi, rcx
+.skip_lead:
+    cmp byte [rsi], ' '
+    jne .after_lead
+    inc rsi
+    jmp .skip_lead
+.after_lead:
+    cmp byte [rsi], 0
+    je .out
+
+    lea rdi, [rel shell_cmd_buf]
+    xor ecx, ecx
+.copy_cmd:
+    mov al, [rsi]
+    test al, al
+    jz .cmd_done
+    cmp al, ' '
+    je .cmd_done
+    cmp ecx, 15
+    jge .cmd_done
+    cmp al, 'A'
+    jb .no_fold
+    cmp al, 'Z'
+    ja .no_fold
+    add al, 0x20
+.no_fold:
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .copy_cmd
+.cmd_done:
+    mov byte [rdi+rcx], 0
+
+.skip_arg_lead:
+    cmp byte [rsi], ' '
+    jne .have_args
+    inc rsi
+    jmp .skip_arg_lead
+.have_args:                             ; rsi -> argument text (maybe empty)
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_help]
+    call shell_streq
+    test eax, eax
+    jnz .do_help
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_dir]
+    call shell_streq
+    test eax, eax
+    jnz .do_dir
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_clear]
+    call shell_streq
+    test eax, eax
+    jnz .do_clear
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_type]
+    call shell_streq
+    test eax, eax
+    jnz .do_type
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_write]
+    call shell_streq
+    test eax, eax
+    jnz .do_write
+
+    lea rcx, [rel msg_shell_unknown]
+    call console_puts
+    jmp .out
+
+.do_help:
+    lea rcx, [rel msg_shell_help]
+    call console_puts
+    jmp .out
+
+.do_clear:
+    call console_init
+    jmp .out
+
+.do_dir:
+    call exfat_dir_list_start
+.dir_loop:
+    lea rcx, [rel shell_dir_name_buf]
+    lea rdx, [rel shell_dir_datalen]
+    call exfat_dir_list_next
+    test eax, eax
+    jz .out
+    lea rcx, [rel shell_dir_name_buf]
+    call console_puts
+    lea rcx, [rel msg_shell_nl]
+    call console_puts
+    jmp .dir_loop
+
+.do_type:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.type_copy:
+    mov al, [rsi]
+    test al, al
+    jz .type_arg_done
+    cmp al, ' '
+    je .type_arg_done
+    cmp ecx, 63
+    jge .type_arg_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .type_copy
+.type_arg_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .type_usage
+
+    lea rcx, [rel shell_arg_buf]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .type_notfound
+
+    mov rax, [rel exfat_find_result+8]
+    cmp rax, SHELL_TYPE_BUF_MAX
+    ja .type_toobig
+
+    mov ecx, [rel exfat_find_result+0]
+    mov rdx, [rel exfat_find_result+8]
+    lea r8, [rel exfat_test_buf]
+    mov r9d, [rel exfat_find_result+16]
+    call exfat_read_file
+    test eax, eax
+    jz .type_readfail
+
+    mov rax, [rel exfat_find_result+8]
+    lea rdi, [rel exfat_test_buf]
+    mov byte [rdi+rax], 0
+    lea rcx, [rel exfat_test_buf]
+    call console_puts
+    lea rcx, [rel msg_shell_nl]
+    call console_puts
+    jmp .out
+.type_usage:
+    lea rcx, [rel msg_shell_type_usage]
+    call console_puts
+    jmp .out
+.type_notfound:
+    lea rcx, [rel msg_shell_notfound]
+    call console_puts
+    jmp .out
+.type_toobig:
+    lea rcx, [rel msg_shell_toobig]
+    call console_puts
+    jmp .out
+.type_readfail:
+    lea rcx, [rel msg_shell_readfail]
+    call console_puts
+    jmp .out
+
+.do_write:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.write_name_copy:
+    mov al, [rsi]
+    test al, al
+    jz .write_name_done
+    cmp al, ' '
+    je .write_name_done
+    cmp ecx, 63
+    jge .write_name_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .write_name_copy
+.write_name_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .write_usage
+
+.write_skip_sp:
+    cmp byte [rsi], ' '
+    jne .write_have_content
+    inc rsi
+    jmp .write_skip_sp
+.write_have_content:
+    mov r10, rsi                        ; r10 = content ptr
+    xor r11d, r11d                      ; r11d = content length
+.write_len:
+    cmp byte [r10+r11], 0
+    je .write_len_done
+    inc r11d
+    jmp .write_len
+.write_len_done:
+
+    lea rcx, [rel shell_arg_buf]
+    mov r8, r10
+    mov r9, r11
+    call exfat_write_file
+    test eax, eax
+    jz .write_fail
+
+    lea rcx, [rel msg_shell_write_ok]
+    call console_puts
+    jmp .out
+.write_usage:
+    lea rcx, [rel msg_shell_write_usage]
+    call console_puts
+    jmp .out
+.write_fail:
+    lea rcx, [rel msg_shell_write_fail]
+    call console_puts
+    jmp .out
+
+.out:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; shell_main: the interactive read-eval-print loop. Never returns.
+; -------------------------------------------------------------------------
+shell_main:
+    call console_init
+
+    lea rcx, [rel msg_shell_banner]
+    call console_puts
+
+.prompt:
+    lea rcx, [rel msg_shell_prompt]
+    call console_puts
+
+    call shell_read_line
+
+    lea rcx, [rel shell_line_buf]
+    call shell_dispatch
+
+    jmp .prompt
+
 draw_logo:
     push rcx
     push rdx
@@ -1174,6 +1661,36 @@ align 4096
 exfat_test_buf: times 8192 db 0
 exfat_wtest_src:  times 6000 db 0
 exfat_wtest_read: times 6000 db 0
+
+console_col:  dd 0
+console_row:  dd 0
+console_cols: dd 0
+console_rows: dd 0
+
+shell_str_help:  db 'help', 0
+shell_str_dir:   db 'dir', 0
+shell_str_clear: db 'clear', 0
+shell_str_type:  db 'type', 0
+shell_str_write: db 'write', 0
+
+msg_shell_banner:      db 'arOS-X64 shell. Type HELP for commands.', 13, 10, 0
+msg_shell_prompt:      db '] ', 0
+msg_shell_help:        db 'Commands: HELP  DIR  TYPE <file>  WRITE <file> <text>  CLEAR', 13, 10, 0
+msg_shell_unknown:     db 'Unknown command. Type HELP for a list.', 13, 10, 0
+msg_shell_nl:          db 13, 10, 0
+msg_shell_type_usage:  db 'Usage: TYPE <filename>', 13, 10, 0
+msg_shell_notfound:    db 'File not found.', 13, 10, 0
+msg_shell_toobig:      db 'File too large to display.', 13, 10, 0
+msg_shell_readfail:    db 'Error reading file.', 13, 10, 0
+msg_shell_write_usage: db 'Usage: WRITE <filename> <text>', 13, 10, 0
+msg_shell_write_ok:    db 'File written.', 13, 10, 0
+msg_shell_write_fail:  db 'Write failed (name may already exist).', 13, 10, 0
+
+shell_line_buf:     times SHELL_LINE_MAX db 0
+shell_cmd_buf:      times 16 db 0
+shell_arg_buf:       times 64 db 0
+shell_dir_name_buf: times 256 db 0
+shell_dir_datalen:  dq 0
 
 msg_hello:            db 'Hello, kernal!', 13, 10, 0
 msg_ahci_not_found:   db 'AHCI: no controller found', 13, 10, 0
