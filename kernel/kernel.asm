@@ -302,6 +302,43 @@ entry:
     call fb_draw_string
 .kheap_done:
 
+    ; Verify storage_write_sectors against a scratch LBA far beyond
+    ; anything the exFAT volume currently uses, so this can't corrupt the
+    ; boot sector, partition table, or the TEST.TXT content already there.
+    ; (AHCI's write path was separately hand-verified the same way,
+    ; against its own smaller vvfat-backed disk -- not kept as a
+    ; permanent test since forcing a driver switch mid-boot is more
+    ; disruptive than it's worth for routine regression checking.)
+    mov rcx, 100000
+    mov edx, 1
+    lea r8, [rel exfat_test_buf]
+    mov byte [rel exfat_test_buf], 0x5A
+    mov byte [rel exfat_test_buf+511], 0xA5
+    call storage_write_sectors
+    test eax, eax
+    jz .wtest_bad
+
+    mov rcx, 100000
+    mov edx, 1
+    lea r8, [rel exfat_test_buf]
+    mov byte [rel exfat_test_buf], 0
+    mov byte [rel exfat_test_buf+511], 0
+    call storage_read_sectors
+    test eax, eax
+    jz .wtest_bad
+    cmp byte [rel exfat_test_buf], 0x5A
+    jne .wtest_bad
+    cmp byte [rel exfat_test_buf+511], 0xA5
+    jne .wtest_bad
+
+    lea rcx, [rel msg_wtest_ok]
+    call serial_puts
+    jmp .wtest_done
+.wtest_bad:
+    lea rcx, [rel msg_wtest_bad]
+    call serial_puts
+.wtest_done:
+
     ; Bring up the scheduler: the current flow becomes the "main" task
     ; (its TCB.rsp gets filled in on its own first save -- it doesn't need
     ; a hand-built frame like task_create produces, since it's already
@@ -906,6 +943,8 @@ msg_vmm_ok:           db 'VMM: virtual->physical mapping OK', 13, 10, 0
 msg_vmm_bad:          db 'VMM: virtual->physical mapping FAILED', 13, 10, 0
 msg_kheap_ok:         db 'kmalloc/kfree: alloc/content/reuse OK', 13, 10, 0
 msg_kheap_bad:        db 'kmalloc/kfree: FAILED', 13, 10, 0
+msg_wtest_ok:         db 'storage_write_sectors: scratch write/read-back OK', 13, 10, 0
+msg_wtest_bad:        db 'storage_write_sectors: scratch write/read-back FAILED', 13, 10, 0
 msg_sched_ok:         db 'Scheduler: armed (main + 2 test tasks)', 13, 10, 0
 msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
 msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0

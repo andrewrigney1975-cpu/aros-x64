@@ -1,14 +1,16 @@
 ; =============================================================================
 ; Minimal exFAT reader, built against Microsoft's public exFAT specification.
 ;
-; Scope: read-only, single FAT. exfat_mount looks for the exFAT signature
-; at LBA 0 first (whole-disk/superfloppy volume); if that's not it, it
-; falls back to reading LBA 0 as an MBR and mounting the first partition
-; with a nonzero type byte -- which is what Windows' own diskpart/format
-; actually produces (confirmed against a real diskpart-created exFAT VHD:
-; LBA 0 turned out to be MBR boot code, not the VBR). No GPT support yet.
-; All LBAs this file computes are relative to exfat_base_lba, the start of
-; whichever of those two the volume turned out to be at.
+; Scope: single FAT (read-write since phase 7). exfat_mount looks for the
+; exFAT signature at LBA 0 first (whole-disk/superfloppy volume); if
+; that's not it, it tries GPT (LBA 1 signature "EFI PART", preferring a
+; partition typed as Microsoft Basic Data, else the first non-empty
+; entry), and finally falls back to a legacy MBR partition table at LBA 0
+; -- which is what Windows' own diskpart/format actually produces on a
+; fresh VHD (confirmed against a real one: LBA 0 turned out to be MBR
+; boot code, not the VBR). All LBAs this file computes are relative to
+; exfat_base_lba, the start of whichever of those the volume turned out
+; to be at.
 ;
 ; Internal calling convention for this file only: plain registers as
 ; documented per routine, not the MS x64 ABI.
@@ -19,10 +21,13 @@
 ; geometry. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
 exfat_mount:
+    push rbx
     push rcx
     push rdx
-    push r8
     push rsi
+    push rdi
+    push r8
+    push r9
 
     xor ecx, ecx
     mov edx, 1
@@ -34,14 +39,91 @@ exfat_mount:
     lea rsi, [rel exfat_vbr_buf]
     mov eax, [rsi+3]                    ; FileSystemName[0:4] = "EXFA"
     cmp eax, 0x41465845
-    jne .try_mbr
+    jne .try_gpt
     cmp byte [rsi+7], 'T'               ; FileSystemName[4] = "T"
-    jne .try_mbr
+    jne .try_gpt
 
     mov dword [rel exfat_base_lba], 0
     jmp .parse_vbr
 
+.try_gpt:
+    mov ecx, 1                          ; LBA 1 = GPT header
+    mov edx, 1
+    lea r8, [rel exfat_gpt_buf]
+    call storage_read_sectors
+    test eax, eax
+    jz .try_mbr
+
+    lea rsi, [rel exfat_gpt_buf]
+    mov rax, [rsi+0]
+    mov rbx, 0x5452415020494645         ; "EFI PART"
+    cmp rax, rbx
+    jne .try_mbr
+
+    mov eax, [rsi+84]                   ; SizeOfPartitionEntry
+    mov [rel exfat_gpt_entry_size], eax
+
+    mov ecx, [rsi+72]                   ; PartitionEntryLBA (assumed < 4G)
+    mov edx, 1
+    lea r8, [rel exfat_gpt_buf]
+    call storage_read_sectors
+    test eax, eax
+    jz .try_mbr
+
+    xor edx, edx
+    mov eax, 512
+    mov ecx, [rel exfat_gpt_entry_size]
+    test ecx, ecx
+    jz .try_mbr
+    div ecx                             ; eax = entries that fit in one sector
+    mov ebx, eax                        ; ebx = loop bound
+
+    ; Pass 1: prefer an entry typed as Microsoft Basic Data.
+    lea rsi, [rel exfat_gpt_buf]
+    xor edi, edi
+.gpt_pass1:
+    cmp edi, ebx
+    jge .gpt_pass2
+    mov eax, edi
+    mul dword [rel exfat_gpt_entry_size]
+    lea rdx, [rsi+rax]
+    mov rax, [rdx+0]
+    mov r9, 0x4433B9E5EBD0A0A2           ; Basic Data Partition GUID, qword 1
+    cmp rax, r9
+    jne .gpt_pass1_next
+    mov rax, [rdx+8]
+    mov r9, 0xC79926B7B668C087           ; Basic Data Partition GUID, qword 2
+    cmp rax, r9
+    jne .gpt_pass1_next
+    mov eax, [rdx+32]                   ; StartingLBA (assumed < 4G)
+    mov [rel exfat_base_lba], eax
+    jmp .reread_vbr
+.gpt_pass1_next:
+    inc edi
+    jmp .gpt_pass1
+
+    ; Pass 2: no Basic Data entry; fall back to the first non-empty one.
+.gpt_pass2:
+    xor edi, edi
+.gpt_pass2_loop:
+    cmp edi, ebx
+    jge .try_mbr                        ; nothing usable; fall back to MBR
+    mov eax, edi
+    mul dword [rel exfat_gpt_entry_size]
+    lea rdx, [rsi+rax]
+    mov rax, [rdx+0]
+    mov r9, [rdx+8]
+    or rax, r9
+    jz .gpt_pass2_next
+    mov eax, [rdx+32]
+    mov [rel exfat_base_lba], eax
+    jmp .reread_vbr
+.gpt_pass2_next:
+    inc edi
+    jmp .gpt_pass2_loop
+
 .try_mbr:
+    lea rsi, [rel exfat_vbr_buf]
     cmp word [rsi+510], 0xAA55          ; MBR boot signature
     jne .fail
 
@@ -69,7 +151,8 @@ exfat_mount:
     call storage_read_sectors
     test eax, eax
     jz .fail
-    mov eax, [rsi+3]
+    lea rsi, [rel exfat_vbr_buf]        ; may still point at exfat_gpt_buf
+    mov eax, [rsi+3]                     ; from whichever path got us here
     cmp eax, 0x41465845
     jne .fail
     cmp byte [rsi+7], 'T'
@@ -102,10 +185,13 @@ exfat_mount:
 .fail:
     xor eax, eax
 .out:
-    pop rsi
+    pop r9
     pop r8
+    pop rdi
+    pop rsi
     pop rdx
     pop rcx
+    pop rbx
     ret
 
 ; -------------------------------------------------------------------------
@@ -461,10 +547,12 @@ exfat_cluster_count:       dd 0
 exfat_root_dir_cluster:    dd 0
 exfat_bytes_per_sector:    dd 0
 exfat_sectors_per_cluster: dd 0
+exfat_gpt_entry_size:      dd 0
 
 align 512
 exfat_vbr_buf:        times 512 db 0
 exfat_fat_sector_buf: times 512 db 0
+exfat_gpt_buf:        times 512 db 0
 
 ; NOTE: sized for our test volume's 4096-byte clusters. Real volumes can
 ; use larger clusters (up to 32MB per spec); once the heap allocator

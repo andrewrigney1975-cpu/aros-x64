@@ -26,4 +26,20 @@ storage_read_sectors:
 .use_ahci:
     jmp ahci_read_sectors
 
+; -------------------------------------------------------------------------
+; storage_write_sectors: RCX = LBA, RDX = sector count, R8 = buffer.
+; Returns EAX = 1/0. Fails immediately (EAX=0) if no driver is active.
+; -------------------------------------------------------------------------
+storage_write_sectors:
+    cmp dword [rel storage_active_driver], STORAGE_NVME
+    je .use_nvme
+    cmp dword [rel storage_active_driver], STORAGE_AHCI
+    je .use_ahci
+    xor eax, eax
+    ret
+.use_nvme:
+    jmp nvme_write_sectors
+.use_ahci:
+    jmp ahci_write_sectors
+
 storage_active_driver: dd STORAGE_NONE

@@ -390,6 +390,53 @@ nvme_read_sectors:
     pop rcx
     ret
 
+; -------------------------------------------------------------------------
+; nvme_write_sectors: RCX = LBA (64-bit), RDX = sector count (1-65536),
+; R8 = source buffer. Same shape as nvme_read_sectors, just opcode WRITE
+; (0x01) with PRP1 pointing at data the controller reads FROM instead of
+; writes to. Returns EAX=1/0.
+; -------------------------------------------------------------------------
+nvme_write_sectors:
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r10
+
+    mov rsi, r8                         ; rsi = source buffer
+    mov r10, rcx                        ; r10 = LBA
+
+    lea rdi, [rel nvme_sqe_scratch]
+    push rdi
+    xor eax, eax
+    mov ecx, 8
+    cld
+    rep stosq
+    pop rdi
+
+    mov dword [rdi+0], 0x00000001       ; CDW0: opcode = WRITE
+    mov dword [rdi+4], 1                ; NSID = 1
+    mov [rdi+24], rsi                   ; PRP1 = source buffer
+    mov eax, r10d
+    mov [rdi+40], eax                   ; CDW10: SLBA[31:0]
+    mov rax, r10
+    shr rax, 32
+    mov [rdi+44], eax                   ; CDW11: SLBA[63:32]
+    mov eax, edx
+    dec eax                             ; CDW12: NLB (0's-based)
+    mov [rdi+48], eax
+
+    lea rcx, [rel nvme_sqe_scratch]
+    lea rdx, [rel nvme_io_qpair]
+    call nvme_do_cmd
+
+    pop r10
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================

@@ -1,0 +1,7 @@
+create vdisk file="F:\Src\aros-x64\testdata\gpt_test.vhd" maximum=64 type=fixed
+select vdisk file="F:\Src\aros-x64\testdata\gpt_test.vhd"
+attach vdisk
+convert gpt
+create partition primary
+format fs=exfat quick label="AROSGPT"
+assign letter=Y
