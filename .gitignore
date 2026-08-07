@@ -1,0 +1,6 @@
+build/
+disk/EFI/BOOT/BOOTX64.EFI
+disk/AROS/KERNEL.BIN
+*.lst
+debug.log
+disk/NvVars
