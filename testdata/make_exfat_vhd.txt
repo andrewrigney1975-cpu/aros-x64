@@ -1,0 +1,6 @@
+create vdisk file="F:\Src\aros-x64\testdata\exfat_test.vhd" maximum=64 type=fixed
+select vdisk file="F:\Src\aros-x64\testdata\exfat_test.vhd"
+attach vdisk
+create partition primary
+format fs=exfat quick label="AROSTEST"
+assign letter=Z

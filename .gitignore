@@ -4,3 +4,4 @@ disk/AROS/KERNEL.BIN
 *.lst
 debug.log
 disk/NvVars
+testdata/*.vhd

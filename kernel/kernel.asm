@@ -38,6 +38,7 @@ entry:
     call serial_puts
 
     call gdt_install
+    call idt_install
     call paging_init
 
     call fb_clear
@@ -48,6 +49,58 @@ entry:
 
     call storage_init_and_test
     call nvme_init_and_test
+
+    call exfat_mount
+    test eax, eax
+    jz .exfat_bad
+
+    lea rcx, [rel exfat_test_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .exfat_bad
+
+    mov ecx, [rel exfat_find_result+0]  ; FirstCluster
+    mov rdx, [rel exfat_find_result+8]  ; DataLength
+    lea r8, [rel exfat_test_buf]
+    mov r9d, [rel exfat_find_result+16] ; NoFatChain
+    call exfat_read_file
+    test eax, eax
+    jz .exfat_bad
+
+    ; DataLength must be exactly 5000, and the file must end with the
+    ; known marker string -- proves both correct file size and that the
+    ; FAT-chain-following read the file's second cluster correctly.
+    mov rax, [rel exfat_find_result+8]
+    cmp rax, 5000
+    jne .exfat_bad
+    lea rsi, [rel exfat_test_buf + 5000 - 18]   ; "END-OF-FILE-MARKER" is 18 bytes
+    lea rdi, [rel exfat_marker]
+    mov ecx, 18
+.cmp_loop:
+    mov al, [rsi]
+    cmp al, [rdi]
+    jne .exfat_bad
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .cmp_loop
+
+    lea rcx, [rel msg_exfat_ok]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 11
+    lea r8, [rel msg_exfat_ok]
+    call fb_draw_string
+    jmp .exfat_done
+.exfat_bad:
+    lea rcx, [rel msg_exfat_bad]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 11
+    lea r8, [rel msg_exfat_bad]
+    call fb_draw_string
+.exfat_done:
 
 .hang:
     jmp .hang
@@ -90,10 +143,14 @@ storage_init_and_test:
     test eax, eax
     jz .no_port
 
-    lea rcx, [rel ahci_databuf]
-    call ahci_read_lba0
+    xor ecx, ecx                        ; LBA 0
+    mov edx, 1                          ; 1 sector
+    lea r8, [rel ahci_databuf]
+    call ahci_read_sectors
     test eax, eax
     jz .read_failed
+
+    mov dword [rel storage_active_driver], STORAGE_AHCI
 
     lea rcx, [rel msg_ahci_ok]
     call serial_puts
@@ -202,10 +259,14 @@ nvme_init_and_test:
     test eax, eax
     jz .init_failed
 
-    lea rcx, [rel nvme_databuf]
-    call nvme_read_lba0
+    xor ecx, ecx                        ; LBA 0
+    mov edx, 1                          ; 1 sector
+    lea r8, [rel nvme_databuf]
+    call nvme_read_sectors
     test eax, eax
     jz .read_failed
+
+    mov dword [rel storage_active_driver], STORAGE_NVME
 
     lea rcx, [rel msg_nvme_ok]
     call serial_puts
@@ -485,6 +546,17 @@ serial_puts:
 ; =========================================================================
 ; Data
 ; =========================================================================
+msg_exfat_ok:         db 'exFAT: TEST.TXT found and read back correctly', 13, 10, 0
+msg_exfat_bad:        db 'exFAT: mount, find, or read FAILED', 13, 10, 0
+exfat_test_name:      db 'TEST.TXT', 0
+exfat_marker:         db 'END-OF-FILE-MARKER'
+
+align 8
+exfat_find_result: times 24 db 0
+
+align 4096
+exfat_test_buf: times 8192 db 0
+
 msg_hello:            db 'Hello, kernal!', 13, 10, 0
 msg_ahci_not_found:   db 'AHCI: no controller found', 13, 10, 0
 msg_ahci_no_port:     db 'AHCI: no active SATA port', 13, 10, 0
@@ -525,7 +597,10 @@ gdt_descriptor:
     dq gdt_start                         ; base (absolute: fixed load addr)
 
 %include "font8x16.inc"
+%include "idt.inc"
 %include "paging.inc"
 %include "pci.inc"
 %include "ahci.inc"
 %include "nvme.inc"
+%include "storage.inc"
+%include "exfat.inc"

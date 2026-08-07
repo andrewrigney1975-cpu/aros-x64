@@ -284,16 +284,20 @@ nvme_create_io_queues:
     ret
 
 ; -------------------------------------------------------------------------
-; nvme_read_lba0: RCX = destination buffer (>= 512 bytes, page-aligned).
-; Issues an NVM READ for NSID=1, LBA 0, 1 block. Returns EAX=1/0.
+; nvme_read_sectors: RCX = LBA (64-bit), RDX = sector count (1-65536),
+; R8 = destination buffer (contiguous, >= count*512 bytes, page-aligned
+; recommended so a single PRP1 covers it without needing PRP2/a PRP list).
+; Issues an NVM READ for NSID=1. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
-nvme_read_lba0:
+nvme_read_sectors:
     push rcx
     push rdx
     push rdi
     push rsi
+    push r10
 
-    mov rsi, rcx                        ; rsi = destination buffer
+    mov rsi, r8                         ; rsi = destination buffer
+    mov r10, rcx                        ; r10 = LBA
 
     lea rdi, [rel nvme_sqe_scratch]
     push rdi
@@ -306,14 +310,20 @@ nvme_read_lba0:
     mov dword [rdi+0], 0x00000002       ; CDW0: opcode = READ
     mov dword [rdi+4], 1                ; NSID = 1
     mov [rdi+24], rsi                   ; PRP1 = destination buffer
-    mov dword [rdi+40], 0               ; CDW10: SLBA[31:0] = 0
-    mov dword [rdi+44], 0               ; CDW11: SLBA[63:32] = 0
-    mov dword [rdi+48], 0               ; CDW12: NLB = 0 (0's-based = 1 block)
+    mov eax, r10d
+    mov [rdi+40], eax                   ; CDW10: SLBA[31:0]
+    mov rax, r10
+    shr rax, 32
+    mov [rdi+44], eax                   ; CDW11: SLBA[63:32]
+    mov eax, edx
+    dec eax                             ; CDW12: NLB (0's-based)
+    mov [rdi+48], eax
 
     lea rcx, [rel nvme_sqe_scratch]
     lea rdx, [rel nvme_io_qpair]
     call nvme_do_cmd
 
+    pop r10
     pop rsi
     pop rdi
     pop rdx

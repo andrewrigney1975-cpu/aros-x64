@@ -122,23 +122,26 @@ ahci_init:
     ret
 
 ; -------------------------------------------------------------------------
-; ahci_read_lba0: RCX = destination buffer (>= 512 bytes). Reads logical
-; sector 0 from the port ahci_init selected via READ DMA EXT.
+; ahci_read_sectors: RCX = LBA (48-bit), RDX = sector count (1-65535),
+; R8 = destination buffer (contiguous, >= count*512 bytes). Single PRDT
+; entry, so count is capped by what one entry can address (up to 8192
+; sectors/4MB) -- plenty for boot-time exFAT metadata/file reads.
 ; Returns EAX=1 on success, EAX=0 on timeout/error.
 ; -------------------------------------------------------------------------
-ahci_read_lba0:
+ahci_read_sectors:
     push rbx
     push rdx
     push rsi
     push rdi
-    push r8
     push r9
+    push r10
 
-    mov rdi, rcx                        ; rdi = destination buffer
+    mov r10, rcx                        ; r10 = LBA
+    mov rdi, r8                         ; rdi = destination buffer
 
     mov rbx, [rel ahci_abar]
-    mov r8d, [rel ahci_port]
-    mov esi, r8d
+    mov eax, [rel ahci_port]
+    mov esi, eax
     shl esi, 7
     add esi, 0x100                      ; esi = this port's register offset
 
@@ -150,7 +153,7 @@ ahci_read_lba0:
     mov [rcx+0x08], eax                 ; CTBA
     mov dword [rcx+0x0C], 0             ; CTBAU
 
-    ; Command table: H2D register FIS requesting READ DMA EXT, LBA=0, count=1
+    ; Command table: H2D register FIS requesting READ DMA EXT
     lea rcx, [rel ahci_cmdtable]
     mov dword [rcx+0x00], 0             ; zero the CFIS area first
     mov dword [rcx+0x04], 0
@@ -160,21 +163,30 @@ ahci_read_lba0:
     mov byte  [rcx+0x00], 0x27          ; FIS type = H2D register
     mov byte  [rcx+0x01], 0x80          ; C=1 (command), PM port 0
     mov byte  [rcx+0x02], 0x25          ; command = READ DMA EXT
-    mov byte  [rcx+0x04], 0             ; LBA0
-    mov byte  [rcx+0x05], 0             ; LBA1
-    mov byte  [rcx+0x06], 0             ; LBA2
-    mov byte  [rcx+0x07], 0x40          ; device: LBA mode
-    mov byte  [rcx+0x08], 0             ; LBA3
-    mov byte  [rcx+0x09], 0             ; LBA4
-    mov byte  [rcx+0x0A], 0             ; LBA5
-    mov byte  [rcx+0x0C], 1             ; sector count low = 1
-    mov byte  [rcx+0x0D], 0             ; sector count high
+    mov rax, r10                        ; LBA
+    mov [rcx+0x04], al
+    shr rax, 8
+    mov [rcx+0x05], al
+    shr rax, 8
+    mov [rcx+0x06], al
+    mov byte [rcx+0x07], 0x40           ; device: LBA mode
+    shr rax, 8
+    mov [rcx+0x08], al
+    shr rax, 8
+    mov [rcx+0x09], al
+    shr rax, 8
+    mov [rcx+0x0A], al
+    mov [rcx+0x0C], dx                  ; sector count (not 0's-based)
 
     ; PRDT entry 0 at command-table offset 0x80
-    mov [rcx+0x80], edi                 ; DBA
+    mov eax, edi
+    mov [rcx+0x80], eax                 ; DBA
     mov dword [rcx+0x84], 0             ; DBAU
     mov dword [rcx+0x88], 0             ; reserved
-    mov dword [rcx+0x8C], 511           ; byte count-1 = 511 (512 bytes)
+    movzx eax, dx
+    shl eax, 9                          ; * 512 bytes/sector
+    dec eax                             ; byte count - 1
+    mov [rcx+0x8C], eax
 
     ; Ring the doorbell for slot 0 and wait for completion.
     mov dword [rbx+rsi+0x38], 1         ; PxCI
@@ -197,8 +209,8 @@ ahci_read_lba0:
 .fail:
     xor eax, eax
 .out:
+    pop r10
     pop r9
-    pop r8
     pop rdi
     pop rsi
     pop rdx

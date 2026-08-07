@@ -9,6 +9,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 QEMU="/c/Program Files/qemu/qemu-system-x86_64.exe"
 OVMF="/c/Program Files/qemu/share/edk2-x86_64-code.fd"
 DISK="$(cygpath -w "$ROOT/disk")"
+EXFAT_VHD="$(cygpath -w "$ROOT/testdata/exfat_test.vhd")"
 
 ARGS=(
   -machine q35
@@ -17,7 +18,7 @@ ARGS=(
   -drive if=pflash,format=raw,readonly=on,file="$OVMF"
   -drive file=fat:rw:"$DISK",format=raw,if=virtio
   -drive file=fat:rw:"$DISK",format=raw,if=ide
-  -drive if=none,id=nvmedisk,file=fat:rw:"$DISK",format=raw
+  -drive if=none,id=nvmedisk,file="$EXFAT_VHD",format=vpc
   -device nvme,drive=nvmedisk,serial=deadbeef01
   -net none
 )
