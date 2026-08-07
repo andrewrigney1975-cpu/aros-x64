@@ -12,11 +12,13 @@ DISK="$(cygpath -w "$ROOT/disk")"
 
 ARGS=(
   -machine q35
-  -cpu qemu64
+  -cpu qemu64,pdpe1gb=on
   -m 256M
   -drive if=pflash,format=raw,readonly=on,file="$OVMF"
   -drive file=fat:rw:"$DISK",format=raw,if=virtio
   -drive file=fat:rw:"$DISK",format=raw,if=ide
+  -drive if=none,id=nvmedisk,file=fat:rw:"$DISK",format=raw
+  -device nvme,drive=nvmedisk,serial=deadbeef01
   -net none
 )
 

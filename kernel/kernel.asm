@@ -38,6 +38,7 @@ entry:
     call serial_puts
 
     call gdt_install
+    call paging_init
 
     call fb_clear
     mov ecx, 4                          ; column
@@ -46,6 +47,7 @@ entry:
     call fb_draw_string
 
     call storage_init_and_test
+    call nvme_init_and_test
 
 .hang:
     jmp .hang
@@ -144,6 +146,118 @@ storage_init_and_test:
     mov ecx, 4
     mov edx, 4
     lea r8, [rel msg_ahci_not_found]
+    call fb_draw_string
+
+.done:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; nvme_init_and_test: locate an NVMe controller over PCI, bring up its
+; admin queue, create one I/O queue pair, read LBA 0 and check the 0xAA55
+; boot-sector signature. Same verification approach as storage_init_and_test,
+; for the other half of "boot from NVMe or AHCI".
+; -------------------------------------------------------------------------
+nvme_init_and_test:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+
+    mov cl, 0x01                        ; class    = mass storage
+    mov ch, 0x08                        ; subclass = NVMe
+    mov dl, 0x02                        ; progif   = NVMe I/O controller
+    call pci_find_class
+    jc .no_controller
+
+    mov esi, ecx                        ; esi = device's config-space base
+
+    mov ecx, esi
+    add ecx, 0x04                       ; PCI command register
+    call pci_read32
+    or eax, 0x00000006                  ; Memory Space Enable | Bus Master Enable
+    call pci_write32
+
+    mov ecx, esi
+    add ecx, 0x10                       ; BAR0 (low 32 bits of MMIO base)
+    call pci_read32
+    and eax, 0xFFFFFFF0
+    push rax
+    mov ecx, esi
+    add ecx, 0x14                       ; BAR1 (high 32 bits, 64-bit BAR)
+    call pci_read32
+    shl rax, 32
+    pop rdx
+    or rax, rdx
+    mov rcx, rax                        ; NVMe MMIO base
+
+    call nvme_init
+    test eax, eax
+    jz .init_failed
+
+    call nvme_create_io_queues
+    test eax, eax
+    jz .init_failed
+
+    lea rcx, [rel nvme_databuf]
+    call nvme_read_lba0
+    test eax, eax
+    jz .read_failed
+
+    lea rcx, [rel msg_nvme_ok]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 7
+    lea r8, [rel msg_nvme_ok]
+    call fb_draw_string
+
+    mov ax, [rel nvme_databuf+510]
+    cmp ax, 0xAA55
+    jne .bad_sig
+    lea rcx, [rel msg_sig_ok]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 8
+    lea r8, [rel msg_sig_ok]
+    call fb_draw_string
+    jmp .done
+
+.bad_sig:
+    lea rcx, [rel msg_sig_bad]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 8
+    lea r8, [rel msg_sig_bad]
+    call fb_draw_string
+    jmp .done
+
+.read_failed:
+    lea rcx, [rel msg_nvme_read_fail]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 7
+    lea r8, [rel msg_nvme_read_fail]
+    call fb_draw_string
+    jmp .done
+
+.init_failed:
+    lea rcx, [rel msg_nvme_init_fail]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 7
+    lea r8, [rel msg_nvme_init_fail]
+    call fb_draw_string
+    jmp .done
+
+.no_controller:
+    lea rcx, [rel msg_nvme_not_found]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 7
+    lea r8, [rel msg_nvme_not_found]
     call fb_draw_string
 
 .done:
@@ -376,8 +490,13 @@ msg_ahci_not_found:   db 'AHCI: no controller found', 13, 10, 0
 msg_ahci_no_port:     db 'AHCI: no active SATA port', 13, 10, 0
 msg_ahci_read_fail:   db 'AHCI: LBA0 read failed/timed out', 13, 10, 0
 msg_ahci_ok:          db 'AHCI: LBA0 read OK', 13, 10, 0
-msg_sig_ok:           db 'AHCI: boot signature 0xAA55 OK', 13, 10, 0
-msg_sig_bad:          db 'AHCI: boot signature mismatch', 13, 10, 0
+msg_sig_ok:           db 'boot signature 0xAA55 OK', 13, 10, 0
+msg_sig_bad:          db 'boot signature mismatch', 13, 10, 0
+
+msg_nvme_not_found:   db 'NVMe: no controller found', 13, 10, 0
+msg_nvme_init_fail:   db 'NVMe: controller/queue init failed', 13, 10, 0
+msg_nvme_read_fail:   db 'NVMe: LBA0 read failed/timed out', 13, 10, 0
+msg_nvme_ok:          db 'NVMe: LBA0 read OK', 13, 10, 0
 
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.
@@ -406,5 +525,7 @@ gdt_descriptor:
     dq gdt_start                         ; base (absolute: fixed load addr)
 
 %include "font8x16.inc"
+%include "paging.inc"
 %include "pci.inc"
 %include "ahci.inc"
+%include "nvme.inc"
