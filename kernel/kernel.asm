@@ -351,19 +351,22 @@ entry:
     call exfat_alloc_cluster
     test eax, eax
     jz .btest_bad
-    mov ebx, eax                        ; ebx = allocated cluster
+    mov r13d, eax                       ; r13d = allocated cluster (NOT ebx --
+                                         ; rbx is boot_info* for the whole
+                                         ; kernel; clobbering it here bit us
+                                         ; once already, see basix_rt_print_int)
 
-    mov ecx, ebx
+    mov ecx, r13d
     call exfat_bitmap_test_free
     test eax, eax
     jnz .btest_bad                      ; should now read as NOT free
 
-    mov ecx, ebx
+    mov ecx, r13d
     call exfat_free_cluster
     test eax, eax
     jz .btest_bad
 
-    mov ecx, ebx
+    mov ecx, r13d
     call exfat_bitmap_test_free
     test eax, eax
     jz .btest_bad                       ; should be free again
@@ -375,7 +378,6 @@ entry:
     lea rcx, [rel msg_btest_bad]
     call serial_puts
 .btest_done:
-
     ; Verify FAT chain writing: allocate two clusters, link A->B, terminate
     ; B with an end-of-chain marker, confirm exfat_fat_next_cluster follows
     ; the link and then the EOC, then clear both FAT entries and free both
@@ -383,14 +385,14 @@ entry:
     call exfat_alloc_cluster
     test eax, eax
     jz .ctest_bad
-    mov ebx, eax                        ; ebx = cluster A
+    mov r13d, eax                       ; r13d = cluster A (not ebx -- see note above)
 
     call exfat_alloc_cluster
     test eax, eax
     jz .ctest_bad
     mov esi, eax                        ; esi = cluster B
 
-    mov ecx, ebx
+    mov ecx, r13d
     mov edx, esi
     call exfat_fat_set_entry            ; A -> B
     test eax, eax
@@ -402,7 +404,7 @@ entry:
     test eax, eax
     jz .ctest_bad
 
-    mov ecx, ebx
+    mov ecx, r13d
     call exfat_fat_next_cluster
     cmp eax, esi
     jne .ctest_bad
@@ -412,7 +414,7 @@ entry:
     cmp eax, 0xFFFFFFFF
     jne .ctest_bad
 
-    mov ecx, ebx
+    mov ecx, r13d
     xor edx, edx
     call exfat_fat_set_entry
     test eax, eax
@@ -423,7 +425,7 @@ entry:
     test eax, eax
     jz .ctest_bad
 
-    mov ecx, ebx
+    mov ecx, r13d
     call exfat_free_cluster
     test eax, eax
     jz .ctest_bad
@@ -623,6 +625,23 @@ entry:
     lea r8, [rel msg_sched_verify_bad]
     call fb_draw_string
 .sched_verify_done:
+
+    ; Smoke-test the BASIX64 compiler: compile and run a trivial program.
+    ; This only proves the pipeline works end to end (compiles without
+    ; error and executes without crashing) -- RUN in the shell is the
+    ; real way to see a program's output.
+    lea rcx, [rel basixtest_src]
+    call basix_compile
+    test eax, eax
+    jz .basixtest_bad
+    call basix_code_buf
+    lea rcx, [rel msg_basixtest_ran]
+    call serial_puts
+    jmp .basixtest_done
+.basixtest_bad:
+    lea rcx, [rel msg_basixtest_bad]
+    call serial_puts
+.basixtest_done:
 
     call shell_main                     ; never returns
 
@@ -1339,6 +1358,12 @@ shell_dispatch:
     test eax, eax
     jnz .do_write
 
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_run]
+    call shell_streq
+    test eax, eax
+    jnz .do_run
+
     lea rcx, [rel msg_shell_unknown]
     call console_puts
     jmp .out
@@ -1480,6 +1505,76 @@ shell_dispatch:
     jmp .out
 .write_fail:
     lea rcx, [rel msg_shell_write_fail]
+    call console_puts
+    jmp .out
+
+.do_run:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.run_copy:
+    mov al, [rsi]
+    test al, al
+    jz .run_arg_done
+    cmp al, ' '
+    je .run_arg_done
+    cmp ecx, 63
+    jge .run_arg_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .run_copy
+.run_arg_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .run_usage
+
+    lea rcx, [rel shell_arg_buf]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .run_notfound
+
+    mov rax, [rel exfat_find_result+8]
+    cmp rax, SHELL_TYPE_BUF_MAX
+    ja .run_toobig
+
+    mov ecx, [rel exfat_find_result+0]
+    mov rdx, [rel exfat_find_result+8]
+    lea r8, [rel exfat_test_buf]
+    mov r9d, [rel exfat_find_result+16]
+    call exfat_read_file
+    test eax, eax
+    jz .run_readfail
+
+    mov rax, [rel exfat_find_result+8]
+    lea rdi, [rel exfat_test_buf]
+    mov byte [rdi+rax], 0
+
+    lea rcx, [rel exfat_test_buf]
+    call basix_compile
+    test eax, eax
+    jz .run_compilefail
+
+    call basix_code_buf
+    jmp .out
+.run_usage:
+    lea rcx, [rel msg_shell_run_usage]
+    call console_puts
+    jmp .out
+.run_notfound:
+    lea rcx, [rel msg_shell_notfound]
+    call console_puts
+    jmp .out
+.run_toobig:
+    lea rcx, [rel msg_shell_toobig]
+    call console_puts
+    jmp .out
+.run_readfail:
+    lea rcx, [rel msg_shell_readfail]
+    call console_puts
+    jmp .out
+.run_compilefail:
+    lea rcx, [rel msg_shell_run_compilefail]
     call console_puts
     jmp .out
 
@@ -1672,10 +1767,11 @@ shell_str_dir:   db 'dir', 0
 shell_str_clear: db 'clear', 0
 shell_str_type:  db 'type', 0
 shell_str_write: db 'write', 0
+shell_str_run:   db 'run', 0
 
 msg_shell_banner:      db 'arOS-X64 shell. Type HELP for commands.', 13, 10, 0
 msg_shell_prompt:      db '] ', 0
-msg_shell_help:        db 'Commands: HELP  DIR  TYPE <file>  WRITE <file> <text>  CLEAR', 13, 10, 0
+msg_shell_help:        db 'Commands: HELP  DIR  TYPE <file>  WRITE <file> <text>  RUN <file.bas>  CLEAR', 13, 10, 0
 msg_shell_unknown:     db 'Unknown command. Type HELP for a list.', 13, 10, 0
 msg_shell_nl:          db 13, 10, 0
 msg_shell_type_usage:  db 'Usage: TYPE <filename>', 13, 10, 0
@@ -1685,12 +1781,18 @@ msg_shell_readfail:    db 'Error reading file.', 13, 10, 0
 msg_shell_write_usage: db 'Usage: WRITE <filename> <text>', 13, 10, 0
 msg_shell_write_ok:    db 'File written.', 13, 10, 0
 msg_shell_write_fail:  db 'Write failed (name may already exist).', 13, 10, 0
+msg_shell_run_usage:       db 'Usage: RUN <filename.bas>', 13, 10, 0
+msg_shell_run_compilefail: db 'BASIX64 compile error.', 13, 10, 0
 
 shell_line_buf:     times SHELL_LINE_MAX db 0
 shell_cmd_buf:      times 16 db 0
 shell_arg_buf:       times 64 db 0
 shell_dir_name_buf: times 256 db 0
 shell_dir_datalen:  dq 0
+
+basixtest_src: db 'LET x = 5', 10, 'PRINT x * 3 + 2', 10, 'GOSUB sub1', 10, 'END', 10, 'sub1:', 10, 'PRINT 1', 10, 'RETURN', 10, 0
+msg_basixtest_ran:      db 'basixtest: compiled and ran OK', 13, 10, 0
+msg_basixtest_bad:      db 'basixtest: COMPILE FAILED', 13, 10, 0
 
 msg_hello:            db 'Hello, kernal!', 13, 10, 0
 msg_ahci_not_found:   db 'AHCI: no controller found', 13, 10, 0
@@ -1747,3 +1849,7 @@ gdt_descriptor:
 %include "exfat.inc"
 %include "keyboard.inc"
 %include "basix_lexer.inc"
+%include "basix_codegen.inc"
+%include "basix_symbols.inc"
+%include "basix_runtime.inc"
+%include "basix_parser.inc"

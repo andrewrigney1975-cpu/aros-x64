@@ -102,16 +102,26 @@ basix_is_ident_start:
 ; -------------------------------------------------------------------------
 ; basix_is_ident_char: AL = char. Returns EAX=1/0 (ident_start or digit).
 ; -------------------------------------------------------------------------
+; NOTE: is_ident_start and is_digit both return their result in EAX,
+; which overwrites AL -- the very character byte this function needs to
+; hand to the *second* check. Must re-fetch AL from the stack (not just
+; re-use the original register) between the two calls, or a digit right
+; after the identifier's first character (e.g. the '1' in "sub1") gets
+; silently dropped, truncating the identifier one character short.
 basix_is_ident_char:
+    push rax
     call basix_is_ident_start
     test eax, eax
     jnz .yes
+    mov al, [rsp]
     call basix_is_digit
     test eax, eax
     jnz .yes
+    pop rax
     xor eax, eax
     ret
 .yes:
+    pop rax
     mov eax, 1
     ret
 

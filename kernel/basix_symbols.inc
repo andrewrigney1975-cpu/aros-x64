@@ -1,0 +1,422 @@
+; =============================================================================
+; BASIX64 symbol tables: variables, labels, and the forward-reference
+; fixup list used by GOTO/GOSUB targeting a label not yet seen.
+;
+; Variables are 8-byte slots in a flat static array (basix_var_slots),
+; addressed directly since this kernel is a flat, non-relocatable binary
+; -- there is no stack frame or register allocator for v1.
+; =============================================================================
+
+BASIX_MAX_VARS    equ 64
+BASIX_MAX_LABELS  equ 32
+BASIX_MAX_FIXUPS  equ 64
+BASIX_MAX_FOR_DEPTH equ 8
+
+; -------------------------------------------------------------------------
+; basix_name_eq: RCX = candidate ptr, EDX = candidate len, R8 = stored
+; name field (32 bytes, NUL-padded, already upper-case). Returns EAX=1/0,
+; folding the candidate to upper-case for the comparison.
+; -------------------------------------------------------------------------
+basix_name_eq:
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r9
+
+    mov rsi, rcx
+    mov rdi, r8
+    mov r9d, edx
+    cmp r9d, 31
+    jbe .len_ok
+    mov r9d, 31
+.len_ok:
+    xor ecx, ecx
+.loop:
+    cmp ecx, r9d
+    jge .check_end
+    mov al, [rsi+rcx]
+    cmp al, 'a'
+    jb .nofold
+    cmp al, 'z'
+    ja .nofold
+    sub al, 0x20
+.nofold:
+    mov dl, [rdi+rcx]
+    cmp al, dl
+    jne .nomatch
+    inc ecx
+    jmp .loop
+.check_end:
+    cmp byte [rdi+rcx], 0
+    jne .nomatch
+    mov eax, 1
+    jmp .out
+.nomatch:
+    xor eax, eax
+.out:
+    pop r9
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_name_copy_upper: RCX = src ptr, EDX = src len (caller caps to 31),
+; R8 = dest ptr (32-byte field, caller pre-zeroed). Copies up to EDX
+; chars, upper-casing ASCII letters.
+; -------------------------------------------------------------------------
+basix_name_copy_upper:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r9
+
+    mov rsi, rcx
+    mov rdi, r8
+    mov r9d, edx
+    xor ecx, ecx
+.loop:
+    cmp ecx, r9d
+    jge .done
+    mov al, [rsi+rcx]
+    cmp al, 'a'
+    jb .nofold
+    cmp al, 'z'
+    ja .nofold
+    sub al, 0x20
+.nofold:
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .loop
+.done:
+    pop r9
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_var_find_or_create: RCX = name ptr, EDX = len. Returns EAX =
+; variable index, creating a new INTEGER-typed variable if not found.
+; -------------------------------------------------------------------------
+basix_var_find_or_create:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push r8
+    push r9
+
+    mov r8, rcx
+    mov r9d, edx
+
+    xor ebx, ebx
+.search:
+    cmp ebx, [rel basix_var_count]
+    jge .create
+    mov eax, ebx
+    imul eax, 32
+    lea rdi, [rel basix_var_name]
+    add rdi, rax
+
+    mov rcx, r8
+    mov edx, r9d
+    push r8
+    mov r8, rdi
+    call basix_name_eq
+    pop r8
+    test eax, eax
+    jnz .found
+    inc ebx
+    jmp .search
+
+.found:
+    mov eax, ebx
+    jmp .out
+
+.create:
+    cmp dword [rel basix_var_count], BASIX_MAX_VARS
+    jge .fail
+
+    mov eax, ebx
+    imul eax, 32
+    lea rdi, [rel basix_var_name]
+    add rdi, rax
+    push rdi
+    mov ecx, 32
+    xor eax, eax
+    cld
+    rep stosb
+    pop rdi
+
+    mov ecx, r9d
+    cmp ecx, 31
+    jbe .clen_ok
+    mov ecx, 31
+.clen_ok:
+    mov edx, ecx
+    mov rcx, r8
+    mov r8, rdi
+    call basix_name_copy_upper
+
+    mov dword [rel basix_var_type + ebx*4], 0
+    mov eax, [rel basix_var_count]
+    inc eax
+    mov [rel basix_var_count], eax
+    mov eax, ebx
+    jmp .out
+
+.fail:
+    mov dword [rel basix_compile_ok], 0
+    xor eax, eax
+.out:
+    pop r9
+    pop r8
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_var_slot_addr: EAX = variable index. Returns RAX = absolute
+; address of its 8-byte slot.
+; -------------------------------------------------------------------------
+basix_var_slot_addr:
+    imul eax, eax, 8
+    lea rax, [rel basix_var_slots + rax]
+    ret
+
+; -------------------------------------------------------------------------
+; basix_label_find_or_create: RCX = name ptr, EDX = len. Returns EAX =
+; label index, creating an as-yet-undefined entry if not found.
+; -------------------------------------------------------------------------
+basix_label_find_or_create:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push r8
+    push r9
+
+    mov r8, rcx
+    mov r9d, edx
+
+    xor ebx, ebx
+.search:
+    cmp ebx, [rel basix_label_count]
+    jge .create
+    mov eax, ebx
+    imul eax, 32
+    lea rdi, [rel basix_label_name]
+    add rdi, rax
+
+    mov rcx, r8
+    mov edx, r9d
+    push r8
+    mov r8, rdi
+    call basix_name_eq
+    pop r8
+    test eax, eax
+    jnz .found
+    inc ebx
+    jmp .search
+
+.found:
+    mov eax, ebx
+    jmp .out
+
+.create:
+    cmp dword [rel basix_label_count], BASIX_MAX_LABELS
+    jge .fail
+
+    mov eax, ebx
+    imul eax, 32
+    lea rdi, [rel basix_label_name]
+    add rdi, rax
+    push rdi
+    mov ecx, 32
+    xor eax, eax
+    cld
+    rep stosb
+    pop rdi
+
+    mov ecx, r9d
+    cmp ecx, 31
+    jbe .clen_ok
+    mov ecx, 31
+.clen_ok:
+    mov edx, ecx
+    mov rcx, r8
+    mov r8, rdi
+    call basix_name_copy_upper
+
+    mov dword [rel basix_label_defined + ebx*4], 0
+    mov eax, [rel basix_label_count]
+    inc eax
+    mov [rel basix_label_count], eax
+    mov eax, ebx
+    jmp .out
+
+.fail:
+    mov dword [rel basix_compile_ok], 0
+    xor eax, eax
+.out:
+    pop r9
+    pop r8
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_fixup_add: RCX = absolute patch address, EDX = label index.
+; -------------------------------------------------------------------------
+basix_fixup_add:
+    push rax
+    push rcx
+    push rdx
+
+    mov eax, [rel basix_fixup_count]
+    cmp eax, BASIX_MAX_FIXUPS
+    jge .full
+    mov [rel basix_fixup_patchaddr + rax*8], rcx
+    mov [rel basix_fixup_labelidx + rax*4], edx
+    inc eax
+    mov [rel basix_fixup_count], eax
+    jmp .out
+.full:
+    mov dword [rel basix_compile_ok], 0
+.out:
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_label_define: EAX = label index. Marks it defined at the current
+; emit position and patches any pending fixups referencing it.
+; -------------------------------------------------------------------------
+basix_label_define:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+
+    mov ebx, eax
+    call basix_emit_here
+    mov [rel basix_label_addr + rbx*8], rax
+    mov dword [rel basix_label_defined + rbx*4], 1
+
+    xor ecx, ecx
+.scan:
+    cmp ecx, [rel basix_fixup_count]
+    jge .out
+    cmp [rel basix_fixup_labelidx + rcx*4], ebx
+    jne .next
+    mov rdx, rax
+    mov rsi, [rel basix_fixup_patchaddr + rcx*8]
+    push rax
+    push rcx
+    mov rcx, rsi
+    call basix_patch_rel32
+    pop rcx
+    pop rax
+    mov dword [rel basix_fixup_labelidx + rcx*4], 0xFFFFFFFF
+.next:
+    inc ecx
+    jmp .scan
+.out:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_goto_or_gosub_emit: RCX = label name ptr, EDX = len, R8D =
+; is_call (0 = GOTO/JMP, 1 = GOSUB/CALL).
+; -------------------------------------------------------------------------
+basix_goto_or_gosub_emit:
+    push rbx
+    push rcx
+    push rdx
+    push r9
+
+    mov ebx, r8d
+    call basix_label_find_or_create
+    mov r9d, eax
+
+    cmp dword [rel basix_label_defined + r9*4], 0
+    jne .defined
+
+    test ebx, ebx
+    jnz .call_placeholder
+    call basix_emit_jmp_placeholder
+    jmp .add_fixup
+.call_placeholder:
+    mov al, 0xE8
+    call basix_emit_u8
+    call basix_emit_here
+    push rax
+    xor eax, eax
+    call basix_emit_u32
+    pop rax
+.add_fixup:
+    mov rcx, rax
+    mov edx, r9d
+    call basix_fixup_add
+    jmp .out
+
+.defined:
+    mov rdx, [rel basix_label_addr + r9*8]
+    mov rcx, rdx
+    test ebx, ebx
+    jnz .call_defined
+    call basix_emit_jmp_to
+    jmp .out
+.call_defined:
+    call basix_emit_call_to
+
+.out:
+    pop r9
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; =========================================================================
+; Data
+; =========================================================================
+basix_compile_ok: dd 1
+
+basix_var_count: dd 0
+basix_var_type:  times BASIX_MAX_VARS dd 0
+align 8
+basix_var_name:  times (BASIX_MAX_VARS*32) db 0
+basix_var_slots: times BASIX_MAX_VARS dq 0
+
+basix_label_count:   dd 0
+basix_label_defined: times BASIX_MAX_LABELS dd 0
+align 8
+basix_label_name: times (BASIX_MAX_LABELS*32) db 0
+basix_label_addr: times BASIX_MAX_LABELS dq 0
+
+basix_fixup_count: dd 0
+align 8
+basix_fixup_patchaddr: times BASIX_MAX_FIXUPS dq 0
+basix_fixup_labelidx:  times BASIX_MAX_FIXUPS dd 0
+
+basix_for_depth: dd 0
+align 8
+basix_for_end_temps:  times BASIX_MAX_FOR_DEPTH dq 0
+basix_for_step_temps: times BASIX_MAX_FOR_DEPTH dq 0
