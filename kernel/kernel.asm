@@ -572,6 +572,60 @@ entry:
     call serial_puts
 .wftest_done:
 
+    ; Verify long-filename support (exfat_lntest_name is 40 characters --
+    ; well past the old 15-char/one-FileName-entry cap, exercising the
+    ; multi-FileName-entry write path). Idempotent across reboots.
+    lea rcx, [rel exfat_lntest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .lntest_verify
+
+    lea rcx, [rel exfat_lntest_name]
+    lea r8, [rel exfat_lntest_content]
+    mov r9, exfat_lntest_content_len
+    call exfat_write_file
+    test eax, eax
+    jz .lntest_bad
+
+    lea rcx, [rel exfat_lntest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .lntest_bad
+
+.lntest_verify:
+    cmp qword [rel exfat_find_result+8], exfat_lntest_content_len
+    jne .lntest_bad
+
+    mov ecx, [rel exfat_find_result+0]
+    mov rdx, [rel exfat_find_result+8]
+    lea r8, [rel exfat_lntest_read]
+    mov r9d, [rel exfat_find_result+16]
+    call exfat_read_file
+    test eax, eax
+    jz .lntest_bad
+
+    lea rsi, [rel exfat_lntest_read]
+    lea rdi, [rel exfat_lntest_content]
+    xor ecx, ecx
+.lntest_cmp:
+    cmp ecx, exfat_lntest_content_len
+    jge .lntest_ok
+    mov al, [rsi+rcx]
+    cmp al, [rdi+rcx]
+    jne .lntest_bad
+    inc ecx
+    jmp .lntest_cmp
+.lntest_ok:
+    lea rcx, [rel msg_lntest_ok]
+    call serial_puts
+    jmp .lntest_done
+.lntest_bad:
+    lea rcx, [rel msg_lntest_bad]
+    call serial_puts
+.lntest_done:
+
     ; Bring up the scheduler: the current flow becomes the "main" task
     ; (its TCB.rsp gets filled in on its own first save -- it doesn't need
     ; a hand-built frame like task_create produces, since it's already
@@ -2413,6 +2467,11 @@ exfat_crtest_name:    db 'CRTEST.TXT', 0
 msg_wftest_ok:        db 'exFAT: exfat_write_file multi-cluster round-trip OK', 13, 10, 0
 msg_wftest_bad:       db 'exFAT: exfat_write_file multi-cluster round-trip FAILED', 13, 10, 0
 exfat_wtest_name:     db 'WFTEST.TXT', 0
+msg_lntest_ok:        db 'exFAT: long filename (multi-FileName-entry) round-trip OK', 13, 10, 0
+msg_lntest_bad:       db 'exFAT: long filename (multi-FileName-entry) round-trip FAILED', 13, 10, 0
+exfat_lntest_name:    db 'THIS_IS_A_LONG_FILENAME_OVER_15_CHARS.TXT', 0
+exfat_lntest_content: db 'long filename round-trip test payload'
+exfat_lntest_content_len equ $ - exfat_lntest_content
 msg_sched_ok:         db 'Scheduler: armed (main + 5 test tasks)', 13, 10, 0
 msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
 msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0
@@ -2437,6 +2496,7 @@ align 4096
 exfat_test_buf: times 8192 db 0
 exfat_wtest_src:  times 6000 db 0
 exfat_wtest_read: times 6000 db 0
+exfat_lntest_read: times 64 db 0
 
 console_col:  dd 0
 console_row:  dd 0

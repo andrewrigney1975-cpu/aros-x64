@@ -989,17 +989,21 @@ exfat_dir_find_slot:
     pop rcx
     ret
 
+EXFAT_MAX_NAME_LEN equ 64               ; matches shell_arg_buf's own cap
+
 ; -------------------------------------------------------------------------
 ; exfat_dir_write_entry_set: RCX = ptr to a NUL-terminated ASCII filename,
-; <=15 characters (one FileName entry's worth -- longer names are future
-; work, as is anything beyond ASCII); EDX = FirstCluster; R8 = DataLength
-; (qword, also used as ValidDataLength); R9B = Stream Extension
-; GeneralSecondaryFlags (bit0 AllocationPossible, bit1 NoFatChain).
-; Builds and writes a File/StreamExtension/FileName entry set in the root
-; directory. Timestamps are left zeroed (future work). Returns EAX=1/0.
+; <= EXFAT_MAX_NAME_LEN characters (ASCII only -- full Unicode is future
+; work); EDX = FirstCluster; R8 = DataLength (qword, also used as
+; ValidDataLength); R9B = Stream Extension GeneralSecondaryFlags (bit0
+; AllocationPossible, bit1 NoFatChain). Builds and writes a File/
+; StreamExtension/FileName... entry set (one FileName entry per 15
+; characters of the name, per spec) in the root directory. Timestamps
+; are left zeroed (future work). Returns EAX=1/0.
 ; -------------------------------------------------------------------------
 exfat_dir_write_entry_set:
     push rbx
+    push rbp
     push rcx
     push rdx
     push rsi
@@ -1011,6 +1015,7 @@ exfat_dir_write_entry_set:
     push r12
     push r13
     push r14
+    push r15
 
     mov r10, rcx                        ; r10 = name ptr
     mov r11d, edx                       ; r11d = FirstCluster
@@ -1022,32 +1027,49 @@ exfat_dir_write_entry_set:
     cmp byte [r10+r14], 0
     je .namelen_done
     inc r14d
-    cmp r14d, 15
+    cmp r14d, EXFAT_MAX_NAME_LEN
     ja .fail
     jmp .namelen
 .namelen_done:
     test r14d, r14d
     jz .fail
 
-    mov ecx, 3                          ; File + StreamExt + 1 FileName entry
+    mov eax, r14d
+    add eax, 14
+    mov ecx, 15
+    xor edx, edx
+    div ecx
+    mov r15d, eax                       ; r15d = FileName entries needed
+
+    mov ecx, r15d
+    add ecx, 2                          ; + File + StreamExt
     call exfat_dir_find_slot
     test eax, eax
     jz .fail
     ; ebx = directory cluster, edx = byte offset within exfat_dir_buf
+    mov ebp, ebx                        ; ebp = directory cluster (kept
+                                         ; safe across ebx's later reuse
+                                         ; as the FileName-entry loop index)
 
     lea rsi, [rel exfat_dir_buf]
     add rsi, rdx                        ; rsi -> primary (File) entry
 
+    mov r9d, r15d
+    add r9d, 2                          ; r9d = total entry count
+
     push rsi
     mov rdi, rsi
     xor eax, eax
-    mov ecx, 96
+    mov ecx, r9d
+    shl ecx, 5                          ; total entry count * 32 bytes
     cld
     rep stosb
     pop rsi
 
     mov byte [rsi+0], 0x85              ; EntryType: File
-    mov byte [rsi+1], 2                 ; SecondaryCount: StreamExt + 1 FileName
+    mov eax, r15d
+    inc eax                             ; SecondaryCount: StreamExt + N FileName
+    mov [rsi+1], al
     mov word [rsi+4], 0x0020            ; FileAttributes: ARCHIVE
 
     mov byte [rsi+32], 0xC0             ; Stream Extension EntryType
@@ -1061,24 +1083,43 @@ exfat_dir_write_entry_set:
     call exfat_name_hash
     mov [rsi+36], ax                    ; NameHash
 
-    mov byte [rsi+64], 0xC1             ; FileName EntryType
+    ; FileName entries: one per 15 characters, zero-padded in the last one
+    xor ebx, ebx                        ; ebx = FileName entry index
+.name_entry_loop:
+    cmp ebx, r15d
+    jge .name_entries_done
+    mov eax, ebx
+    imul eax, 15                        ; eax = index of this entry's first char
+    lea rdi, [rsi+64]
+    mov edx, ebx
+    imul edx, 32
+    add rdi, rdx                        ; rdi -> this FileName entry
+    mov byte [rdi], 0xC1
 
     xor ecx, ecx
-.copy_name:
-    cmp ecx, r14d
-    jge .name_copied
-    movzx eax, byte [r10+rcx]
-    mov [rsi+66+rcx*2], ax
+.copy_name_chars:
+    cmp ecx, 15
+    jge .name_entry_next
+    mov edx, eax
+    add edx, ecx
+    cmp edx, r14d
+    jge .copy_name_chars_next           ; past the real name -- leave zero
+    movzx r8d, byte [r10+rdx]
+    mov [rdi+2+rcx*2], r8w
+.copy_name_chars_next:
     inc ecx
-    jmp .copy_name
-.name_copied:
+    jmp .copy_name_chars
+.name_entry_next:
+    inc ebx
+    jmp .name_entry_loop
+.name_entries_done:
 
     mov rcx, rsi
-    mov edx, 3
+    mov edx, r9d
     call exfat_checksum_entries
     mov [rsi+2], ax                     ; SetChecksum
 
-    mov ecx, ebx
+    mov ecx, ebp
     call exfat_cluster_to_lba
     mov rcx, rax
     mov edx, [rel exfat_sectors_per_cluster]
@@ -1092,6 +1133,7 @@ exfat_dir_write_entry_set:
 .fail:
     xor eax, eax
 .out:
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -1103,13 +1145,14 @@ exfat_dir_write_entry_set:
     pop rsi
     pop rdx
     pop rcx
+    pop rbp
     pop rbx
     ret
 
 ; -------------------------------------------------------------------------
-; exfat_create_file: RCX = ptr to a NUL-terminated ASCII filename, <=15
-; characters. Creates an empty (FirstCluster=0, DataLength=0) file entry
-; in the root directory. Returns EAX=1/0.
+; exfat_create_file: RCX = ptr to a NUL-terminated ASCII filename, <=
+; EXFAT_MAX_NAME_LEN characters. Creates an empty (FirstCluster=0,
+; DataLength=0) file entry in the root directory. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
 exfat_create_file:
     push rdx
@@ -1127,10 +1170,11 @@ exfat_create_file:
     ret
 
 ; -------------------------------------------------------------------------
-; exfat_write_file: RCX = ptr to a NUL-terminated ASCII filename (<=15
-; chars), R8 = ptr to source data, R9 = data length in bytes. Creates a
-; NEW file -- fails if the name already exists in the root directory (v1
-; has no overwrite/append support). Allocates and FAT-chains enough
+; exfat_write_file: RCX = ptr to a NUL-terminated ASCII filename (<=
+; EXFAT_MAX_NAME_LEN chars), R8 = ptr to source data, R9 = data length
+; in bytes. Creates a NEW file -- fails if the name already exists in
+; the root directory (see exfat_append_file for extending an existing
+; one). Allocates and FAT-chains enough
 ; clusters to hold the data (always via a real FAT chain -- NoFatChain is
 ; never set, so allocation need not be contiguous), writes the data, and
 ; writes the file's directory entry with the real FirstCluster/
