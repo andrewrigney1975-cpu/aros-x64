@@ -15,8 +15,17 @@
 ;              | FOR ident '=' expr TO expr (STEP expr)? NEWLINE block NEXT ident?
 ;              | WHILE condition NEWLINE block WEND
 ;              | GOTO ident | GOSUB ident | RETURN
-;              | DIM ident AS (INTEGER|SFLOAT|DFLOAT)
+;              | DIM ident AS (INTEGER|SFLOAT|DFLOAT|VECTOR2|VECTOR3|VECTOR4|MATRIX4)
 ;              | END
+;              | VSET ident (',' expr)+
+;              | (VADD|VSUB) ident ',' ident ',' ident
+;              | VSCALE ident ',' ident ',' expr
+;              | VDOT ident ',' ident ',' ident
+;              | VCROSS ident ',' ident ',' ident           (VECTOR3 only)
+;              | (VLEN|VNORM) ident ',' ident
+;              | MIDENT ident                                (MATRIX4 only)
+;              | MMUL ident ',' ident ',' ident               (MATRIX4 only)
+;              | MVMUL ident ',' ident ',' ident      (MATRIX4 * VECTOR4)
 ;   printitem := expr | STRING
 ;   condition := bool_or
 ;   bool_or   := bool_and ('OR' bool_and)*
@@ -36,6 +45,21 @@
 ; final TEST+JE on top to get back to a single false-jump patch address
 ; for IF/WHILE. No nested-FOR temp collision (each FOR nesting level
 ; gets its own hidden end/step slot, up to BASIX_MAX_FOR_DEPTH).
+;
+; Vector/matrix values (VECTOR2/3/4, MATRIX4) are statement-level only --
+; they don't flow through the general expr grammar as first-class values
+; the way int/float do (that would need the type-tracking system to
+; carry width and route through memory-resident temporaries everywhere,
+; a much bigger redesign). Instead: DIM declares one, VSET/VADD/etc.
+; operate on named vector/matrix variables directly, and ident[N] (N a
+; compile-time integer literal, not a general expression -- v1 scope)
+; reads/writes a single scalar component, which *does* fit the normal
+; expr grammar since it's just a double. Every VSET/VADD/.../MMUL/MVMUL
+; statement is unrolled entirely at compile time (component indices are
+; always compile-time constants), so "looping over components" in this
+; parser is the *parser* looping while compiling, not code generated to
+; loop at runtime -- each component gets its own fixed-address load/op/
+; store sequence emitted directly.
 ; =============================================================================
 
 ; -------------------------------------------------------------------------
@@ -168,6 +192,972 @@ basix_emit_store_var:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_emit_store_var_indexed: EAX = variable index, R12 = component
+; index (compile-time constant), R11D = the just-evaluated expression's
+; type. Stores into that component of the variable's wide (vector/
+; matrix) slot, converting int->double if needed (vector/matrix
+; components are always doubles, regardless of the language's separate
+; sfloat/dfloat distinction for scalars).
+; -------------------------------------------------------------------------
+basix_emit_store_var_indexed:
+    push r10
+    mov r10, r12
+    call basix_var_wide_slot_addr
+    imul r10, r10, 8
+    add rax, r10
+    push rax
+    cmp r11d, 0
+    jne .already_float
+    call basix_emit_cvtsi2sd_x0_rax
+.already_float:
+    pop rax
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+    pop r10
+    ret
+
+; =============================================================================
+; Vector/matrix support (VECTOR2/3/4, MATRIX4). Every operation below is
+; unrolled entirely at compile time -- component indices are always
+; compile-time constants (v1 scope: no runtime-computed indices), so a
+; "loop over components" in this parser is a loop that runs while
+; *compiling*, emitting one fixed-address load/op/store sequence per
+; component rather than a real runtime loop. Matrices are row-major,
+; 16 doubles, M[row][col] at flat index row*4+col.
+; =============================================================================
+
+; -------------------------------------------------------------------------
+; basix_var_component_count: EAX = a var_type value. Returns ECX = its
+; component count (2/3/4/16), or 0 if it's not a vector/matrix type.
+; -------------------------------------------------------------------------
+basix_var_component_count:
+    cmp eax, 3
+    je .v2
+    cmp eax, 4
+    je .v3
+    cmp eax, 5
+    je .v4
+    cmp eax, 6
+    je .m4
+    xor ecx, ecx
+    ret
+.v2:
+    mov ecx, 2
+    ret
+.v3:
+    mov ecx, 3
+    ret
+.v4:
+    mov ecx, 4
+    ret
+.m4:
+    mov ecx, 16
+    ret
+
+; -------------------------------------------------------------------------
+; basix_wide_component_addr: EAX = variable index, ECX = component index
+; (both compile-time constants). Returns RAX = absolute address of that
+; double.
+; -------------------------------------------------------------------------
+basix_wide_component_addr:
+    push rcx
+    call basix_var_wide_slot_addr
+    pop rcx
+    imul ecx, ecx, 8
+    add rax, rcx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_resolve_vec_ident: assumes the current token is the (not yet
+; consumed) name of a vector/matrix variable. Creates it if new
+; (defaulting to INTEGER, which will then fail the caller's component-
+; count check -- variables used this way should always have been DIM'd
+; explicitly first). Consumes the identifier. Returns EAX = var index,
+; ECX = component count (0 if not actually a vector/matrix type).
+; -------------------------------------------------------------------------
+basix_resolve_vec_ident:
+    cmp dword [rel basix_tok_type], TOK_IDENT
+    jne .fail
+    mov rcx, [rel basix_tok_text]
+    mov edx, [rel basix_tok_len]
+    call basix_var_find_or_create
+    push rax
+    mov ecx, [rel basix_var_type + rax*4]
+    mov eax, ecx
+    call basix_var_component_count
+    pop rax
+    call basix_lex_next
+    ret
+.fail:
+    mov dword [rel basix_compile_ok], 0
+    xor eax, eax
+    xor ecx, ecx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_emit_cross_term: RCX = a_idx, RDX = b_idx, R8D = i, R9D = j.
+; Emits code computing XMM0 = a[i]*b[j] - a[j]*b[i] (one component of a
+; 3D cross product).
+; -------------------------------------------------------------------------
+basix_emit_cross_term:
+    push rbx
+    push r10
+    push r11
+    push r12
+    mov ebx, ecx
+    mov r10d, edx
+    mov r11d, r8d
+    mov r12d, r9d
+
+    mov eax, ebx
+    mov ecx, r11d
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax       ; xmm0 = a[i]
+
+    mov eax, r10d
+    mov ecx, r12d
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax_x1    ; xmm1 = b[j]
+
+    call basix_emit_mulsd                ; xmm0 = a[i]*b[j]
+    call basix_emit_push_xmm0
+
+    mov eax, ebx
+    mov ecx, r12d
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax       ; xmm0 = a[j]
+
+    mov eax, r10d
+    mov ecx, r11d
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax_x1    ; xmm1 = b[i]
+
+    call basix_emit_mulsd                ; xmm0 = a[j]*b[i]
+    call basix_emit_mov_xmm1_xmm0        ; xmm1 = a[j]*b[i]
+    call basix_emit_pop_xmm0             ; xmm0 = a[i]*b[j]
+    call basix_emit_subsd                ; xmm0 = a[i]*b[j] - a[j]*b[i]
+
+    pop r12
+    pop r11
+    pop r10
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_vset: "VSET target, v0, v1, ..." -- sets all of target's
+; components. The value count must exactly match target's declared type.
+; -------------------------------------------------------------------------
+basix_parse_vset:
+    push rbx
+    push r13
+    push r14
+
+    call basix_resolve_vec_ident
+    mov ebx, eax
+    mov r13d, ecx
+    test r13d, r13d
+    jz .bail
+
+    xor r14d, r14d
+.loop:
+    cmp r14d, r13d
+    jge .check_extra
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_arith               ; r11d = expr type
+    mov eax, ebx
+    mov r12, r14
+    call basix_emit_store_var_indexed
+    inc r14d
+    jmp .loop
+.check_extra:
+    cmp dword [rel basix_tok_type], TOK_COMMA
+    jne .out
+    mov dword [rel basix_compile_ok], 0  ; too many values supplied
+    jmp .out
+.bail:
+    mov dword [rel basix_compile_ok], 0
+.out:
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_vadd / basix_parse_vsub: "VADD target, a, b" / "VSUB ...":
+; target = a +/- b, component-wise. All three must share the same
+; vector/matrix type.
+; -------------------------------------------------------------------------
+basix_parse_vadd:
+    xor r12d, r12d
+    jmp basix_parse_vaddsub_common
+basix_parse_vsub:
+    mov r12d, 1
+    jmp basix_parse_vaddsub_common
+
+basix_parse_vaddsub_common:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    call basix_resolve_vec_ident         ; target
+    mov ebx, eax
+    mov r13d, ecx
+    test r13d, r13d
+    jz .bail
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_resolve_vec_ident         ; a
+    mov r14d, eax
+    cmp ecx, r13d
+    jne .bail
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_resolve_vec_ident         ; b
+    mov r15d, eax
+    cmp ecx, r13d
+    jne .bail
+
+    xor r10d, r10d
+.loop:
+    cmp r10d, r13d
+    jge .done
+    mov r11d, r10d
+    shl r11, 3                           ; component byte offset
+
+    mov eax, r14d
+    call basix_var_wide_slot_addr
+    add rax, r11
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax       ; xmm0 = a[i]
+
+    mov eax, r15d
+    call basix_var_wide_slot_addr
+    add rax, r11
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax_x1    ; xmm1 = b[i]
+
+    test r12d, r12d
+    jnz .do_sub
+    call basix_emit_addsd
+    jmp .store_result
+.do_sub:
+    call basix_emit_subsd
+.store_result:
+    mov eax, ebx
+    call basix_var_wide_slot_addr
+    add rax, r11
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    inc r10d
+    jmp .loop
+.done:
+    jmp .out
+.bail:
+    mov dword [rel basix_compile_ok], 0
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_vscale: "VSCALE target, a, scalar" -- target = a * scalar
+; (scalar may be any arithmetic expression, int or float).
+; -------------------------------------------------------------------------
+basix_parse_vscale:
+    push rbx
+    push r13
+    push r14
+
+    call basix_resolve_vec_ident         ; target
+    mov ebx, eax
+    mov r13d, ecx
+    test r13d, r13d
+    jz .bail
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_resolve_vec_ident         ; a
+    mov r14d, eax
+    cmp ecx, r13d
+    jne .bail
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_arith               ; scalar expr, r11d = type
+    cmp r11d, 0
+    jne .have_scalar_float
+    call basix_emit_cvtsi2sd_x0_rax
+.have_scalar_float:
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax      ; stash scalar
+
+    xor r10d, r10d
+.loop:
+    cmp r10d, r13d
+    jge .done
+    mov r11d, r10d
+    shl r11, 3
+
+    mov eax, r14d
+    call basix_var_wide_slot_addr
+    add rax, r11
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax       ; xmm0 = a[i]
+
+    push r11
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax_x1    ; xmm1 = scalar
+    pop r11
+
+    call basix_emit_mulsd
+
+    mov eax, ebx
+    call basix_var_wide_slot_addr
+    add rax, r11
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    inc r10d
+    jmp .loop
+.done:
+    jmp .out
+.bail:
+    mov dword [rel basix_compile_ok], 0
+.out:
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_vdot: "VDOT target, a, b" -- target (a plain scalar
+; variable) = dot(a, b).
+; -------------------------------------------------------------------------
+basix_parse_vdot:
+    push rbx
+    push r13
+    push r14
+    push r15
+
+    cmp dword [rel basix_tok_type], TOK_IDENT
+    jne .bail
+    mov rcx, [rel basix_tok_text]
+    mov edx, [rel basix_tok_len]
+    call basix_var_find_or_create
+    mov ebx, eax                          ; target scalar var
+    call basix_lex_next
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_resolve_vec_ident          ; a
+    mov r14d, eax
+    mov r13d, ecx
+    test r13d, r13d
+    jz .bail
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_resolve_vec_ident          ; b
+    mov r15d, eax
+    cmp ecx, r13d
+    jne .bail
+
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_pxor_xmm0_xmm0
+    call basix_emit_movsd_store_rax       ; scalar_temp = 0.0
+
+    xor r10d, r10d
+.loop:
+    cmp r10d, r13d
+    jge .finish
+    mov r11d, r10d
+    shl r11, 3
+
+    mov eax, r14d
+    call basix_var_wide_slot_addr
+    add rax, r11
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax        ; xmm0 = a[i]
+
+    mov eax, r15d
+    call basix_var_wide_slot_addr
+    add rax, r11
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax_x1     ; xmm1 = b[i]
+
+    call basix_emit_mulsd                 ; xmm0 = a[i]*b[i]
+    call basix_emit_mov_xmm1_xmm0
+
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+    call basix_emit_addsd
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    inc r10d
+    jmp .loop
+.finish:
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+    mov r11d, 2
+    mov eax, ebx
+    call basix_emit_store_var
+    jmp .out
+.bail:
+    mov dword [rel basix_compile_ok], 0
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_vcross: "VCROSS target, a, b" -- target = a x b. VECTOR3
+; only.
+; -------------------------------------------------------------------------
+basix_parse_vcross:
+    push rbx
+    push r13
+    push r14
+
+    call basix_resolve_vec_ident         ; target
+    mov ebx, eax
+    cmp ecx, 3
+    jne .bail
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_resolve_vec_ident         ; a
+    mov r13d, eax
+    cmp ecx, 3
+    jne .bail
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_resolve_vec_ident         ; b
+    mov r14d, eax
+    cmp ecx, 3
+    jne .bail
+
+    mov ecx, r13d
+    mov edx, r14d
+    mov r8d, 1
+    mov r9d, 2
+    call basix_emit_cross_term
+    mov eax, ebx
+    mov ecx, 0
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    mov ecx, r13d
+    mov edx, r14d
+    mov r8d, 2
+    mov r9d, 0
+    call basix_emit_cross_term
+    mov eax, ebx
+    mov ecx, 1
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    mov ecx, r13d
+    mov edx, r14d
+    mov r8d, 0
+    mov r9d, 1
+    call basix_emit_cross_term
+    mov eax, ebx
+    mov ecx, 2
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    jmp .out
+.bail:
+    mov dword [rel basix_compile_ok], 0
+.out:
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_vlen: "VLEN target, a" -- target (scalar) = |a|.
+; -------------------------------------------------------------------------
+basix_parse_vlen:
+    push rbx
+    push r13
+    push r14
+
+    cmp dword [rel basix_tok_type], TOK_IDENT
+    jne .bail
+    mov rcx, [rel basix_tok_text]
+    mov edx, [rel basix_tok_len]
+    call basix_var_find_or_create
+    mov ebx, eax
+    call basix_lex_next
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_resolve_vec_ident          ; a
+    mov r13d, eax
+    mov r14d, ecx
+    test r14d, r14d
+    jz .bail
+
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_pxor_xmm0_xmm0
+    call basix_emit_movsd_store_rax
+
+    xor r10d, r10d
+.loop:
+    cmp r10d, r14d
+    jge .finish
+    mov eax, r13d
+    mov ecx, r10d
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+    call basix_emit_mov_xmm1_xmm0
+    call basix_emit_mulsd                 ; xmm0 = a[i]^2
+    call basix_emit_mov_xmm1_xmm0
+
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+    call basix_emit_addsd
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    inc r10d
+    jmp .loop
+.finish:
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+    call basix_emit_sqrtsd
+    mov r11d, 2
+    mov eax, ebx
+    call basix_emit_store_var
+    jmp .out
+.bail:
+    mov dword [rel basix_compile_ok], 0
+.out:
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_vnorm: "VNORM target, a" -- target = a / |a|.
+; -------------------------------------------------------------------------
+basix_parse_vnorm:
+    push rbx
+    push r13
+    push r14
+
+    call basix_resolve_vec_ident          ; target
+    mov ebx, eax
+    mov r14d, ecx
+    test r14d, r14d
+    jz .bail
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_resolve_vec_ident          ; a
+    mov r13d, eax
+    cmp ecx, r14d
+    jne .bail
+
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_pxor_xmm0_xmm0
+    call basix_emit_movsd_store_rax
+
+    xor r10d, r10d
+.sumloop:
+    cmp r10d, r14d
+    jge .sumdone
+    mov eax, r13d
+    mov ecx, r10d
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+    call basix_emit_mov_xmm1_xmm0
+    call basix_emit_mulsd
+    call basix_emit_mov_xmm1_xmm0
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+    call basix_emit_addsd
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+    inc r10d
+    jmp .sumloop
+.sumdone:
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+    call basix_emit_sqrtsd
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax       ; scalar_temp = |a|
+
+    xor r10d, r10d
+.divloop:
+    cmp r10d, r14d
+    jge .out
+    mov eax, r13d
+    mov ecx, r10d
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax        ; xmm0 = a[i]
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax_x1     ; xmm1 = |a|
+    call basix_emit_divsd
+    mov eax, ebx
+    mov ecx, r10d
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+    inc r10d
+    jmp .divloop
+.bail:
+    mov dword [rel basix_compile_ok], 0
+.out:
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_mident: "MIDENT target" -- target (MATRIX4) = identity.
+; -------------------------------------------------------------------------
+basix_parse_mident:
+    cmp dword [rel basix_tok_type], TOK_IDENT
+    jne .bail_early
+    mov rcx, [rel basix_tok_text]
+    mov edx, [rel basix_tok_len]
+    call basix_var_find_or_create
+    push rax
+    call basix_lex_next
+
+    xor r10d, r10d
+.zero_loop:
+    cmp r10d, 16
+    jge .set_diag
+    mov eax, [rsp]
+    mov ecx, r10d
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_pxor_xmm0_xmm0
+    call basix_emit_movsd_store_rax
+    inc r10d
+    jmp .zero_loop
+.set_diag:
+    xor r10d, r10d
+.diag_loop:
+    cmp r10d, 4
+    jge .done
+    mov rax, 0x3FF0000000000000           ; IEEE754 bits for 1.0
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movq_xmm0_rax         ; xmm0 = 1.0
+
+    mov eax, [rsp]
+    mov ecx, r10d
+    imul ecx, ecx, 4
+    add ecx, r10d                          ; index = i*4+i
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    inc r10d
+    jmp .diag_loop
+.done:
+    pop rax
+    ret
+.bail_early:
+    mov dword [rel basix_compile_ok], 0
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_mmul: "MMUL target, a, b" -- target = a*b, standard 4x4
+; matrix multiply. Writes through a scratch matrix first so it's safe
+; even if target aliases a or b.
+; -------------------------------------------------------------------------
+basix_parse_mmul:
+    push rbx
+    push r13
+    push r14
+
+    cmp dword [rel basix_tok_type], TOK_IDENT
+    jne .bail
+    mov rcx, [rel basix_tok_text]
+    mov edx, [rel basix_tok_len]
+    call basix_var_find_or_create
+    mov ebx, eax                          ; target
+    call basix_lex_next
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    cmp dword [rel basix_tok_type], TOK_IDENT
+    jne .bail
+    mov rcx, [rel basix_tok_text]
+    mov edx, [rel basix_tok_len]
+    call basix_var_find_or_create
+    mov r13d, eax                          ; a
+    call basix_lex_next
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    cmp dword [rel basix_tok_type], TOK_IDENT
+    jne .bail
+    mov rcx, [rel basix_tok_text]
+    mov edx, [rel basix_tok_len]
+    call basix_var_find_or_create
+    mov r14d, eax                          ; b
+    call basix_lex_next
+
+    xor r10d, r10d                         ; row
+.row_loop:
+    cmp r10d, 4
+    jge .copy_out
+    xor r11d, r11d                         ; col
+.col_loop:
+    cmp r11d, 4
+    jge .row_next
+
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_pxor_xmm0_xmm0
+    call basix_emit_movsd_store_rax
+
+    push r10
+    push r11
+    xor r12d, r12d                         ; k
+.k_loop:
+    cmp r12d, 4
+    jge .k_done
+
+    mov eax, r13d
+    mov ecx, r10d
+    imul ecx, ecx, 4
+    add ecx, r12d                          ; a[row][k]
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+
+    mov eax, r14d
+    mov ecx, r12d
+    imul ecx, ecx, 4
+    add ecx, r11d                          ; b[k][col]
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax_x1
+
+    call basix_emit_mulsd
+    call basix_emit_mov_xmm1_xmm0
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+    call basix_emit_addsd
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    inc r12d
+    jmp .k_loop
+.k_done:
+    pop r11
+    pop r10
+
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+
+    mov eax, r10d
+    imul eax, eax, 4
+    add eax, r11d
+    imul eax, eax, 8
+    lea rax, [rel basix_mat_scratch + rax]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    inc r11d
+    jmp .col_loop
+.row_next:
+    inc r10d
+    jmp .row_loop
+
+.copy_out:
+    xor r10d, r10d
+.copy_loop:
+    cmp r10d, 16
+    jge .out
+    mov eax, r10d
+    imul eax, eax, 8
+    lea rax, [rel basix_mat_scratch + rax]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+
+    mov eax, ebx
+    mov ecx, r10d
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    inc r10d
+    jmp .copy_loop
+.bail:
+    mov dword [rel basix_compile_ok], 0
+.out:
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_mvmul: "MVMUL target, m, v" -- target = m*v. MATRIX4 times
+; VECTOR4, giving a VECTOR4. Writes through a scratch vector first so
+; it's safe even if target aliases v.
+; -------------------------------------------------------------------------
+basix_parse_mvmul:
+    push rbx
+    push r13
+    push r14
+
+    call basix_resolve_vec_ident          ; target
+    mov ebx, eax
+    cmp ecx, 4
+    jne .bail
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    cmp dword [rel basix_tok_type], TOK_IDENT
+    jne .bail
+    mov rcx, [rel basix_tok_text]
+    mov edx, [rel basix_tok_len]
+    call basix_var_find_or_create
+    mov r13d, eax                          ; matrix
+    call basix_lex_next
+
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_resolve_vec_ident           ; v
+    mov r14d, eax
+    cmp ecx, 4
+    jne .bail
+
+    xor r10d, r10d                         ; output component i
+.loop:
+    cmp r10d, 4
+    jge .copy_out
+
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_pxor_xmm0_xmm0
+    call basix_emit_movsd_store_rax
+
+    push r10
+    xor r11d, r11d                         ; k
+.kloop:
+    cmp r11d, 4
+    jge .kdone
+
+    mov eax, r13d
+    mov ecx, r10d
+    imul ecx, ecx, 4
+    add ecx, r11d                          ; m[i][k]
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+
+    mov eax, r14d
+    mov ecx, r11d                          ; v[k]
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax_x1
+
+    call basix_emit_mulsd
+    call basix_emit_mov_xmm1_xmm0
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+    call basix_emit_addsd
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    inc r11d
+    jmp .kloop
+.kdone:
+    pop r10
+
+    lea rax, [rel basix_vec_scalar_temp]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+
+    mov eax, r10d
+    imul eax, eax, 8
+    lea rax, [rel basix_vec4_scratch + rax]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    inc r10d
+    jmp .loop
+
+.copy_out:
+    xor r10d, r10d
+.copyloop:
+    cmp r10d, 4
+    jge .out
+    mov eax, r10d
+    imul eax, eax, 8
+    lea rax, [rel basix_vec4_scratch + rax]
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+
+    mov eax, ebx
+    mov ecx, r10d
+    call basix_wide_component_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+
+    inc r10d
+    jmp .copyloop
+.bail:
+    mov dword [rel basix_compile_ok], 0
+.out:
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_parse_primary
 ; -------------------------------------------------------------------------
 basix_parse_primary:
@@ -202,19 +1192,51 @@ basix_parse_primary:
     ret
 
 .ident:
+    push r12
     mov rcx, [rel basix_tok_text]
     mov edx, [rel basix_tok_len]
     call basix_var_find_or_create
     mov r10d, eax
     mov r9d, [rel basix_var_type + r10*4]
+    call basix_lex_next                   ; consume the identifier
+
+    cmp dword [rel basix_tok_type], TOK_LBRACKET
+    jne .ident_no_index
+
+    ; indexed access: v[N] -- N must be an integer literal (v1 scope;
+    ; no runtime-computed indices).
+    call basix_lex_next                   ; consume '['
+    cmp dword [rel basix_tok_type], TOK_INT
+    jne .index_bad
+    mov r12, [rel basix_tok_ival]
+    call basix_lex_next                   ; consume the index literal
+    mov eax, TOK_RBRACKET
+    call basix_expect
+
+    mov eax, r10d
+    call basix_var_wide_slot_addr
+    imul r12, r12, 8
+    add rax, r12
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_load_rax
+    mov r11d, 2
+    pop r12
+    ret
+.index_bad:
+    mov dword [rel basix_compile_ok], 0
+    mov r11d, 2
+    pop r12
+    ret
+
+.ident_no_index:
     mov eax, r10d
     call basix_var_slot_addr
 
     cmp r9d, 0
     jne .ident_float
     call basix_emit_mov_rax_moffs
-    call basix_lex_next
     xor r11d, r11d
+    pop r12
     ret
 
 .ident_float:
@@ -227,8 +1249,8 @@ basix_parse_primary:
     call basix_emit_movss_load_rax
     call basix_emit_cvtss2sd_x0_x0
 .ident_float_done:
-    call basix_lex_next
     mov r11d, 2
+    pop r12
     ret
 
 .paren:
@@ -604,6 +1626,7 @@ basix_parse_block:
 basix_parse_assignment:
     push rbx
     push rdx
+    push r12
 
     mov rbx, [rel basix_tok_text]
     mov edx, [rel basix_tok_len]
@@ -614,13 +1637,38 @@ basix_parse_assignment:
     push rax
 
     call basix_lex_next
+
+    cmp dword [rel basix_tok_type], TOK_LBRACKET
+    jne .no_index
+
+    call basix_lex_next                 ; consume '['
+    cmp dword [rel basix_tok_type], TOK_INT
+    jne .index_bad
+    mov r12, [rel basix_tok_ival]
+    call basix_lex_next
+    mov eax, TOK_RBRACKET
+    call basix_expect
+    jmp .have_index
+.index_bad:
+    mov dword [rel basix_compile_ok], 0
+    xor r12, r12
+.have_index:
     mov eax, TOK_EQ
     call basix_expect
     call basix_parse_arith              ; r11d = expr type
+    pop rax
+    call basix_emit_store_var_indexed
+    jmp .done
 
+.no_index:
+    mov eax, TOK_EQ
+    call basix_expect
+    call basix_parse_arith              ; r11d = expr type
     pop rax
     call basix_emit_store_var
 
+.done:
+    pop r12
     pop rdx
     pop rbx
     ret
@@ -942,8 +1990,28 @@ basix_parse_dim:
     jmp .type_ok
 .check_dfloat:
     cmp dword [rel basix_tok_type], TOK_DFLOAT
-    jne .bail_after_push
+    jne .check_vec2
     mov r8d, 2
+    jmp .type_ok
+.check_vec2:
+    cmp dword [rel basix_tok_type], TOK_VECTOR2
+    jne .check_vec3
+    mov r8d, 3
+    jmp .type_ok
+.check_vec3:
+    cmp dword [rel basix_tok_type], TOK_VECTOR3
+    jne .check_vec4
+    mov r8d, 4
+    jmp .type_ok
+.check_vec4:
+    cmp dword [rel basix_tok_type], TOK_VECTOR4
+    jne .check_mat4
+    mov r8d, 5
+    jmp .type_ok
+.check_mat4:
+    cmp dword [rel basix_tok_type], TOK_MATRIX4
+    jne .bail_after_push
+    mov r8d, 6
 .type_ok:
     call basix_lex_next
 
@@ -968,6 +2036,7 @@ basix_parse_dim:
 ; -------------------------------------------------------------------------
 basix_parse_statement:
     push rbx
+    push r12
     push r13
     push r15
 
@@ -993,6 +2062,28 @@ basix_parse_statement:
     je .do_dim
     cmp r15d, TOK_END
     je .do_end
+    cmp r15d, TOK_VSET
+    je .do_vset
+    cmp r15d, TOK_VADD
+    je .do_vadd
+    cmp r15d, TOK_VSUB
+    je .do_vsub
+    cmp r15d, TOK_VSCALE
+    je .do_vscale
+    cmp r15d, TOK_VDOT
+    je .do_vdot
+    cmp r15d, TOK_VCROSS
+    je .do_vcross
+    cmp r15d, TOK_VLEN
+    je .do_vlen
+    cmp r15d, TOK_VNORM
+    je .do_vnorm
+    cmp r15d, TOK_MIDENT
+    je .do_mident
+    cmp r15d, TOK_MMUL
+    je .do_mmul
+    cmp r15d, TOK_MVMUL
+    je .do_mvmul
     cmp r15d, TOK_IDENT
     je .do_ident_stmt
 
@@ -1005,6 +2096,51 @@ basix_parse_statement:
     call basix_parse_assignment
     jmp .out
 
+.do_vset:
+    call basix_lex_next
+    call basix_parse_vset
+    jmp .out
+.do_vadd:
+    call basix_lex_next
+    call basix_parse_vadd
+    jmp .out
+.do_vsub:
+    call basix_lex_next
+    call basix_parse_vsub
+    jmp .out
+.do_vscale:
+    call basix_lex_next
+    call basix_parse_vscale
+    jmp .out
+.do_vdot:
+    call basix_lex_next
+    call basix_parse_vdot
+    jmp .out
+.do_vcross:
+    call basix_lex_next
+    call basix_parse_vcross
+    jmp .out
+.do_vlen:
+    call basix_lex_next
+    call basix_parse_vlen
+    jmp .out
+.do_vnorm:
+    call basix_lex_next
+    call basix_parse_vnorm
+    jmp .out
+.do_mident:
+    call basix_lex_next
+    call basix_parse_mident
+    jmp .out
+.do_mmul:
+    call basix_lex_next
+    call basix_parse_mmul
+    jmp .out
+.do_mvmul:
+    call basix_lex_next
+    call basix_parse_mvmul
+    jmp .out
+
 .do_ident_stmt:
     mov rbx, [rel basix_tok_text]
     mov r13d, [rel basix_tok_len]
@@ -1012,14 +2148,38 @@ basix_parse_statement:
     cmp dword [rel basix_tok_type], TOK_COLON
     je .label_def
 
-    mov eax, TOK_EQ
-    call basix_expect
     push rbx
     mov rcx, rbx
     mov edx, r13d
     call basix_var_find_or_create
     pop rbx
     push rax
+
+    cmp dword [rel basix_tok_type], TOK_LBRACKET
+    jne .assign_no_index
+
+    call basix_lex_next                 ; consume '['
+    cmp dword [rel basix_tok_type], TOK_INT
+    jne .assign_index_bad
+    mov r12, [rel basix_tok_ival]
+    call basix_lex_next
+    mov eax, TOK_RBRACKET
+    call basix_expect
+    jmp .assign_have_index
+.assign_index_bad:
+    mov dword [rel basix_compile_ok], 0
+    xor r12, r12
+.assign_have_index:
+    mov eax, TOK_EQ
+    call basix_expect
+    call basix_parse_arith              ; r11d = expr type
+    pop rax
+    call basix_emit_store_var_indexed
+    jmp .out
+
+.assign_no_index:
+    mov eax, TOK_EQ
+    call basix_expect
     call basix_parse_arith              ; r11d = expr type
     pop rax
     call basix_emit_store_var
@@ -1105,6 +2265,7 @@ basix_parse_statement:
 .out:
     pop r15
     pop r13
+    pop r12
     pop rbx
     ret
 

@@ -464,6 +464,22 @@ basix_i_and_rax_rcx:  db 0x48,0x21,0xC8             ; and rax,rcx
 basix_i_or_rax_rcx:   db 0x48,0x09,0xC8             ; or rax,rcx
 basix_i_movzx_eax_al: db 0x0F,0xB6,0xC0              ; movzx eax,al
 basix_i_pxor_xmm1_xmm1: db 0x66,0x0F,0xEF,0xC9       ; pxor xmm1,xmm1
+basix_i_pxor_xmm0_xmm0: db 0x66,0x0F,0xEF,0xC0       ; pxor xmm0,xmm0
+basix_i_movsd_load_rax_x1: db 0xF2,0x0F,0x10,0x08    ; movsd xmm1,[rax]
+basix_i_sqrtsd: db 0xF2,0x0F,0x51,0xC0               ; sqrtsd xmm0,xmm0
+
+basix_emit_pxor_xmm0_xmm0:
+    lea rcx, [rel basix_i_pxor_xmm0_xmm0]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_movsd_load_rax_x1:
+    lea rcx, [rel basix_i_movsd_load_rax_x1]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_sqrtsd:
+    lea rcx, [rel basix_i_sqrtsd]
+    mov edx, 4
+    jmp basix_emit_bytes
 
 basix_i_sete:  db 0x0F,0x94,0xC0                     ; sete al
 basix_i_setne: db 0x0F,0x95,0xC0                     ; setne al

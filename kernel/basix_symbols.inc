@@ -194,6 +194,17 @@ basix_var_slot_addr:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_var_wide_slot_addr: EAX = variable index. Returns RAX = absolute
+; address of its 128-byte wide slot (VECTOR2/3/4 and MATRIX4 storage --
+; up to 16 doubles, row-major for MATRIX4). Every variable gets one of
+; these regardless of declared type; scalars just never use theirs.
+; -------------------------------------------------------------------------
+basix_var_wide_slot_addr:
+    imul eax, eax, 128
+    lea rax, [rel basix_var_wide_slots + rax]
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_label_find_or_create: RCX = name ptr, EDX = len. Returns EAX =
 ; label index, creating an as-yet-undefined entry if not found.
 ; -------------------------------------------------------------------------
@@ -404,6 +415,14 @@ basix_var_type:  times BASIX_MAX_VARS dd 0
 align 8
 basix_var_name:  times (BASIX_MAX_VARS*32) db 0
 basix_var_slots: times BASIX_MAX_VARS dq 0
+
+align 8
+basix_var_wide_slots: times (BASIX_MAX_VARS * 128) db 0
+
+align 8
+basix_vec_scalar_temp: dq 0              ; accumulator for dot/length/matmul
+basix_mat_scratch:     times 16 dq 0     ; MMUL result staging (alias safety)
+basix_vec4_scratch:    times 4 dq 0      ; MVMUL result staging (alias safety)
 
 basix_label_count:   dd 0
 basix_label_defined: times BASIX_MAX_LABELS dd 0

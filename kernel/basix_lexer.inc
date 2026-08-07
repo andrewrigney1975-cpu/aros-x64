@@ -61,6 +61,26 @@ TOK_LPAREN  equ 50
 TOK_RPAREN  equ 51
 TOK_COMMA   equ 52
 TOK_COLON   equ 53
+TOK_LBRACKET equ 54
+TOK_RBRACKET equ 55
+
+; Vector/matrix types and statements (var_type encoding: 0=INT,1=SFLOAT,
+; 2=DFLOAT,3=VECTOR2,4=VECTOR3,5=VECTOR4,6=MATRIX4)
+TOK_VECTOR2 equ 60
+TOK_VECTOR3 equ 61
+TOK_VECTOR4 equ 62
+TOK_MATRIX4 equ 63
+TOK_VSET    equ 64
+TOK_VADD    equ 65
+TOK_VSUB    equ 66
+TOK_VSCALE  equ 67
+TOK_VDOT    equ 68
+TOK_VCROSS  equ 69
+TOK_VLEN    equ 70
+TOK_VNORM   equ 71
+TOK_MIDENT  equ 72
+TOK_MMUL    equ 73
+TOK_MVMUL   equ 74
 
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
@@ -296,6 +316,10 @@ basix_lex_next:
     je .op1_comma
     cmp al, ':'
     je .op1_colon
+    cmp al, '['
+    je .op1_lbracket
+    cmp al, ']'
+    je .op1_rbracket
     cmp al, '<'
     je .op_lt_family
     cmp al, '>'
@@ -331,6 +355,12 @@ basix_lex_next:
     jmp .adv1
 .op1_colon:
     mov dword [rel basix_tok_type], TOK_COLON
+    jmp .adv1
+.op1_lbracket:
+    mov dword [rel basix_tok_type], TOK_LBRACKET
+    jmp .adv1
+.op1_rbracket:
+    mov dword [rel basix_tok_type], TOK_RBRACKET
     jmp .adv1
 .adv1:
     inc rsi
@@ -690,5 +720,65 @@ basix_keywords:
     db 3
     dd TOK_NOT
     db 'NOT', 0,0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_VECTOR2
+    db 'VECTOR2', 0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_VECTOR3
+    db 'VECTOR3', 0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_VECTOR4
+    db 'VECTOR4', 0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_MATRIX4
+    db 'MATRIX4', 0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_VSET
+    db 'VSET', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_VADD
+    db 'VADD', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_VSUB
+    db 'VSUB', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 6
+    dd TOK_VSCALE
+    db 'VSCALE', 0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_VDOT
+    db 'VDOT', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 6
+    dd TOK_VCROSS
+    db 'VCROSS', 0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_VLEN
+    db 'VLEN', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 5
+    dd TOK_VNORM
+    db 'VNORM', 0,0,0,0,0,0,0,0,0,0,0
+
+    db 6
+    dd TOK_MIDENT
+    db 'MIDENT', 0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_MMUL
+    db 'MMUL', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 5
+    dd TOK_MVMUL
+    db 'MVMUL', 0,0,0,0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table
