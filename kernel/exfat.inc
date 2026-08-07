@@ -922,12 +922,47 @@ exfat_dir_find_slot:
     mov ecx, edx
     add ecx, eax
     cmp ecx, edi
-    jg .this_cluster_full               ; free run starts here but won't fit
+    jg .pad_and_extend                  ; free run starts here but won't fit
     mov ebx, r10d                       ; ebx = cluster containing the run
     jmp .found
 .not_free:
     add edx, 32
     jmp .entry_scan
+
+.pad_and_extend:
+    ; A 0x00 EntryType means "nothing valid follows anywhere in the
+    ; directory" to any compliant scan (exfat_find_root_file,
+    ; exfat_dir_list_next) -- both stop dead the moment they see one,
+    ; even if more clusters follow in the chain. If we just moved on to
+    ; a new cluster and wrote there without touching this leftover
+    ; free-but-too-small run, whatever we write would be permanently
+    ; unreachable: every future scan would still stop right here. Pad it
+    ; with a non-zero, non-0x85 filler (anything else is just skipped
+    ; over, same as this scan's own .not_free path does) so scanning
+    ; continues on to the next cluster instead of stopping early.
+    push rcx
+    push rdi
+    mov ecx, edi
+    sub ecx, edx
+    lea rdi, [rsi+rdx]
+    mov al, 0x01
+    cld
+    rep stosb
+    pop rdi
+    pop rcx
+
+    push rcx
+    push rdx
+    mov ecx, r10d
+    call exfat_cluster_to_lba
+    mov rcx, rax
+    mov edx, [rel exfat_sectors_per_cluster]
+    lea r8, [rel exfat_dir_buf]
+    call storage_write_sectors
+    pop rdx
+    pop rcx
+    test eax, eax
+    jz .fail
 
 .this_cluster_full:
     mov ecx, r10d
