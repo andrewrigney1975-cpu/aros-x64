@@ -339,6 +339,42 @@ entry:
     call serial_puts
 .wtest_done:
 
+    ; Verify the allocation bitmap: mount it, allocate a cluster, confirm
+    ; it now reads back as allocated, then free it again. This ends with
+    ; the on-disk bitmap byte-for-byte unchanged (alloc then free of the
+    ; same cluster is a net no-op), so it's safe to run every boot.
+    call exfat_bitmap_mount
+    test eax, eax
+    jz .btest_bad
+
+    call exfat_alloc_cluster
+    test eax, eax
+    jz .btest_bad
+    mov ebx, eax                        ; ebx = allocated cluster
+
+    mov ecx, ebx
+    call exfat_bitmap_test_free
+    test eax, eax
+    jnz .btest_bad                      ; should now read as NOT free
+
+    mov ecx, ebx
+    call exfat_free_cluster
+    test eax, eax
+    jz .btest_bad
+
+    mov ecx, ebx
+    call exfat_bitmap_test_free
+    test eax, eax
+    jz .btest_bad                       ; should be free again
+
+    lea rcx, [rel msg_btest_ok]
+    call serial_puts
+    jmp .btest_done
+.btest_bad:
+    lea rcx, [rel msg_btest_bad]
+    call serial_puts
+.btest_done:
+
     ; Bring up the scheduler: the current flow becomes the "main" task
     ; (its TCB.rsp gets filled in on its own first save -- it doesn't need
     ; a hand-built frame like task_create produces, since it's already
@@ -945,6 +981,8 @@ msg_kheap_ok:         db 'kmalloc/kfree: alloc/content/reuse OK', 13, 10, 0
 msg_kheap_bad:        db 'kmalloc/kfree: FAILED', 13, 10, 0
 msg_wtest_ok:         db 'storage_write_sectors: scratch write/read-back OK', 13, 10, 0
 msg_wtest_bad:        db 'storage_write_sectors: scratch write/read-back FAILED', 13, 10, 0
+msg_btest_ok:         db 'exFAT: allocation bitmap alloc/free round-trip OK', 13, 10, 0
+msg_btest_bad:        db 'exFAT: allocation bitmap alloc/free round-trip FAILED', 13, 10, 0
 msg_sched_ok:         db 'Scheduler: armed (main + 2 test tasks)', 13, 10, 0
 msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
 msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0

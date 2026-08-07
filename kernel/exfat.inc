@@ -1,7 +1,13 @@
 ; =============================================================================
-; Minimal exFAT reader, built against Microsoft's public exFAT specification.
+; Minimal exFAT reader/writer, built against Microsoft's public exFAT
+; specification.
 ;
-; Scope: single FAT (read-write since phase 7). exfat_mount looks for the
+; Write support (phase 7) so far: sector-level writes (storage.inc),
+; allocation-bitmap discovery and cluster alloc/free (exfat_bitmap_mount /
+; exfat_alloc_cluster / exfat_free_cluster). FAT chain writing, directory
+; entry construction, and exfat_write_file are still to come.
+;
+; Scope: single FAT. exfat_mount looks for the
 ; exFAT signature at LBA 0 first (whole-disk/superfloppy volume); if
 ; that's not it, it tries GPT (LBA 1 signature "EFI PART", preferring a
 ; partition typed as Microsoft Basic Data, else the first non-empty
@@ -252,16 +258,9 @@ exfat_fat_next_cluster:
     mov ecx, [rel exfat_fat_offset]
     add ecx, edx
     add ecx, [rel exfat_base_lba]
-    push rcx
-    mov eax, ecx
-    call dbg_hex64
-    pop rcx
     mov edx, 1
     lea r8, [rel exfat_fat_sector_buf]
     call storage_read_sectors
-    push rax
-    call dbg_hex64
-    pop rax
     pop rdx                             ; rdx = in-sector byte offset
     test eax, eax
     jz .fail
@@ -277,6 +276,319 @@ exfat_fat_next_cluster:
     pop rdx
     pop rcx
     pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_bitmap_mount: locates the volume's Allocation Bitmap directory
+; entry (EntryType 0x81) in the root directory and records its first
+; cluster + length. Must be called after a successful exfat_mount.
+; Returns EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_bitmap_mount:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r10
+
+    mov dword [rel exfat_bitmap_cache_valid], 0
+
+    mov ecx, [rel exfat_root_dir_cluster]
+.cluster_loop:
+    mov r10d, ecx
+    lea r8, [rel exfat_dir_buf]
+    call exfat_read_cluster
+    test eax, eax
+    jz .fail
+
+    lea rsi, [rel exfat_dir_buf]
+    mov eax, [rel exfat_sectors_per_cluster]
+    imul eax, [rel exfat_bytes_per_sector]
+    mov ebx, eax                        ; ebx = cluster size in bytes
+    xor edx, edx                        ; edx = offset within cluster
+.entry_loop:
+    cmp edx, ebx
+    jge .next_cluster
+    movzx eax, byte [rsi+rdx]
+    test al, al
+    jz .fail                            ; end marker: no bitmap entry found
+    cmp al, 0x81
+    jne .skip_entry
+
+    mov eax, [rsi+rdx+20]               ; FirstCluster
+    mov [rel exfat_bitmap_cluster], eax
+    mov rax, [rsi+rdx+24]               ; DataLength
+    mov [rel exfat_bitmap_length], rax
+    mov eax, 1
+    jmp .out
+
+.skip_entry:
+    add edx, 32
+    jmp .entry_loop
+
+.next_cluster:
+    mov ecx, r10d
+    call exfat_fat_next_cluster
+    test eax, eax
+    jz .fail
+    cmp eax, 0xFFFFFFF8
+    jae .fail
+    mov ecx, eax
+    jmp .cluster_loop
+
+.fail:
+    xor eax, eax
+.out:
+    pop r10
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_bitmap_find_cluster: ECX = chain index (0-based cluster count from
+; the bitmap file's first cluster). Returns EAX = actual cluster number, or
+; 0 on error/premature end-of-chain. Preserves the caller's RCX.
+; -------------------------------------------------------------------------
+exfat_bitmap_find_cluster:
+    push rbx
+    push rcx
+
+    mov ebx, [rel exfat_bitmap_cluster]
+    test ecx, ecx
+    jz .done
+.walk:
+    push rcx
+    mov ecx, ebx
+    call exfat_fat_next_cluster
+    pop rcx
+    test eax, eax
+    jz .fail
+    cmp eax, 0xFFFFFFF8
+    jae .fail
+    mov ebx, eax
+    dec ecx
+    jnz .walk
+.done:
+    mov eax, ebx
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_bitmap_ensure_loaded: ECX = chain index of the bitmap-file cluster
+; that must be resident in exfat_bitmap_buf. Returns EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_bitmap_ensure_loaded:
+    push rcx
+    push r8
+
+    cmp dword [rel exfat_bitmap_cache_valid], 0
+    je .miss
+    cmp [rel exfat_bitmap_cache_chain_idx], ecx
+    jne .miss
+    mov eax, 1
+    jmp .out
+
+.miss:
+    call exfat_bitmap_find_cluster      ; preserves ecx (chain idx)
+    test eax, eax
+    jz .fail
+    mov dword [rel exfat_bitmap_cache_cluster], eax
+    push rcx
+    mov ecx, eax
+    lea r8, [rel exfat_bitmap_buf]
+    call exfat_read_cluster
+    pop rcx
+    test eax, eax
+    jz .fail
+
+    mov dword [rel exfat_bitmap_cache_valid], 1
+    mov [rel exfat_bitmap_cache_chain_idx], ecx
+    mov eax, 1
+    jmp .out
+.fail:
+    mov dword [rel exfat_bitmap_cache_valid], 0
+    xor eax, eax
+.out:
+    pop r8
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_bitmap_test_free: ECX = cluster number (>=2). Returns EAX=1 if the
+; cluster is free (bit clear), EAX=0 if allocated or on any error (a read
+; failure is treated as "not free" so a caller never hands out a cluster
+; it couldn't actually verify).
+; -------------------------------------------------------------------------
+exfat_bitmap_test_free:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+
+    sub ecx, 2
+    mov ebx, ecx                        ; ebx = bit index
+    mov eax, [rel exfat_sectors_per_cluster]
+    imul eax, [rel exfat_bytes_per_sector]
+    mov esi, eax                        ; esi = bitmap-file cluster size, bytes
+
+    mov eax, ebx
+    shr eax, 3                          ; eax = byte index within whole bitmap
+    xor edx, edx
+    div esi                             ; eax = chain idx, edx = offset in cluster
+    push rdx
+
+    mov ecx, eax
+    call exfat_bitmap_ensure_loaded
+    pop rdx
+    test eax, eax
+    jz .fail
+
+    lea rax, [rel exfat_bitmap_buf]
+    add rax, rdx
+    movzx eax, byte [rax]
+    mov ecx, ebx
+    and ecx, 7
+    shr eax, cl
+    and eax, 1
+    xor eax, 1                          ; invert: clear bit (free) -> eax=1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_bitmap_set_bit: ECX = cluster number, EDX = desired bit value (0/1).
+; Updates the cached bitmap cluster and writes it back to disk immediately.
+; Returns EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_bitmap_set_bit:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r9
+
+    mov r9d, edx                        ; save desired bit value
+    sub ecx, 2
+    mov ebx, ecx                        ; ebx = bit index
+    mov eax, [rel exfat_sectors_per_cluster]
+    imul eax, [rel exfat_bytes_per_sector]
+    mov esi, eax                        ; esi = bitmap-file cluster size, bytes
+
+    mov eax, ebx
+    shr eax, 3
+    xor edx, edx
+    div esi                             ; eax = chain idx, edx = offset in cluster
+    push rdx
+
+    mov ecx, eax
+    call exfat_bitmap_ensure_loaded
+    pop rdx
+    test eax, eax
+    jz .fail
+
+    lea rsi, [rel exfat_bitmap_buf]
+    add rsi, rdx                        ; rsi -> target byte
+    mov ecx, ebx
+    and ecx, 7                          ; bit position
+    mov eax, 1
+    shl eax, cl                         ; eax = bit mask
+
+    test r9d, r9d
+    jz .clear_bit
+    or byte [rsi], al
+    jmp .write_back
+.clear_bit:
+    not eax
+    and byte [rsi], al
+.write_back:
+    mov ecx, [rel exfat_bitmap_cache_cluster]
+    call exfat_cluster_to_lba
+    mov rcx, rax
+    mov edx, [rel exfat_sectors_per_cluster]
+    lea r8, [rel exfat_bitmap_buf]
+    call storage_write_sectors
+    test eax, eax
+    jz .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r9
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_alloc_cluster: scans the allocation bitmap for the first free
+; cluster in the heap, marks it allocated, and returns it. Requires
+; exfat_bitmap_mount to have succeeded first. Returns EAX = cluster number
+; (>=2), or 0 if the volume is full or on error.
+; -------------------------------------------------------------------------
+exfat_alloc_cluster:
+    push rbx
+    push rcx
+    push rdx
+
+    mov ebx, 2                          ; ebx = candidate cluster
+.scan:
+    mov eax, [rel exfat_cluster_count]
+    add eax, 2
+    cmp ebx, eax
+    jge .full
+
+    mov ecx, ebx
+    call exfat_bitmap_test_free
+    test eax, eax
+    jnz .found
+    inc ebx
+    jmp .scan
+
+.found:
+    mov ecx, ebx
+    mov edx, 1
+    call exfat_bitmap_set_bit
+    test eax, eax
+    jz .full                            ; write failed -- treat as no allocation
+    mov eax, ebx
+    jmp .out
+.full:
+    xor eax, eax
+.out:
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_free_cluster: ECX = cluster number. Clears its bitmap bit. Returns
+; EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_free_cluster:
+    push rdx
+    xor edx, edx
+    call exfat_bitmap_set_bit
+    pop rdx
     ret
 
 ; -------------------------------------------------------------------------
@@ -549,6 +861,12 @@ exfat_bytes_per_sector:    dd 0
 exfat_sectors_per_cluster: dd 0
 exfat_gpt_entry_size:      dd 0
 
+exfat_bitmap_cluster:         dd 0
+exfat_bitmap_length:          dq 0
+exfat_bitmap_cache_valid:     dd 0
+exfat_bitmap_cache_chain_idx: dd 0
+exfat_bitmap_cache_cluster:   dd 0
+
 align 512
 exfat_vbr_buf:        times 512 db 0
 exfat_fat_sector_buf: times 512 db 0
@@ -558,4 +876,5 @@ exfat_gpt_buf:        times 512 db 0
 ; use larger clusters (up to 32MB per spec); once the heap allocator
 ; exists this should become a dynamically-sized, allocated buffer instead.
 align 4096
-exfat_dir_buf: times 4096 db 0
+exfat_dir_buf:    times 4096 db 0
+exfat_bitmap_buf: times 4096 db 0
