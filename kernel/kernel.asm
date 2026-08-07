@@ -257,6 +257,37 @@ entry:
     cmp rax, r12
     jne .kheap_bad                      ; freed block should be reused
 
+    ; Coalescing: two freshly carved, address-adjacent blocks, freed in
+    ; order (so the second free() finds the first, already-free one as
+    ; its predecessor and merges into it), must reassemble into one block
+    ; big enough for a request neither alone could satisfy -- and the
+    ; result must start exactly where the first block did, proving a
+    ; genuine merge rather than two blocks that just happen to both be
+    ; free.
+    mov ecx, 96
+    call kmalloc
+    test rax, rax
+    jz .kheap_bad
+    mov r12, rax                        ; r12 = block C
+
+    mov ecx, 96
+    call kmalloc
+    test rax, rax
+    jz .kheap_bad
+    mov r13, rax                        ; r13 = block D (immediately after C)
+
+    mov rcx, r12
+    call kfree                          ; free C first
+    mov rcx, r13
+    call kfree                          ; then D -- should coalesce into C's block
+
+    mov ecx, 150                        ; bigger than either C or D alone
+    call kmalloc
+    test rax, rax
+    jz .kheap_bad
+    cmp rax, r12
+    jne .kheap_bad                      ; must be the coalesced C+D block
+
     ; Multi-page allocation: 10000 bytes spans 3 pages. Write recognizable
     ; bytes at the start, at each page boundary, and near the end, proving
     ; the VMM really stitched (possibly non-contiguous) physical pages
