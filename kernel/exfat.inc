@@ -649,6 +649,290 @@ exfat_free_cluster:
     ret
 
 ; -------------------------------------------------------------------------
+; exfat_name_hash: RCX = ptr to a NUL-terminated ASCII name. Returns EAX =
+; the 16-bit NameHash per the exFAT spec, computed over the up-cased
+; UTF-16LE encoding (ASCII-only up-casing, matching exfat_name_matches's
+; folding -- full Unicode up-case table is future work).
+; -------------------------------------------------------------------------
+exfat_name_hash:
+    push rcx
+    push rdx
+
+    xor edx, edx                        ; dx = running hash accumulator
+.loop:
+    movzx eax, byte [rcx]
+    test al, al
+    jz .done
+    cmp al, 'a'
+    jb .no_lower
+    cmp al, 'z'
+    ja .no_lower
+    sub al, 0x20
+.no_lower:
+    ror dx, 1
+    add dx, ax                          ; low byte of the UTF-16LE char
+    ror dx, 1                           ; high byte is always 0 for ASCII
+    inc rcx
+    jmp .loop
+.done:
+    movzx eax, dx
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_checksum_entries: RCX = ptr to the first (primary) directory entry
+; of a set, EDX = number of 32-byte entries in the set. Returns EAX = the
+; 16-bit SetChecksum value (bytes 2-3 of the primary entry -- the checksum
+; field itself -- are excluded from the sum, per spec).
+; -------------------------------------------------------------------------
+exfat_checksum_entries:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+
+    mov rsi, rcx                        ; rsi = pointer, indexed by rcx below
+    mov eax, edx
+    shl eax, 5
+    mov ebx, eax                        ; ebx = total byte length
+    xor edx, edx                        ; dx = running checksum
+    xor ecx, ecx                        ; ecx = byte index
+.loop:
+    cmp ecx, ebx
+    jge .done
+    cmp ecx, 2
+    je .next
+    cmp ecx, 3
+    je .next
+    movzx eax, byte [rsi+rcx]
+    ror dx, 1
+    add dx, ax
+.next:
+    inc ecx
+    jmp .loop
+.done:
+    movzx eax, dx
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_dir_find_slot: ECX = number of consecutive 32-byte directory
+; entries needed. Finds (or makes, by extending the root directory's
+; cluster chain) a run of that many free entries. Returns EAX=1/0; on
+; success EBX = the cluster containing the run, EDX = byte offset of the
+; run's start within exfat_dir_buf (which is left holding that cluster's
+; current on-disk content, ready for the caller to patch in place and
+; write back).
+; -------------------------------------------------------------------------
+exfat_dir_find_slot:
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    mov r9d, ecx                        ; r9d = entries needed
+
+    mov ecx, [rel exfat_root_dir_cluster]
+.cluster_loop:
+    mov r10d, ecx                       ; r10d = current cluster
+    lea r8, [rel exfat_dir_buf]
+    call exfat_read_cluster
+    test eax, eax
+    jz .fail
+
+    mov eax, [rel exfat_sectors_per_cluster]
+    imul eax, [rel exfat_bytes_per_sector]
+    mov edi, eax                        ; edi = cluster size, bytes
+
+    lea rsi, [rel exfat_dir_buf]
+    xor edx, edx                        ; edx = offset within cluster
+.entry_scan:
+    cmp edx, edi
+    jge .this_cluster_full
+    movzx eax, byte [rsi+rdx]
+    test al, al
+    jnz .not_free
+    mov eax, r9d
+    shl eax, 5
+    mov ecx, edx
+    add ecx, eax
+    cmp ecx, edi
+    jg .this_cluster_full               ; free run starts here but won't fit
+    mov ebx, r10d                       ; ebx = cluster containing the run
+    jmp .found
+.not_free:
+    add edx, 32
+    jmp .entry_scan
+
+.this_cluster_full:
+    mov ecx, r10d
+    call exfat_fat_next_cluster
+    test eax, eax
+    jz .extend
+    cmp eax, 0xFFFFFFF8
+    jae .extend
+    mov ecx, eax
+    jmp .cluster_loop
+
+.extend:
+    call exfat_alloc_cluster
+    test eax, eax
+    jz .fail
+    mov ebx, eax                        ; ebx = newly allocated cluster
+    mov ecx, r10d
+    mov edx, ebx
+    call exfat_fat_set_entry            ; link old last cluster -> new one
+    test eax, eax
+    jz .fail
+    mov ecx, ebx
+    mov edx, 0xFFFFFFFF
+    call exfat_fat_set_entry            ; terminate the new cluster
+    test eax, eax
+    jz .fail
+
+    lea rdi, [rel exfat_dir_buf]
+    mov eax, [rel exfat_sectors_per_cluster]
+    imul eax, [rel exfat_bytes_per_sector]
+    mov ecx, eax
+    xor eax, eax
+    cld
+    rep stosb
+
+    mov ecx, ebx
+    call exfat_cluster_to_lba
+    mov rcx, rax
+    mov edx, [rel exfat_sectors_per_cluster]
+    lea r8, [rel exfat_dir_buf]
+    call storage_write_sectors
+    test eax, eax
+    jz .fail
+
+    xor edx, edx                        ; the run starts at offset 0
+    jmp .found
+
+.found:
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_create_file: RCX = ptr to a NUL-terminated ASCII filename, <=15
+; characters (one FileName entry's worth -- longer names are future work,
+; as is anything beyond ASCII). Creates an empty (FirstCluster=0,
+; DataLength=0) File/StreamExtension/FileName entry set in the root
+; directory; timestamps are left zeroed (also future work). Returns
+; EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_create_file:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    mov r10, rcx                        ; r10 = name ptr
+
+    xor r9d, r9d
+.namelen:
+    cmp byte [r10+r9], 0
+    je .namelen_done
+    inc r9d
+    cmp r9d, 15
+    ja .fail
+    jmp .namelen
+.namelen_done:
+    test r9d, r9d
+    jz .fail
+
+    mov ecx, 3                          ; File + StreamExt + 1 FileName entry
+    call exfat_dir_find_slot
+    test eax, eax
+    jz .fail
+    ; ebx = directory cluster, edx = byte offset within exfat_dir_buf
+
+    lea rsi, [rel exfat_dir_buf]
+    add rsi, rdx                        ; rsi -> primary (File) entry
+
+    push rsi
+    mov rdi, rsi
+    xor eax, eax
+    mov ecx, 96
+    cld
+    rep stosb
+    pop rsi
+
+    mov byte [rsi+0], 0x85              ; EntryType: File
+    mov byte [rsi+1], 2                 ; SecondaryCount: StreamExt + 1 FileName
+    mov word [rsi+4], 0x0020            ; FileAttributes: ARCHIVE
+
+    mov byte [rsi+32], 0xC0             ; Stream Extension EntryType
+    mov byte [rsi+33], 0x01             ; GeneralSecondaryFlags: AllocationPossible
+    mov byte [rsi+35], r9b              ; NameLength
+
+    mov rcx, r10
+    call exfat_name_hash
+    mov [rsi+36], ax                    ; NameHash
+
+    mov byte [rsi+64], 0xC1             ; FileName EntryType
+
+    xor ecx, ecx
+.copy_name:
+    cmp ecx, r9d
+    jge .name_copied
+    movzx eax, byte [r10+rcx]
+    mov [rsi+66+rcx*2], ax
+    inc ecx
+    jmp .copy_name
+.name_copied:
+
+    mov rcx, rsi
+    mov edx, 3
+    call exfat_checksum_entries
+    mov [rsi+2], ax                     ; SetChecksum
+
+    mov ecx, ebx
+    call exfat_cluster_to_lba
+    mov rcx, rax
+    mov edx, [rel exfat_sectors_per_cluster]
+    lea r8, [rel exfat_dir_buf]
+    call storage_write_sectors
+    test eax, eax
+    jz .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
 ; exfat_name_matches: compares a directory FileName-entry run against an
 ; ASCII target name, case-insensitively (ASCII a-z/A-Z folding only --
 ; full Unicode case folding via the volume's up-case table is future work).

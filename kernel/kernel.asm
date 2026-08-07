@@ -439,6 +439,38 @@ entry:
     call serial_puts
 .ctest_done:
 
+    ; Verify directory entry construction: create an empty test file in
+    ; the root directory. Idempotent across reboots of the same VHD -- if
+    ; a prior boot already created it, this just confirms it's still
+    ; found rather than creating a duplicate entry.
+    lea rcx, [rel exfat_crtest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .crtest_exists
+
+    lea rcx, [rel exfat_crtest_name]
+    call exfat_create_file
+    test eax, eax
+    jz .crtest_bad
+
+    lea rcx, [rel exfat_crtest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .crtest_bad
+.crtest_exists:
+    cmp qword [rel exfat_find_result+8], 0   ; DataLength must be 0 (empty)
+    jne .crtest_bad
+
+    lea rcx, [rel msg_crtest_ok]
+    call serial_puts
+    jmp .crtest_done
+.crtest_bad:
+    lea rcx, [rel msg_crtest_bad]
+    call serial_puts
+.crtest_done:
+
     ; Bring up the scheduler: the current flow becomes the "main" task
     ; (its TCB.rsp gets filled in on its own first save -- it doesn't need
     ; a hand-built frame like task_create produces, since it's already
@@ -1049,6 +1081,9 @@ msg_btest_ok:         db 'exFAT: allocation bitmap alloc/free round-trip OK', 13
 msg_btest_bad:        db 'exFAT: allocation bitmap alloc/free round-trip FAILED', 13, 10, 0
 msg_ctest_ok:         db 'exFAT: FAT chain link/follow/free round-trip OK', 13, 10, 0
 msg_ctest_bad:        db 'exFAT: FAT chain link/follow/free round-trip FAILED', 13, 10, 0
+msg_crtest_ok:        db 'exFAT: directory entry creation OK', 13, 10, 0
+msg_crtest_bad:       db 'exFAT: directory entry creation FAILED', 13, 10, 0
+exfat_crtest_name:    db 'CRTEST.TXT', 0
 msg_sched_ok:         db 'Scheduler: armed (main + 2 test tasks)', 13, 10, 0
 msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
 msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0
