@@ -1,0 +1,2 @@
+select vdisk file="F:\Src\aros-x64\testdata\exfat_test.vhd"
+attach vdisk

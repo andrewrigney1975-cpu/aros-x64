@@ -336,6 +336,130 @@ exfat_fat_set_entry:
     ret
 
 ; -------------------------------------------------------------------------
+; exfat_dir_list_start: resets the root-directory iterator used by
+; exfat_dir_list_next.
+; -------------------------------------------------------------------------
+exfat_dir_list_start:
+    push rax
+    mov eax, [rel exfat_root_dir_cluster]
+    mov [rel exfat_list_cluster], eax
+    mov dword [rel exfat_list_offset], 0
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_dir_list_next: iterates the root directory, one File entry at a
+; time (skipping non-File entries such as the Allocation Bitmap/Up-case
+; Table/Volume Label). RCX = output buffer for the ASCII name (caller-
+; sized, NUL-terminated -- names can be up to 255 chars per spec, so a
+; 256-byte buffer is recommended), RDX = output pointer for a qword
+; DataLength. Call exfat_dir_list_start first. Returns EAX=1 with the
+; outputs filled in, or EAX=0 once the directory is exhausted (safe to
+; call again afterward -- keeps returning 0 without re-reading).
+; -------------------------------------------------------------------------
+exfat_dir_list_next:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    mov r10, rcx                        ; r10 = output name buffer
+    mov r11, rdx                        ; r11 = output DataLength ptr
+
+    cmp dword [rel exfat_list_cluster], 0xFFFFFFFF
+    je .done
+
+.cluster_loop:
+    mov ecx, [rel exfat_list_cluster]
+    lea r8, [rel exfat_dir_buf]
+    call exfat_read_cluster
+    test eax, eax
+    jz .exhausted
+
+    mov eax, [rel exfat_sectors_per_cluster]
+    imul eax, [rel exfat_bytes_per_sector]
+    mov ebx, eax                        ; ebx = cluster size, bytes
+
+    lea rsi, [rel exfat_dir_buf]
+    mov edx, [rel exfat_list_offset]
+.entry_scan:
+    cmp edx, ebx
+    jge .next_cluster
+    movzx eax, byte [rsi+rdx]
+    test al, al
+    jz .exhausted                       ; end marker
+    cmp al, 0x85
+    jne .skip_entry
+
+    movzx r9d, byte [rsi+rdx+32+3]      ; NameLength (Stream Ext, offset+3)
+    mov rax, [rsi+rdx+32+24]            ; DataLength (Stream Ext, offset+24)
+    mov [r11], rax
+
+    lea rdi, [rsi+rdx+64]               ; first FileName entry
+    xor ecx, ecx                        ; chars copied so far
+    xor r8d, r8d                        ; offset within current entry's 15 chars
+.copy_loop:
+    cmp ecx, r9d
+    jge .copy_done
+    cmp r8d, 15
+    jl .copy_have_entry
+    add rdi, 32                         ; next FileName entry
+    xor r8d, r8d
+.copy_have_entry:
+    movzx eax, word [rdi+2+r8*2]
+    mov [r10+rcx], al
+    inc ecx
+    inc r8d
+    jmp .copy_loop
+.copy_done:
+    mov byte [r10+rcx], 0               ; NUL-terminate
+
+    movzx eax, byte [rsi+rdx+1]         ; SecondaryCount
+    inc eax
+    shl eax, 5                          ; entries * 32 bytes
+    add edx, eax
+    mov [rel exfat_list_offset], edx
+
+    mov eax, 1
+    jmp .out
+
+.skip_entry:
+    add edx, 32
+    jmp .entry_scan
+
+.next_cluster:
+    mov ecx, [rel exfat_list_cluster]
+    call exfat_fat_next_cluster
+    test eax, eax
+    jz .exhausted
+    cmp eax, 0xFFFFFFF8
+    jae .exhausted
+    mov [rel exfat_list_cluster], eax
+    mov dword [rel exfat_list_offset], 0
+    jmp .cluster_loop
+
+.exhausted:
+    mov dword [rel exfat_list_cluster], 0xFFFFFFFF
+.done:
+    xor eax, eax
+.out:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
 ; exfat_bitmap_mount: locates the volume's Allocation Bitmap directory
 ; entry (EntryType 0x81) in the root directory and records its first
 ; cluster + length. Must be called after a successful exfat_mount.
@@ -1381,6 +1505,9 @@ exfat_root_dir_cluster:    dd 0
 exfat_bytes_per_sector:    dd 0
 exfat_sectors_per_cluster: dd 0
 exfat_gpt_entry_size:      dd 0
+
+exfat_list_cluster:           dd 0
+exfat_list_offset:            dd 0
 
 exfat_bitmap_cluster:         dd 0
 exfat_bitmap_length:          dq 0
