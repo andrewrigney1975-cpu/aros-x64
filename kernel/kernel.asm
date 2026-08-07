@@ -626,6 +626,290 @@ entry:
     call serial_puts
 .lntest_done:
 
+    ; Verify exfat_delete_file: create a temp file, confirm it exists,
+    ; delete it, confirm it's gone. Naturally idempotent across reboots
+    ; -- the file never survives a successful run, so "create" always
+    ; starts fresh next time.
+    lea rcx, [rel exfat_deltest_name]
+    call exfat_create_file
+    test eax, eax
+    jz .deltest_bad
+
+    lea rcx, [rel exfat_deltest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .deltest_bad
+
+    lea rcx, [rel exfat_deltest_name]
+    call exfat_delete_file
+    test eax, eax
+    jz .deltest_bad
+
+    lea rcx, [rel exfat_deltest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .deltest_bad             ; must be gone now
+
+    lea rcx, [rel msg_deltest_ok]
+    call serial_puts
+    jmp .deltest_done
+.deltest_bad:
+    lea rcx, [rel msg_deltest_bad]
+    call serial_puts
+.deltest_done:
+
+    ; Verify exfat_rename_file: write a file under one name, rename it,
+    ; confirm the new name has the same content and the old name is
+    ; gone. Idempotent: if the destination already exists (a prior boot
+    ; already renamed it), skip straight to verification.
+    lea rcx, [rel exfat_rentest_dst]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .rentest_verify
+
+    lea rcx, [rel exfat_rentest_src]
+    lea r8, [rel exfat_rentest_content]
+    mov r9, exfat_rentest_content_len
+    call exfat_write_file
+    test eax, eax
+    jz .rentest_bad
+
+    lea rcx, [rel exfat_rentest_src]
+    lea rdx, [rel exfat_rentest_dst]
+    call exfat_rename_file
+    test eax, eax
+    jz .rentest_bad
+
+.rentest_verify:
+    lea rcx, [rel exfat_rentest_src]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .rentest_bad             ; old name must be gone
+
+    lea rcx, [rel exfat_rentest_dst]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .rentest_bad
+    cmp qword [rel exfat_find_result+8], exfat_rentest_content_len
+    jne .rentest_bad
+
+    mov ecx, [rel exfat_find_result+0]
+    mov rdx, [rel exfat_find_result+8]
+    lea r8, [rel exfat_rentest_read]
+    mov r9d, [rel exfat_find_result+16]
+    call exfat_read_file
+    test eax, eax
+    jz .rentest_bad
+
+    lea rsi, [rel exfat_rentest_read]
+    lea rdi, [rel exfat_rentest_content]
+    xor ecx, ecx
+.rentest_cmp:
+    cmp ecx, exfat_rentest_content_len
+    jge .rentest_ok
+    mov al, [rsi+rcx]
+    cmp al, [rdi+rcx]
+    jne .rentest_bad
+    inc ecx
+    jmp .rentest_cmp
+.rentest_ok:
+    lea rcx, [rel msg_rentest_ok]
+    call serial_puts
+    jmp .rentest_done
+.rentest_bad:
+    lea rcx, [rel msg_rentest_bad]
+    call serial_puts
+.rentest_done:
+
+    ; Verify exfat_truncate_file: write a multi-cluster file, truncate
+    ; it down to a short prefix, confirm the length and content match.
+    ; Idempotent, and tolerant of a prior run that got interrupted
+    ; between creating the file and truncating it (e.g. a build that
+    ; failed mid-development): the file already having the truncated
+    ; (short) length skips straight to verification, and the file
+    ; existing at some OTHER length just means "still needs truncating"
+    ; rather than "something is wrong" -- only a genuinely fresh name
+    ; needs the initial full-size write.
+    lea rcx, [rel exfat_trunctest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .trunctest_create
+    cmp qword [rel exfat_find_result+8], EXFAT_TRUNCTEST_SHORT_LEN
+    je .trunctest_verify
+    jmp .trunctest_do_truncate
+.trunctest_create:
+    lea rdi, [rel exfat_trunctest_src]
+    xor ecx, ecx
+.trunctest_fill:
+    cmp ecx, 5000
+    jge .trunctest_fill_done
+    mov eax, ecx
+    and eax, 0xFF
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .trunctest_fill
+.trunctest_fill_done:
+
+    lea rcx, [rel exfat_trunctest_name]
+    lea r8, [rel exfat_trunctest_src]
+    mov r9, 5000
+    call exfat_write_file
+    test eax, eax
+    jz .trunctest_bad
+
+.trunctest_do_truncate:
+    lea rcx, [rel exfat_trunctest_name]
+    mov rdx, EXFAT_TRUNCTEST_SHORT_LEN
+    call exfat_truncate_file
+    test eax, eax
+    jz .trunctest_bad
+
+.trunctest_verify:
+    lea rcx, [rel exfat_trunctest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .trunctest_bad
+    cmp qword [rel exfat_find_result+8], EXFAT_TRUNCTEST_SHORT_LEN
+    jne .trunctest_bad
+
+    mov ecx, [rel exfat_find_result+0]
+    mov rdx, [rel exfat_find_result+8]
+    lea r8, [rel exfat_trunctest_read]
+    mov r9d, [rel exfat_find_result+16]
+    call exfat_read_file
+    test eax, eax
+    jz .trunctest_bad
+
+    lea rsi, [rel exfat_trunctest_read]
+    xor ecx, ecx
+.trunctest_cmp:
+    cmp ecx, EXFAT_TRUNCTEST_SHORT_LEN
+    jge .trunctest_ok
+    mov al, [rsi+rcx]
+    mov ah, cl
+    cmp al, ah
+    jne .trunctest_bad
+    inc ecx
+    jmp .trunctest_cmp
+.trunctest_ok:
+    lea rcx, [rel msg_trunctest_ok]
+    call serial_puts
+    jmp .trunctest_done
+.trunctest_bad:
+    lea rcx, [rel msg_trunctest_bad]
+    call serial_puts
+.trunctest_done:
+
+    ; Verify exfat_append_file: write a file, append more data spanning
+    ; new clusters, confirm the combined content round-trips. Idempotent,
+    ; and tolerant of a prior run that got interrupted between the
+    ; initial write and the append (a name that exists but isn't yet at
+    ; the full post-append length just means "still needs appending to",
+    ; not "something is wrong").
+    lea rcx, [rel exfat_apptest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .apptest_create
+    cmp qword [rel exfat_find_result+8], EXFAT_APPTEST_TOTAL_LEN
+    je .apptest_verify
+    jmp .apptest_fill2
+.apptest_create:
+    lea rdi, [rel exfat_apptest_part1]
+    xor ecx, ecx
+.apptest_fill1:
+    cmp ecx, EXFAT_APPTEST_PART1_LEN
+    jge .apptest_fill1_done
+    mov eax, ecx
+    and eax, 0xFF
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .apptest_fill1
+.apptest_fill1_done:
+
+    lea rcx, [rel exfat_apptest_name]
+    lea r8, [rel exfat_apptest_part1]
+    mov r9, EXFAT_APPTEST_PART1_LEN
+    call exfat_write_file
+    test eax, eax
+    jz .apptest_bad
+
+.apptest_fill2:
+    lea rdi, [rel exfat_apptest_part2]
+    xor ecx, ecx
+.apptest_fill2_loop:
+    cmp ecx, EXFAT_APPTEST_PART2_LEN
+    jge .apptest_fill2_done
+    mov eax, ecx
+    add eax, 77
+    and eax, 0xFF
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .apptest_fill2_loop
+.apptest_fill2_done:
+
+    lea rcx, [rel exfat_apptest_name]
+    lea r8, [rel exfat_apptest_part2]
+    mov r9, EXFAT_APPTEST_PART2_LEN
+    call exfat_append_file
+    test eax, eax
+    jz .apptest_bad
+
+.apptest_verify:
+    lea rcx, [rel exfat_apptest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .apptest_bad
+    cmp qword [rel exfat_find_result+8], EXFAT_APPTEST_TOTAL_LEN
+    jne .apptest_bad
+
+    mov ecx, [rel exfat_find_result+0]
+    mov rdx, [rel exfat_find_result+8]
+    lea r8, [rel exfat_apptest_read]
+    mov r9d, [rel exfat_find_result+16]
+    call exfat_read_file
+    test eax, eax
+    jz .apptest_bad
+
+    lea rsi, [rel exfat_apptest_read]
+    xor ecx, ecx
+.apptest_cmp:
+    cmp ecx, EXFAT_APPTEST_TOTAL_LEN
+    jge .apptest_ok
+    cmp ecx, EXFAT_APPTEST_PART1_LEN
+    jl .apptest_cmp_part1
+    mov eax, ecx
+    sub eax, EXFAT_APPTEST_PART1_LEN
+    add eax, 77
+    and eax, 0xFF
+    jmp .apptest_cmp_have_expected
+.apptest_cmp_part1:
+    mov eax, ecx
+    and eax, 0xFF
+.apptest_cmp_have_expected:
+    mov ah, al
+    mov al, [rsi+rcx]
+    cmp al, ah
+    jne .apptest_bad
+    inc ecx
+    jmp .apptest_cmp
+.apptest_ok:
+    lea rcx, [rel msg_apptest_ok]
+    call serial_puts
+    jmp .apptest_done
+.apptest_bad:
+    lea rcx, [rel msg_apptest_bad]
+    call serial_puts
+.apptest_done:
+
     ; Bring up the scheduler: the current flow becomes the "main" task
     ; (its TCB.rsp gets filled in on its own first save -- it doesn't need
     ; a hand-built frame like task_create produces, since it's already
@@ -2092,6 +2376,30 @@ shell_dispatch:
     test eax, eax
     jnz .do_run
 
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_del]
+    call shell_streq
+    test eax, eax
+    jnz .do_del
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_rename]
+    call shell_streq
+    test eax, eax
+    jnz .do_rename
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_append]
+    call shell_streq
+    test eax, eax
+    jnz .do_append
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_truncate]
+    call shell_streq
+    test eax, eax
+    jnz .do_truncate
+
     lea rcx, [rel msg_shell_unknown]
     call console_puts
     jmp .out
@@ -2306,6 +2614,222 @@ shell_dispatch:
     call console_puts
     jmp .out
 
+.do_del:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.del_copy:
+    mov al, [rsi]
+    test al, al
+    jz .del_arg_done
+    cmp al, ' '
+    je .del_arg_done
+    cmp ecx, 63
+    jge .del_arg_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .del_copy
+.del_arg_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .del_usage
+
+    lea rcx, [rel shell_arg_buf]
+    call exfat_delete_file
+    test eax, eax
+    jz .del_fail
+
+    lea rcx, [rel msg_shell_del_ok]
+    call console_puts
+    jmp .out
+.del_usage:
+    lea rcx, [rel msg_shell_del_usage]
+    call console_puts
+    jmp .out
+.del_fail:
+    lea rcx, [rel msg_shell_del_fail]
+    call console_puts
+    jmp .out
+
+.do_rename:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.rename_copy1:
+    mov al, [rsi]
+    test al, al
+    jz .rename_arg1_done
+    cmp al, ' '
+    je .rename_arg1_done
+    cmp ecx, 63
+    jge .rename_arg1_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .rename_copy1
+.rename_arg1_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .rename_usage
+
+.rename_skip_sp:
+    cmp byte [rsi], ' '
+    jne .rename_copy2_start
+    inc rsi
+    jmp .rename_skip_sp
+.rename_copy2_start:
+    lea rdi, [rel shell_arg_buf2]
+    xor ecx, ecx
+.rename_copy2:
+    mov al, [rsi]
+    test al, al
+    jz .rename_arg2_done
+    cmp al, ' '
+    je .rename_arg2_done
+    cmp ecx, 63
+    jge .rename_arg2_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .rename_copy2
+.rename_arg2_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .rename_usage
+
+    lea rcx, [rel shell_arg_buf]
+    lea rdx, [rel shell_arg_buf2]
+    call exfat_rename_file
+    test eax, eax
+    jz .rename_fail
+
+    lea rcx, [rel msg_shell_rename_ok]
+    call console_puts
+    jmp .out
+.rename_usage:
+    lea rcx, [rel msg_shell_rename_usage]
+    call console_puts
+    jmp .out
+.rename_fail:
+    lea rcx, [rel msg_shell_rename_fail]
+    call console_puts
+    jmp .out
+
+.do_append:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.append_name_copy:
+    mov al, [rsi]
+    test al, al
+    jz .append_name_done
+    cmp al, ' '
+    je .append_name_done
+    cmp ecx, 63
+    jge .append_name_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .append_name_copy
+.append_name_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .append_usage
+
+.append_skip_sp:
+    cmp byte [rsi], ' '
+    jne .append_have_content
+    inc rsi
+    jmp .append_skip_sp
+.append_have_content:
+    mov r10, rsi                        ; r10 = content ptr
+    xor r11d, r11d                      ; r11d = content length
+.append_len:
+    cmp byte [r10+r11], 0
+    je .append_len_done
+    inc r11d
+    jmp .append_len
+.append_len_done:
+
+    lea rcx, [rel shell_arg_buf]
+    mov r8, r10
+    mov r9, r11
+    call exfat_append_file
+    test eax, eax
+    jz .append_fail
+
+    lea rcx, [rel msg_shell_append_ok]
+    call console_puts
+    jmp .out
+.append_usage:
+    lea rcx, [rel msg_shell_append_usage]
+    call console_puts
+    jmp .out
+.append_fail:
+    lea rcx, [rel msg_shell_append_fail]
+    call console_puts
+    jmp .out
+
+.do_truncate:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.truncate_name_copy:
+    mov al, [rsi]
+    test al, al
+    jz .truncate_name_done
+    cmp al, ' '
+    je .truncate_name_done
+    cmp ecx, 63
+    jge .truncate_name_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .truncate_name_copy
+.truncate_name_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .truncate_usage
+
+.truncate_skip_sp:
+    cmp byte [rsi], ' '
+    jne .truncate_parse_num
+    inc rsi
+    jmp .truncate_skip_sp
+.truncate_parse_num:
+    cmp byte [rsi], 0
+    je .truncate_usage
+    xor rdx, rdx                        ; rdx = parsed size
+.truncate_num_loop:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .truncate_num_done
+    cmp al, '0'
+    jb .truncate_usage
+    cmp al, '9'
+    ja .truncate_usage
+    sub al, '0'
+    movzx eax, al
+    imul rdx, rdx, 10
+    add rdx, rax
+    inc rsi
+    jmp .truncate_num_loop
+.truncate_num_done:
+
+    lea rcx, [rel shell_arg_buf]
+    call exfat_truncate_file
+    test eax, eax
+    jz .truncate_fail
+
+    lea rcx, [rel msg_shell_truncate_ok]
+    call console_puts
+    jmp .out
+.truncate_usage:
+    lea rcx, [rel msg_shell_truncate_usage]
+    call console_puts
+    jmp .out
+.truncate_fail:
+    lea rcx, [rel msg_shell_truncate_fail]
+    call console_puts
+    jmp .out
+
 .out:
     pop r11
     pop r10
@@ -2472,6 +2996,30 @@ msg_lntest_bad:       db 'exFAT: long filename (multi-FileName-entry) round-trip
 exfat_lntest_name:    db 'THIS_IS_A_LONG_FILENAME_OVER_15_CHARS.TXT', 0
 exfat_lntest_content: db 'long filename round-trip test payload'
 exfat_lntest_content_len equ $ - exfat_lntest_content
+
+msg_deltest_ok:       db 'exFAT: exfat_delete_file round-trip OK', 13, 10, 0
+msg_deltest_bad:      db 'exFAT: exfat_delete_file round-trip FAILED', 13, 10, 0
+exfat_deltest_name:   db 'DELTEST.TXT', 0
+
+msg_rentest_ok:       db 'exFAT: exfat_rename_file round-trip OK', 13, 10, 0
+msg_rentest_bad:      db 'exFAT: exfat_rename_file round-trip FAILED', 13, 10, 0
+exfat_rentest_src:    db 'RENSRC.TXT', 0
+exfat_rentest_dst:    db 'RENDST.TXT', 0
+exfat_rentest_content: db 'rename round-trip test payload'
+exfat_rentest_content_len equ $ - exfat_rentest_content
+
+msg_trunctest_ok:     db 'exFAT: exfat_truncate_file round-trip OK', 13, 10, 0
+msg_trunctest_bad:    db 'exFAT: exfat_truncate_file round-trip FAILED', 13, 10, 0
+exfat_trunctest_name: db 'TRUNCTS2.TXT', 0
+EXFAT_TRUNCTEST_SHORT_LEN equ 137
+
+msg_apptest_ok:       db 'exFAT: exfat_append_file round-trip OK', 13, 10, 0
+msg_apptest_bad:      db 'exFAT: exfat_append_file round-trip FAILED', 13, 10, 0
+exfat_apptest_name:   db 'APPTEST2.TXT', 0
+EXFAT_APPTEST_PART1_LEN equ 3000
+EXFAT_APPTEST_PART2_LEN equ 5000
+EXFAT_APPTEST_TOTAL_LEN equ EXFAT_APPTEST_PART1_LEN + EXFAT_APPTEST_PART2_LEN
+
 msg_sched_ok:         db 'Scheduler: armed (main + 5 test tasks)', 13, 10, 0
 msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
 msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0
@@ -2490,13 +3038,19 @@ exfat_test_name:      db 'TEST.TXT', 0
 exfat_marker:         db 'END-OF-FILE-MARKER'
 
 align 8
-exfat_find_result: times 24 db 0
+exfat_find_result: times 32 db 0
 
 align 4096
 exfat_test_buf: times 8192 db 0
 exfat_wtest_src:  times 6000 db 0
 exfat_wtest_read: times 6000 db 0
 exfat_lntest_read: times 64 db 0
+exfat_rentest_read: times 64 db 0
+exfat_trunctest_src:  times 5000 db 0
+exfat_trunctest_read: times EXFAT_TRUNCTEST_SHORT_LEN db 0
+exfat_apptest_part1: times EXFAT_APPTEST_PART1_LEN db 0
+exfat_apptest_part2: times EXFAT_APPTEST_PART2_LEN db 0
+exfat_apptest_read:  times EXFAT_APPTEST_TOTAL_LEN db 0
 
 console_col:  dd 0
 console_row:  dd 0
@@ -2509,10 +3063,15 @@ shell_str_clear: db 'clear', 0
 shell_str_type:  db 'type', 0
 shell_str_write: db 'write', 0
 shell_str_run:   db 'run', 0
+shell_str_del:      db 'del', 0
+shell_str_rename:   db 'rename', 0
+shell_str_append:   db 'append', 0
+shell_str_truncate: db 'truncate', 0
 
 msg_shell_banner:      db 'arOS-X64 shell. Type HELP for commands.', 13, 10, 0
 msg_shell_prompt:      db '] ', 0
-msg_shell_help:        db 'Commands: HELP  DIR  TYPE <file>  WRITE <file> <text>  RUN <file.bas>  CLEAR', 13, 10, 0
+msg_shell_help:        db 'Commands: HELP  DIR  TYPE <file>  WRITE <file> <text>  APPEND <file> <text>', 13, 10
+                       db '  DEL <file>  RENAME <old> <new>  TRUNCATE <file> <size>  RUN <file.bas>  CLEAR', 13, 10, 0
 msg_shell_unknown:     db 'Unknown command. Type HELP for a list.', 13, 10, 0
 msg_shell_nl:          db 13, 10, 0
 msg_shell_type_usage:  db 'Usage: TYPE <filename>', 13, 10, 0
@@ -2524,6 +3083,18 @@ msg_shell_write_ok:    db 'File written.', 13, 10, 0
 msg_shell_write_fail:  db 'Write failed (name may already exist).', 13, 10, 0
 msg_shell_run_usage:       db 'Usage: RUN <filename.bas>', 13, 10, 0
 msg_shell_run_compilefail: db 'BASIX64 compile error.', 13, 10, 0
+msg_shell_del_usage:  db 'Usage: DEL <filename>', 13, 10, 0
+msg_shell_del_ok:     db 'File deleted.', 13, 10, 0
+msg_shell_del_fail:   db 'Delete failed (file may not exist).', 13, 10, 0
+msg_shell_rename_usage: db 'Usage: RENAME <oldname> <newname>', 13, 10, 0
+msg_shell_rename_ok:    db 'File renamed.', 13, 10, 0
+msg_shell_rename_fail:  db 'Rename failed (old name missing or new name already exists).', 13, 10, 0
+msg_shell_append_usage: db 'Usage: APPEND <filename> <text>', 13, 10, 0
+msg_shell_append_ok:    db 'Appended.', 13, 10, 0
+msg_shell_append_fail:  db 'Append failed (file may not exist).', 13, 10, 0
+msg_shell_truncate_usage: db 'Usage: TRUNCATE <filename> <newsize>', 13, 10, 0
+msg_shell_truncate_ok:    db 'File truncated.', 13, 10, 0
+msg_shell_truncate_fail:  db 'Truncate failed (file may not exist, or newsize > current size).', 13, 10, 0
 
 shell_line_buf:     times SHELL_LINE_MAX db 0
 shell_history:      times (SHELL_HISTORY_MAX * SHELL_LINE_MAX) db 0
@@ -2531,6 +3102,7 @@ shell_history_count: dd 0
 shell_history_write: dd 0
 shell_cmd_buf:      times 16 db 0
 shell_arg_buf:       times 64 db 0
+shell_arg_buf2:      times 64 db 0
 shell_dir_name_buf: times 256 db 0
 shell_dir_datalen:  dq 0
 
