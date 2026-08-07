@@ -3,19 +3,33 @@
 ; UEFI memory map the bootloader captured before ExitBootServices (passed
 ; through boot_info at +32/+40/+48; see boot/bootloader.asm).
 ;
-; Scope: tracks only the first 4GB of physical memory (1M frames, 128KB
-; bitmap) -- a documented limit for this phase, not a design ceiling;
-; extending it just means a bigger (or dynamically sized) bitmap once that
-; matters. EfiBootServicesCode/Data and EfiConventionalMemory regions
-; become free; everything else (including our own EfiLoaderCode/Data
-; image, ACPI/MMIO/reserved regions) stays marked reserved.
+; Tracks the first 128GB of physical memory (32M frames, 4MB bitmap) -- a
+; documented limit, not a design ceiling; the identity map in paging.inc
+; covers the same range for the same reason. EfiBootServicesCode/Data and
+; EfiConventionalMemory regions become free; everything else (including
+; our own EfiLoaderCode/Data image, ACPI/MMIO/reserved regions) stays
+; marked reserved.
+;
+; The bitmap itself is NOT stored as file-backed static data (a 4MB
+; `times db 0` array would bloat KERNEL.BIN by 4MB for no reason) -- it
+; lives at a fixed physical address instead (PMM_BITMAP_ADDR) and
+; pmm_init writes it directly via the identity map, then explicitly
+; re-reserves that range so the allocator can never hand its own bitmap
+; out. That address must clear BOTH the kernel's own load address
+; (0x200000) and the bootloader's PE ImageBase (0x400000, still alive and
+; holding boot_info/the memory map at the time pmm_init runs) -- an
+; earlier 0x300000 choice quietly overlapped the bootloader's image and
+; corrupted boot_info out from under the kernel while pmm_init's first
+; rep stosd was still running.
 ;
 ; Internal calling convention for this file only: plain registers as
 ; documented per routine, not the MS x64 ABI.
 ; =============================================================================
 
-PMM_MAX_FRAMES      equ 1048576                   ; 4GB / 4KB
-PMM_BITMAP_BYTES    equ PMM_MAX_FRAMES / 8         ; 128KB
+PMM_MAX_FRAMES      equ 33554432                  ; 128GB / 4KB
+PMM_BITMAP_BYTES    equ PMM_MAX_FRAMES / 8         ; 4MB
+PMM_BITMAP_ADDR     equ 0x800000                   ; clear of kernel (0x200000)
+                                                     ; and bootloader (0x400000)
 
 ; boot_info field offsets for the memory map (see boot_info in bootloader.asm)
 BI_MMAP_BASE  equ 32
@@ -43,7 +57,7 @@ pmm_init:
 
     mov r10, rcx                        ; r10 = boot_info
 
-    lea rdi, [rel pmm_bitmap]
+    mov rdi, PMM_BITMAP_ADDR
     mov eax, 0xFFFFFFFF
     mov ecx, PMM_BITMAP_BYTES / 4
     cld
@@ -77,7 +91,13 @@ pmm_init:
     ; Frame 0 (physical address 0) is deliberately kept reserved even if
     ; the memory map says it's free: pmm_alloc_page returns 0 to signal
     ; "out of memory", so 0 must never also be a real, valid allocation.
-    or byte [rel pmm_bitmap], 1
+    or byte [abs PMM_BITMAP_ADDR], 1
+
+    ; The bitmap's own backing memory must never be handed out, even
+    ; though it likely sits inside a region the memory map calls free.
+    mov rbx, PMM_BITMAP_ADDR
+    mov rcx, (PMM_BITMAP_BYTES + 4095) / 4096
+    call pmm_reserve_range
 
     pop r10
     pop r9
@@ -114,7 +134,7 @@ pmm_free_range:
     mov rdx, PMM_MAX_FRAMES
 .no_clip:
 
-    lea rdi, [rel pmm_bitmap]
+    mov rdi, PMM_BITMAP_ADDR
 .loop:
     cmp rsi, rdx
     jae .out
@@ -139,6 +159,55 @@ pmm_free_range:
     ret
 
 ; -------------------------------------------------------------------------
+; pmm_reserve_range: RBX = physical start address, RCX = page count. Sets
+; the corresponding bitmap bits (clipped to PMM_MAX_FRAMES) -- the mirror
+; image of pmm_free_range, used to protect memory the map calls free but
+; that's actually already spoken for (e.g. the bitmap's own storage).
+; -------------------------------------------------------------------------
+pmm_reserve_range:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+
+    mov rsi, rbx
+    shr rsi, 12
+    cmp rsi, PMM_MAX_FRAMES
+    jae .out
+
+    mov rdx, rsi
+    add rdx, rcx
+    cmp rdx, PMM_MAX_FRAMES
+    jbe .no_clip
+    mov rdx, PMM_MAX_FRAMES
+.no_clip:
+
+    mov rdi, PMM_BITMAP_ADDR
+.loop:
+    cmp rsi, rdx
+    jae .out
+    mov r8, rsi
+    shr r8, 3
+    mov rcx, rsi
+    and cl, 7
+    mov al, 1
+    shl al, cl
+    or [rdi+r8], al
+    inc rsi
+    jmp .loop
+
+.out:
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
 ; pmm_alloc_page: returns RAX = physical address of a freshly-reserved 4KB
 ; frame, or 0 if none are free. Linear first-fit scan.
 ; -------------------------------------------------------------------------
@@ -148,7 +217,7 @@ pmm_alloc_page:
     push rdx
     push rdi
 
-    lea rdi, [rel pmm_bitmap]
+    mov rdi, PMM_BITMAP_ADDR
     xor rbx, rbx                        ; rbx = byte index
 .byte_loop:
     cmp rbx, PMM_BITMAP_BYTES
@@ -208,7 +277,7 @@ pmm_free_page:
     mov al, 1
     shl al, cl
     not al
-    lea rdi, [rel pmm_bitmap]
+    mov rdi, PMM_BITMAP_ADDR
     and [rdi+rbx], al
 .out:
     pop rdi
@@ -216,9 +285,3 @@ pmm_free_page:
     pop rbx
     pop rax
     ret
-
-; =========================================================================
-; Data
-; =========================================================================
-align 4096
-pmm_bitmap: times PMM_BITMAP_BYTES db 0

@@ -173,6 +173,57 @@ entry:
     call fb_draw_string
 .pmm_done:
 
+    ; Exercise the VMM: map two physical frames into adjacent pages of a
+    ; virtual arena that is NOT part of the identity map (VMM_VIRT_BASE,
+    ; 1TB), write through the virtual addresses, and confirm the data
+    ; really landed at the underlying physical addresses -- proving this
+    ; is genuine translation, not coincidental identity mapping.
+    call pmm_alloc_page
+    test rax, rax
+    jz .vmm_bad
+    mov r12, rax                        ; r12 = physical frame A
+    call pmm_alloc_page
+    test rax, rax
+    jz .vmm_bad
+    mov r13, rax                        ; r13 = physical frame B
+
+    mov rcx, VMM_VIRT_BASE
+    mov rdx, r12
+    call vmm_map_page
+    test eax, eax
+    jz .vmm_bad
+    mov rcx, VMM_VIRT_BASE + 4096
+    mov rdx, r13
+    call vmm_map_page
+    test eax, eax
+    jz .vmm_bad
+
+    mov rax, VMM_VIRT_BASE
+    mov byte [rax], 0xCC
+    mov rax, VMM_VIRT_BASE + 4096
+    mov byte [rax], 0xDD
+
+    cmp byte [r12], 0xCC                ; landed at the real physical frame?
+    jne .vmm_bad
+    cmp byte [r13], 0xDD
+    jne .vmm_bad
+
+    lea rcx, [rel msg_vmm_ok]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 16
+    lea r8, [rel msg_vmm_ok]
+    call fb_draw_string
+    jmp .vmm_done
+.vmm_bad:
+    lea rcx, [rel msg_vmm_bad]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 16
+    lea r8, [rel msg_vmm_bad]
+    call fb_draw_string
+.vmm_done:
+
     ; Exercise the heap: two live blocks with different content (proving
     ; no overlap), free one, and confirm the freed block gets reused.
     mov ecx, 64
@@ -202,6 +253,36 @@ entry:
     jz .kheap_bad
     cmp rax, r12
     jne .kheap_bad                      ; freed block should be reused
+
+    ; Multi-page allocation: 10000 bytes spans 3 pages. Write recognizable
+    ; bytes at the start, at each page boundary, and near the end, proving
+    ; the VMM really stitched (possibly non-contiguous) physical pages
+    ; into one contiguous virtual range rather than just getting lucky.
+    mov ecx, 10000
+    call kmalloc
+    test rax, rax
+    jz .kheap_bad
+    mov r14, rax                        ; r14 = large block
+    mov byte [rax+0], 0x11
+    mov byte [rax+4096], 0x22
+    mov byte [rax+8192], 0x33
+    mov byte [rax+9999], 0x44
+
+    cmp byte [r14+0], 0x11
+    jne .kheap_bad
+    cmp byte [r14+4096], 0x22
+    jne .kheap_bad
+    cmp byte [r14+8192], 0x33
+    jne .kheap_bad
+    cmp byte [r14+9999], 0x44
+    jne .kheap_bad
+
+    mov rcx, r14
+    call kfree
+    mov ecx, 20000                      ; a second, larger multi-page alloc
+    call kmalloc
+    test rax, rax
+    jz .kheap_bad
 
     lea rcx, [rel msg_kheap_ok]
     call serial_puts
@@ -371,6 +452,10 @@ nvme_init_and_test:
     call nvme_init
     test eax, eax
     jz .init_failed
+
+    call nvme_identify_namespace ; discover the real block size; a
+                                  ; failure here just leaves the 512-byte
+                                  ; default, not fatal to init
 
     call nvme_create_io_queues
     test eax, eax
@@ -669,6 +754,8 @@ msg_timer_ok:         db 'Timer: IRQ0 firing, ticks=', 0
 msg_timer_bad:        db 'Timer: no ticks observed', 13, 10, 0
 msg_pmm_ok:           db 'PMM: alloc/free/reuse OK', 13, 10, 0
 msg_pmm_bad:          db 'PMM: alloc/free/reuse FAILED', 13, 10, 0
+msg_vmm_ok:           db 'VMM: virtual->physical mapping OK', 13, 10, 0
+msg_vmm_bad:          db 'VMM: virtual->physical mapping FAILED', 13, 10, 0
 msg_kheap_ok:         db 'kmalloc/kfree: alloc/content/reuse OK', 13, 10, 0
 msg_kheap_bad:        db 'kmalloc/kfree: FAILED', 13, 10, 0
 exfat_test_name:      db 'TEST.TXT', 0
@@ -724,6 +811,7 @@ gdt_descriptor:
 %include "pic.inc"
 %include "paging.inc"
 %include "pmm.inc"
+%include "vmm.inc"
 %include "kheap.inc"
 %include "pci.inc"
 %include "ahci.inc"

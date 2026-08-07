@@ -284,6 +284,66 @@ nvme_create_io_queues:
     ret
 
 ; -------------------------------------------------------------------------
+; nvme_identify_namespace: sends an Identify Namespace admin command for
+; NSID=1 and parses the real logical block size out of it (FLBAS selects
+; an entry in the LBAF array; that entry's LBADS field is log2 of the
+; block size). Unlike AHCI's PRDT, NVMe's PRP + NLB (block count, not byte
+; count) mechanism means the controller already knows the block size from
+; its own namespace format -- this doesn't change how nvme_read_sectors
+; issues a transfer, only what nvme_sector_size reports to callers sizing
+; buffers. Leaves the 512-byte default in place on any failure or
+; implausible (zero) LBADS. Returns EAX=1/0.
+; -------------------------------------------------------------------------
+nvme_identify_namespace:
+    push rcx
+    push rdx
+    push rdi
+
+    lea rdi, [rel nvme_sqe_scratch]
+    push rdi
+    xor eax, eax
+    mov ecx, 8
+    cld
+    rep stosq
+    pop rdi
+
+    mov dword [rdi+0], 0x00000006       ; CDW0: opcode = Identify
+    mov dword [rdi+4], 1                ; NSID = 1
+    lea rax, [rel nvme_identbuf]
+    mov [rdi+24], rax                   ; PRP1
+    mov dword [rdi+40], 0               ; CDW10: CNS = 0 (Identify Namespace)
+
+    lea rcx, [rel nvme_sqe_scratch]
+    lea rdx, [rel nvme_admin_qpair]
+    call nvme_do_cmd
+    test eax, eax
+    jz .fail
+
+    movzx eax, byte [rel nvme_identbuf + 26]   ; FLBAS
+    and eax, 0x0F                                ; format index
+    mov ecx, eax
+    shl ecx, 2                                     ; * 4 bytes per LBAF entry
+    lea rdx, [rel nvme_identbuf + 128]
+    add rdx, rcx                                    ; rdx = &LBAF[index]
+    movzx eax, byte [rdx+2]                           ; LBADS (log2 block size)
+    test eax, eax
+    jz .use_default
+    mov ecx, eax
+    mov eax, 1
+    shl eax, cl
+    mov [rel nvme_sector_size], eax
+.use_default:
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop rdi
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
 ; nvme_read_sectors: RCX = LBA (64-bit), RDX = sector count (1-65536),
 ; R8 = destination buffer (contiguous, >= count*512 bytes, page-aligned
 ; recommended so a single PRP1 covers it without needing PRP2/a PRP list).
@@ -333,8 +393,12 @@ nvme_read_sectors:
 ; =========================================================================
 ; Data
 ; =========================================================================
-nvme_base:      dq 0
-nvme_dbstride:  dd 0
+nvme_base:        dq 0
+nvme_dbstride:    dd 0
+nvme_sector_size: dd 512
+
+align 4096
+nvme_identbuf: times 4096 db 0
 
 align 4096
 nvme_asq: times (NVME_ADMIN_QSIZE*64) db 0

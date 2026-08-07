@@ -102,6 +102,9 @@ ahci_init:
     mov [rbx+rsi+0x18], eax
 
     mov [rel ahci_port], r8d
+    call ahci_identify           ; discover the real logical sector size;
+                                  ; a failure here just leaves the 512-byte
+                                  ; default in place, not fatal to init
     mov eax, 1
     jmp .done
 
@@ -122,10 +125,86 @@ ahci_init:
     ret
 
 ; -------------------------------------------------------------------------
+; ahci_identify: sends ATA IDENTIFY DEVICE to the port ahci_init selected
+; and parses the real logical sector size out of it (word 106 bit 12: 1
+; means "see words 117-118 for the real size in words"; otherwise the
+; classic 512-byte default applies). ahci_sector_size is left at its
+; 512-byte default if this fails or the device doesn't report one --
+; not fatal to ahci_init. Returns EAX=1/0.
+; -------------------------------------------------------------------------
+ahci_identify:
+    push rbx
+    push rcx
+    push rsi
+    push r9
+
+    mov rbx, [rel ahci_abar]
+    mov eax, [rel ahci_port]
+    mov esi, eax
+    shl esi, 7
+    add esi, 0x100
+
+    lea rax, [rel ahci_cmdtable]
+    lea rcx, [rel ahci_cmdlist]
+    mov dword [rcx+0x00], (1 << 16) | 5 ; PRDTL=1, CFL=5, Write=0
+    mov dword [rcx+0x04], 0
+    mov [rcx+0x08], eax
+    mov dword [rcx+0x0C], 0
+
+    lea rcx, [rel ahci_cmdtable]
+    mov dword [rcx+0x00], 0
+    mov dword [rcx+0x04], 0
+    mov dword [rcx+0x08], 0
+    mov dword [rcx+0x0C], 0
+    mov dword [rcx+0x10], 0
+    mov byte  [rcx+0x00], 0x27          ; FIS type = H2D register
+    mov byte  [rcx+0x01], 0x80          ; C=1
+    mov byte  [rcx+0x02], 0xEC          ; command = IDENTIFY DEVICE
+    mov byte  [rcx+0x07], 0x40
+
+    lea rax, [rel ahci_identbuf]
+    mov [rcx+0x80], eax                 ; DBA
+    mov dword [rcx+0x84], 0
+    mov dword [rcx+0x88], 0
+    mov dword [rcx+0x8C], 511           ; 512 bytes
+
+    mov dword [rbx+rsi+0x38], 1
+    mov r9d, 20000000
+.wait_cmd:
+    mov eax, [rbx+rsi+0x38]
+    test eax, 1
+    jz .cmd_done
+    dec r9d
+    jnz .wait_cmd
+    xor eax, eax
+    jmp .out
+.cmd_done:
+    mov eax, [rbx+rsi+0x20]
+    test al, 0x01
+    jnz .fail
+
+    movzx eax, word [rel ahci_identbuf + 212]   ; word 106
+    test ax, 0x1000                              ; bit12
+    jz .use_default
+    mov eax, [rel ahci_identbuf + 234]            ; words 117-118 (in words)
+    shl eax, 1                                     ; -> bytes
+    mov [rel ahci_sector_size], eax
+.use_default:
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r9
+    pop rsi
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
 ; ahci_read_sectors: RCX = LBA (48-bit), RDX = sector count (1-65535),
-; R8 = destination buffer (contiguous, >= count*512 bytes). Single PRDT
-; entry, so count is capped by what one entry can address (up to 8192
-; sectors/4MB) -- plenty for boot-time exFAT metadata/file reads.
+; R8 = destination buffer (contiguous, >= count*ahci_sector_size bytes).
+; Single PRDT entry, so count is capped by what one entry can address.
 ; Returns EAX=1 on success, EAX=0 on timeout/error.
 ; -------------------------------------------------------------------------
 ahci_read_sectors:
@@ -184,7 +263,7 @@ ahci_read_sectors:
     mov dword [rcx+0x84], 0             ; DBAU
     mov dword [rcx+0x88], 0             ; reserved
     movzx eax, dx
-    shl eax, 9                          ; * 512 bytes/sector
+    imul eax, [rel ahci_sector_size]
     dec eax                             ; byte count - 1
     mov [rcx+0x8C], eax
 
@@ -220,8 +299,12 @@ ahci_read_sectors:
 ; =========================================================================
 ; Data (statically reserved, physically addressed via the identity map)
 ; =========================================================================
-ahci_abar:  dq 0
-ahci_port:  dd 0
+ahci_abar:        dq 0
+ahci_port:        dd 0
+ahci_sector_size: dd 512
+
+align 512
+ahci_identbuf: times 512 db 0
 
 align 1024
 ahci_cmdlist: times 1024 db 0
