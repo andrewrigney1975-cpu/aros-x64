@@ -302,8 +302,122 @@ entry:
     call fb_draw_string
 .kheap_done:
 
+    ; Bring up the scheduler: the current flow becomes the "main" task
+    ; (its TCB.rsp gets filled in on its own first save -- it doesn't need
+    ; a hand-built frame like task_create produces, since it's already
+    ; running), plus two test tasks that loop forever printing a tag and
+    ; incrementing a counter. Both counters advancing, and their serial
+    ; output interleaving, is the proof the timer really is preempting
+    ; and round-robining between them -- not just running one to
+    ; completion before the other starts.
+    mov rcx, TCB_SIZE
+    call kmalloc
+    test rax, rax
+    jz .sched_bad
+    mov r15, rax                        ; r15 = main task's TCB
+    mov qword [r15+TCB_RSP], 0
+    mov qword [r15+TCB_STACK], 0
+
+    mov rcx, test_task_a
+    xor edx, edx
+    mov r8, 16384
+    call task_create
+    test rax, rax
+    jz .sched_bad
+    mov r13, rax                        ; r13 = task A's TCB
+
+    mov rcx, test_task_b
+    xor edx, edx
+    mov r8, 16384
+    call task_create
+    test rax, rax
+    jz .sched_bad
+    mov r14, rax                        ; r14 = task B's TCB
+
+    mov [r15+TCB_NEXT], r13             ; ring: main -> A -> B -> main
+    mov [r13+TCB_NEXT], r14
+    mov [r14+TCB_NEXT], r15
+
+    mov [rel current_task], r15         ; arms the scheduler (irq0_stub
+                                         ; starts switching on the next tick)
+
+    lea rcx, [rel msg_sched_ok]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 46
+    lea r8, [rel msg_sched_ok]
+    call fb_draw_string
+    jmp .sched_done
+.sched_bad:
+    lea rcx, [rel msg_sched_bad]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 46
+    lea r8, [rel msg_sched_bad]
+    call fb_draw_string
+.sched_done:
+
+    ; Let the round-robin run for a while (the main task keeps its slice
+    ; too, so this delay itself gets preempted many times), then check
+    ; both test tasks actually made progress.
+    mov rcx, 300000000
+.sched_wait:
+    dec rcx
+    jnz .sched_wait
+
+    mov rax, [rel test_task_a_counter]
+    test rax, rax
+    jz .sched_verify_bad
+    mov rax, [rel test_task_b_counter]
+    test rax, rax
+    jz .sched_verify_bad
+    lea rcx, [rel msg_sched_verify_ok]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 47
+    lea r8, [rel msg_sched_verify_ok]
+    call fb_draw_string
+    jmp .sched_verify_done
+.sched_verify_bad:
+    lea rcx, [rel msg_sched_verify_bad]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 47
+    lea r8, [rel msg_sched_verify_bad]
+    call fb_draw_string
+.sched_verify_done:
+
 .hang:
+    hlt
     jmp .hang
+
+; -------------------------------------------------------------------------
+; test_task_a / test_task_b: preemptive-scheduling demo tasks. Each loops
+; forever: bump its own counter, print a tag, spin for a bit. Neither
+; ever yields voluntarily -- proving preemption, not cooperation, is what
+; interleaves them.
+; -------------------------------------------------------------------------
+test_task_a:
+.loop:
+    inc qword [rel test_task_a_counter]
+    lea rcx, [rel msg_task_a]
+    call serial_puts
+    mov rcx, 5000000
+.delay:
+    dec rcx
+    jnz .delay
+    jmp .loop
+
+test_task_b:
+.loop:
+    inc qword [rel test_task_b_counter]
+    lea rcx, [rel msg_task_b]
+    call serial_puts
+    mov rcx, 5000000
+.delay:
+    dec rcx
+    jnz .delay
+    jmp .loop
 
 ; -------------------------------------------------------------------------
 ; storage_init_and_test: locate an AHCI controller over PCI, bring up its
@@ -792,6 +906,15 @@ msg_vmm_ok:           db 'VMM: virtual->physical mapping OK', 13, 10, 0
 msg_vmm_bad:          db 'VMM: virtual->physical mapping FAILED', 13, 10, 0
 msg_kheap_ok:         db 'kmalloc/kfree: alloc/content/reuse OK', 13, 10, 0
 msg_kheap_bad:        db 'kmalloc/kfree: FAILED', 13, 10, 0
+msg_sched_ok:         db 'Scheduler: armed (main + 2 test tasks)', 13, 10, 0
+msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
+msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0
+msg_sched_verify_bad: db 'Scheduler: a test task made no progress (preemption FAILED)', 13, 10, 0
+msg_task_a:           db '[taskA]', 13, 10, 0
+msg_task_b:           db '[taskB]', 13, 10, 0
+
+test_task_a_counter: dq 0
+test_task_b_counter: dq 0
 exfat_test_name:      db 'TEST.TXT', 0
 exfat_marker:         db 'END-OF-FILE-MARKER'
 
@@ -843,6 +966,7 @@ gdt_descriptor:
 %include "font8x16.inc"
 %include "logo.inc"
 %include "idt.inc"
+%include "sched.inc"
 %include "pic.inc"
 %include "paging.inc"
 %include "pmm.inc"

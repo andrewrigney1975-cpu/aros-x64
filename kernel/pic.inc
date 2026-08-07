@@ -66,13 +66,67 @@ pit_init:
     ret
 
 ; -------------------------------------------------------------------------
-; irq0_stub: timer ISR. Increments a tick counter and acknowledges the PIC.
+; irq0_stub: timer ISR. Ticks the counter, then -- once the scheduler has
+; been armed (current_task != NULL, see sched.inc) -- performs a full
+; context switch every SCHED_QUANTUM ticks: save the interrupted task's
+; RSP (which by now points at a complete GPR+interrupt frame on its own
+; stack, built either by this same prologue or by task_create), advance
+; to the next task in the ready ring, load its RSP, and let the shared
+; pop+iretq tail resume it. Interrupts stay off for the whole handler
+; (interrupt-gate entry clears IF automatically), so no nested timer tick
+; can land mid-switch.
 ; -------------------------------------------------------------------------
 irq0_stub:
     push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
     inc qword [rel timer_ticks]
+
     mov al, 0x20                        ; EOI
     out 0x20, al
+
+    mov rax, [rel current_task]
+    test rax, rax
+    jz .no_switch                       ; scheduler not armed yet
+
+    inc dword [rel sched_quantum_counter]
+    cmp dword [rel sched_quantum_counter], SCHED_QUANTUM
+    jl .no_switch
+    mov dword [rel sched_quantum_counter], 0
+
+    mov [rax+TCB_RSP], rsp              ; save the outgoing task's context
+    mov rcx, [rax+TCB_NEXT]
+    mov [rel current_task], rcx
+    mov rsp, [rcx+TCB_RSP]              ; switch to the incoming task's stack
+
+.no_switch:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
     pop rax
     iretq
 
