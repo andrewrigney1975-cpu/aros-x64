@@ -1136,6 +1136,10 @@ fb_clear:
 ; -------------------------------------------------------------------------
 ; fb_draw_char: draw one glyph from font8x16. ECX=column, EDX=row (in 8x16
 ; character cells), R8B=ASCII code. Characters outside 32..126 render blank.
+; Paints both the glyph's set pixels (white) AND its clear ones (black),
+; not just the set ones -- this is what makes it safe to redraw a cell
+; that previously held a *different*, wider/taller-stroked character (the
+; shell's line editor depends on this for backspace/delete/insert redraws).
 ; -------------------------------------------------------------------------
 fb_draw_char:
     push rax
@@ -1167,8 +1171,6 @@ fb_draw_char:
     movzx r12d, byte [rsi + r11]        ; scanline bits, bit7 = leftmost pixel
     mov ecx, 8
 .col_loop:
-    test r12d, 0x80
-    jz .skip_pixel
     mov eax, 8
     sub eax, ecx
     add eax, r9d                        ; eax = x
@@ -1179,8 +1181,13 @@ fb_draw_char:
     shl rdx, 2                          ; * 4 bytes/pixel
     mov rdi, [rbx+FB_BASE]
     add rdi, rdx
+    test r12d, 0x80
+    jz .clear_pixel
     mov dword [rdi], 0xFFFFFFFF         ; white; channel order doesn't matter
-.skip_pixel:
+    jmp .col_next
+.clear_pixel:
+    mov dword [rdi], 0                  ; black -- erases whatever was here before
+.col_next:
     shl r12d, 1
     dec ecx
     jnz .col_loop
@@ -1396,6 +1403,7 @@ console_puts:
 ; =============================================================================
 SHELL_LINE_MAX equ 120
 SHELL_TYPE_BUF_MAX equ 8191             ; exfat_test_buf is 8192 bytes; -1 for NUL
+SHELL_HISTORY_MAX equ 8                 ; recalled via Up/Down, see shell_history_recall
 
 ; -------------------------------------------------------------------------
 ; shell_streq: RCX/RDX = two NUL-terminated ASCII strings. Returns
@@ -1425,16 +1433,422 @@ shell_streq:
     ret
 
 ; -------------------------------------------------------------------------
+; shell_cursor_to: repositions the console's logical cursor (console_col/
+; console_row) to a given index within the line being edited, WITHOUT
+; drawing anything -- used after Left/Right/Home/End and after a redraw
+; already left the video cursor somewhere else. R8D=target index (0..line
+; length), R9D=the line's starting column, R10D=the line's starting row.
+; Does not account for the line wrapping past the bottom of the screen
+; and triggering a scroll mid-edit -- acceptable for SHELL_LINE_MAX (120)
+; against any reasonable console width/height, not a general terminal.
+; -------------------------------------------------------------------------
+shell_cursor_to:
+    push rax
+    push rcx
+    push rdx
+
+    mov eax, r9d
+    add eax, r8d                        ; eax = start_col + index
+    xor edx, edx
+    div dword [rel console_cols]        ; eax = row delta, edx = column
+    add eax, r10d
+    mov [rel console_row], eax
+    mov [rel console_col], edx
+
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_redraw_range: draws shell_line_buf[R8D..R9D-1] via console_putc
+; (so it naturally advances/wraps/scrolls like ordinary typing), then
+; R10D additional trailing spaces (to erase stale characters left behind
+; by a delete/backspace that shortened the line). Does not touch the
+; cursor position afterward -- the caller repositions via shell_cursor_to.
+; -------------------------------------------------------------------------
+shell_redraw_range:
+    push rax
+    push rcx
+    push rsi
+    push rdi
+
+    lea rdi, [rel shell_line_buf]
+    mov esi, r8d
+.chars:
+    cmp esi, r9d
+    jge .trailing
+    movzx eax, byte [rdi+rsi]
+    call console_putc
+    inc esi
+    jmp .chars
+.trailing:
+    mov ecx, r10d
+    test ecx, ecx
+    jz .done
+.spaces:
+    mov al, ' '
+    call console_putc
+    dec ecx
+    jnz .spaces
+.done:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_line_insert: inserts AL at cursor index R12D into shell_line_buf,
+; growing ECX (length) and R12D (cursor) by one, and redraws the (now
+; shifted) tail of the line. R13D/R14D = the line's starting column/row
+; (for repositioning the cursor afterward).
+; -------------------------------------------------------------------------
+shell_line_insert:
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    lea rdi, [rel shell_line_buf]
+    mov r9d, eax                        ; r9d = the character (AL survives calls below)
+    mov esi, ecx                        ; esi = old length, shifting down to r12d
+.shift:
+    cmp esi, r12d
+    je .place
+    dec esi
+    mov dl, [rdi+rsi]
+    mov [rdi+rsi+1], dl
+    jmp .shift
+.place:
+    mov [rdi+r12], r9b
+    inc ecx
+
+    mov r8d, r12d
+    mov r9d, ecx
+    xor r10d, r10d
+    call shell_redraw_range
+
+    inc r12d
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_line_delete_before: removes the character immediately before
+; cursor index R12D (backspace). Shrinks ECX/R12D and redraws the tail
+; plus one trailing space. No-op if R12D==0 (caller already checks, but
+; safe either way).
+; -------------------------------------------------------------------------
+shell_line_delete_before:
+    test r12d, r12d
+    jz .out
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    lea rdi, [rel shell_line_buf]
+    dec r12d
+    mov r9d, ecx
+    dec r9d                             ; r9d = old length - 1 (exclusive bound)
+    mov esi, r12d
+.shift:
+    cmp esi, r9d
+    jge .shifted
+    mov dl, [rdi+rsi+1]
+    mov [rdi+rsi], dl
+    inc esi
+    jmp .shift
+.shifted:
+    dec ecx
+
+    ; the video cursor is still wherever it was before this backspace (the
+    ; PRE-decrement position) -- reposition to the new cursor index first,
+    ; or the redraw below draws one column too far right instead of over
+    ; the character that needs erasing.
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+
+    mov r8d, r12d
+    mov r9d, ecx
+    mov r10d, 1
+    call shell_redraw_range
+
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
+.out:
+    ret
+
+; -------------------------------------------------------------------------
+; shell_line_delete_at: removes the character AT cursor index R12D
+; (forward delete / the Delete key). Shrinks ECX (cursor stays put) and
+; redraws the tail plus one trailing space. No-op if R12D>=ECX.
+; -------------------------------------------------------------------------
+shell_line_delete_at:
+    cmp r12d, ecx
+    jge .out
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    lea rdi, [rel shell_line_buf]
+    mov r9d, ecx
+    dec r9d                             ; r9d = old length - 1 (exclusive bound)
+    mov esi, r12d
+.shift:
+    cmp esi, r9d
+    jge .shifted
+    mov dl, [rdi+rsi+1]
+    mov [rdi+rsi], dl
+    inc esi
+    jmp .shift
+.shifted:
+    dec ecx
+
+    ; cursor index doesn't change for a forward delete, but reposition
+    ; the video cursor explicitly anyway rather than relying on it
+    ; already being in sync -- cheap, and matches delete_before's fix.
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+
+    mov r8d, r12d
+    mov r9d, ecx
+    mov r10d, 1
+    call shell_redraw_range
+
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
+.out:
+    ret
+
+; -------------------------------------------------------------------------
+; shell_history_push: RCX = pointer to a NUL-terminated line just entered.
+; Appends it to shell_history's ring buffer unless it's empty. Overwrites
+; the oldest entry once the ring is full.
+; -------------------------------------------------------------------------
+shell_history_push:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    cmp byte [rcx], 0
+    je .out                             ; don't clutter history with blank lines
+
+    mov eax, [rel shell_history_write]
+    mov edx, eax
+    imul edx, SHELL_LINE_MAX
+    lea rdi, [rel shell_history]
+    add rdi, rdx                        ; rdi = this slot
+    mov rsi, rcx
+.copy:
+    mov dl, [rsi]
+    mov [rdi], dl
+    test dl, dl
+    jz .copied
+    inc rsi
+    inc rdi
+    jmp .copy
+.copied:
+    inc eax
+    cmp eax, SHELL_HISTORY_MAX
+    jl .no_wrap
+    xor eax, eax
+.no_wrap:
+    mov [rel shell_history_write], eax
+
+    mov eax, [rel shell_history_count]
+    cmp eax, SHELL_HISTORY_MAX
+    jge .out
+    inc eax
+    mov [rel shell_history_count], eax
+.out:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_history_recall: R8D = +1 (Up: older) or -1 (Down: newer). Loads a
+; history entry into shell_line_buf, replacing the current in-progress
+; line, and redraws it. In/out via ECX (length), R12D (cursor), R15D
+; (browse depth: 0 = editing a fresh line, N>0 = showing the Nth-most-
+; recent history entry); R13D/R14D = the line's starting column/row.
+; -------------------------------------------------------------------------
+shell_history_recall:
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    push r9
+    push r10
+    push r11
+
+    mov r11d, [rel shell_history_count]
+    test r11d, r11d
+    jz .out                             ; no history at all -- nothing to do
+
+    cmp r8d, 0
+    jg .up
+    ; Down: browsing off the oldest edge just clears back to an empty line.
+    test r15d, r15d
+    jz .out                             ; not browsing -- nothing to come back to
+    dec r15d
+    jmp .load
+.up:
+    cmp r15d, r11d
+    jge .out                            ; already at the oldest entry
+    inc r15d
+
+.load:
+    ; blank out whatever's on screen for the current content first
+    mov eax, ecx
+    xor ecx, ecx
+    xor r12d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    push r8
+    mov r8d, 0
+    call shell_cursor_to
+    pop r8
+
+    test r15d, r15d
+    jnz .load_entry
+    ; back to an empty, fresh line
+    lea rdi, [rel shell_line_buf]
+    mov byte [rdi], 0
+    jmp .redraw
+
+.load_entry:
+    ; slot = (write_index - browse_depth + MAX) mod MAX, i.e. the r15d-th
+    ; most recently written entry
+    mov edx, [rel shell_history_write]
+    sub edx, r15d
+    add edx, SHELL_HISTORY_MAX
+    xor eax, eax
+.mod:
+    cmp edx, SHELL_HISTORY_MAX
+    jl .have_slot
+    sub edx, SHELL_HISTORY_MAX
+    jmp .mod
+.have_slot:
+    imul edx, SHELL_LINE_MAX
+    lea rsi, [rel shell_history]
+    add rsi, rdx
+    lea rdi, [rel shell_line_buf]
+.copy:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .redraw
+    inc rsi
+    inc rdi
+    jmp .copy
+
+.redraw:
+    lea rdi, [rel shell_line_buf]
+    xor esi, esi
+.len:
+    cmp byte [rdi+rsi], 0
+    je .have_len
+    inc esi
+    jmp .len
+.have_len:
+    mov ecx, esi                        ; ecx = new length
+    mov r12d, ecx                       ; cursor lands at end, like a real shell
+
+    mov r8d, 0
+    mov r9d, ecx
+    xor r10d, r10d
+    call shell_redraw_range
+
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+
+.out:
+    pop r11
+    pop r10
+    pop r9
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
 ; shell_read_line: reads keys into shell_line_buf (NUL-terminated, up to
-; SHELL_LINE_MAX-1 chars), echoing each to the console and honoring
-; backspace, until Enter.
+; SHELL_LINE_MAX-1 chars), echoing each to the console, until Enter.
+; Supports mid-line editing (Left/Right/Home/End/Delete/Backspace, with a
+; real insert-at-cursor rather than append-only) and command-history
+; recall (Up/Down) via shell_history.
 ; -------------------------------------------------------------------------
 shell_read_line:
     push rax
     push rcx
     push rdi
+    push r8
+    push r9
+    push r10
+    push r12
+    push r13
+    push r14
+    push r15
 
-    xor ecx, ecx
+    xor ecx, ecx                        ; ecx = line length
+    xor r12d, r12d                      ; r12d = cursor index
+    xor r15d, r15d                      ; r15d = history browse depth
+    mov r13d, [rel console_col]         ; r13d = this line's starting column
+    mov r14d, [rel console_row]         ; r14d = this line's starting row
     lea rdi, [rel shell_line_buf]
 .loop:
     call kbd_read_char
@@ -1442,22 +1856,91 @@ shell_read_line:
     je .enter
     cmp al, 8
     je .backspace
+    cmp al, KBD_KEY_DELETE
+    je .fwd_delete
+    cmp al, KBD_KEY_LEFT
+    je .move_left
+    cmp al, KBD_KEY_RIGHT
+    je .move_right
+    cmp al, KBD_KEY_HOME
+    je .move_home
+    cmp al, KBD_KEY_END
+    je .move_end
+    cmp al, KBD_KEY_UP
+    je .hist_up
+    cmp al, KBD_KEY_DOWN
+    je .hist_down
+    cmp al, ' '
+    jb .loop                            ; other control bytes: ignore
+    cmp al, 0x7E
+    ja .loop                            ; DEL (0x7F) and virtual key codes: ignore
     cmp ecx, SHELL_LINE_MAX-1
     jge .loop                           ; line full -- drop the character
-    mov [rdi+rcx], al
-    inc ecx
-    call console_putc
+    call shell_line_insert
     jmp .loop
 .backspace:
-    test ecx, ecx
+    call shell_line_delete_before
+    jmp .loop
+.fwd_delete:
+    call shell_line_delete_at
+    jmp .loop
+.move_left:
+    test r12d, r12d
     jz .loop
-    dec ecx
-    call console_putc
+    dec r12d
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+    jmp .loop
+.move_right:
+    cmp r12d, ecx
+    jge .loop
+    inc r12d
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+    jmp .loop
+.move_home:
+    xor r12d, r12d
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+    jmp .loop
+.move_end:
+    mov r12d, ecx
+    mov r8d, r12d
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
+    jmp .loop
+.hist_up:
+    mov r8d, 1
+    call shell_history_recall
+    jmp .loop
+.hist_down:
+    mov r8d, -1
+    call shell_history_recall
     jmp .loop
 .enter:
     mov byte [rdi+rcx], 0
+    mov r8d, ecx
+    mov r9d, r13d
+    mov r10d, r14d
+    call shell_cursor_to
     mov al, 13
     call console_putc
+    lea rcx, [rel shell_line_buf]
+    call shell_history_push
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop r8
     pop rdi
     pop rcx
     pop rax
@@ -1983,6 +2466,9 @@ msg_shell_run_usage:       db 'Usage: RUN <filename.bas>', 13, 10, 0
 msg_shell_run_compilefail: db 'BASIX64 compile error.', 13, 10, 0
 
 shell_line_buf:     times SHELL_LINE_MAX db 0
+shell_history:      times (SHELL_HISTORY_MAX * SHELL_LINE_MAX) db 0
+shell_history_count: dd 0
+shell_history_write: dd 0
 shell_cmd_buf:      times 16 db 0
 shell_arg_buf:       times 64 db 0
 shell_dir_name_buf: times 256 db 0

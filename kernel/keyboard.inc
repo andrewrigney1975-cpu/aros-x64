@@ -2,15 +2,28 @@
 ; PS/2 keyboard driver (IRQ1, scancode set 1, US QWERTY).
 ;
 ; Scope: make/break codes for the standard alphanumeric block, shift and
-; caps lock. The 0xE0 extended-key prefix (arrows, right-Ctrl/Alt, etc.)
-; is recognized and its following byte is swallowed so it can't be
-; misread as a base-set code, but extended keys themselves produce no
-; character yet -- future work. Decoded ASCII lands in a small circular
-; buffer that kbd_read_char blocks on (via HLT, so the CPU is genuinely
-; idle between keystrokes, not spinning).
+; caps lock, plus the 0xE0-prefixed extended set: arrow keys, Home/End/
+; Delete/Insert/PgUp/PgDn, and right-Ctrl/right-Alt (tracked as modifier
+; state for future use -- nothing consumes them yet). Since the buffer
+; kbd_read_char returns from is just a byte stream, arrows/Home/End/etc.
+; are encoded as values in the 0x80-0x8F range (KBD_KEY_* below) that
+; can never collide with a real decoded ASCII character (the printable
+; tables only ever produce 0x20-0x7E plus backspace/tab/enter). Decoded
+; bytes land in a small circular buffer that kbd_read_char blocks on (via
+; HLT, so the CPU is genuinely idle between keystrokes, not spinning).
 ; =============================================================================
 
 KBD_BUF_SIZE equ 256
+
+; Virtual key codes for keys with no ASCII representation, pushed into
+; the same byte stream as ordinary characters (see the header comment).
+KBD_KEY_LEFT  equ 0x81
+KBD_KEY_RIGHT equ 0x82
+KBD_KEY_UP    equ 0x83
+KBD_KEY_DOWN  equ 0x84
+KBD_KEY_HOME  equ 0x85
+KBD_KEY_END   equ 0x86
+KBD_KEY_DELETE equ 0x87
 
 ; -------------------------------------------------------------------------
 ; kbd_irq_stub: IRQ1 handler. Reads the scancode, updates shift/caps
@@ -23,7 +36,7 @@ kbd_irq_stub:
     push rdx
 
     cmp byte [rel kbd_pending_ext], 0
-    jne .swallow_ext_byte
+    jne .ext_byte
 
     in al, 0x60
     mov bl, al
@@ -94,9 +107,77 @@ kbd_irq_stub:
     xor byte [rel kbd_capslock_active], 1
     jmp .eoi
 
-.swallow_ext_byte:
-    in al, 0x60                         ; discard the byte following 0xE0
+.ext_byte:
+    in al, 0x60
+    mov bl, al
     mov byte [rel kbd_pending_ext], 0
+
+    test bl, 0x80
+    jnz .ext_release
+
+    cmp bl, 0x4B
+    je .ext_left
+    cmp bl, 0x4D
+    je .ext_right
+    cmp bl, 0x48
+    je .ext_up
+    cmp bl, 0x50
+    je .ext_down
+    cmp bl, 0x47
+    je .ext_home
+    cmp bl, 0x4F
+    je .ext_end
+    cmp bl, 0x53
+    je .ext_delete
+    cmp bl, 0x1D
+    je .ext_rctrl_down
+    cmp bl, 0x38
+    je .ext_ralt_down
+    jmp .eoi                            ; unhandled extended key: ignore
+
+.ext_left:
+    mov al, KBD_KEY_LEFT
+    jmp .ext_push
+.ext_right:
+    mov al, KBD_KEY_RIGHT
+    jmp .ext_push
+.ext_up:
+    mov al, KBD_KEY_UP
+    jmp .ext_push
+.ext_down:
+    mov al, KBD_KEY_DOWN
+    jmp .ext_push
+.ext_home:
+    mov al, KBD_KEY_HOME
+    jmp .ext_push
+.ext_end:
+    mov al, KBD_KEY_END
+    jmp .ext_push
+.ext_delete:
+    mov al, KBD_KEY_DELETE
+.ext_push:
+    call kbd_buf_push
+    jmp .eoi
+
+.ext_rctrl_down:
+    mov byte [rel kbd_rctrl_active], 1
+    jmp .eoi
+.ext_ralt_down:
+    mov byte [rel kbd_ralt_active], 1
+    jmp .eoi
+
+.ext_release:
+    and bl, 0x7F
+    cmp bl, 0x1D
+    je .ext_rctrl_up
+    cmp bl, 0x38
+    je .ext_ralt_up
+    jmp .eoi
+.ext_rctrl_up:
+    mov byte [rel kbd_rctrl_active], 0
+    jmp .eoi
+.ext_ralt_up:
+    mov byte [rel kbd_ralt_active], 0
 
 .eoi:
     mov al, 0x20
@@ -195,6 +276,8 @@ kbd_install:
 kbd_shift_active:    db 0
 kbd_capslock_active: db 0
 kbd_pending_ext:      db 0
+kbd_rctrl_active:     db 0
+kbd_ralt_active:      db 0
 
 kbd_buf_head: db 0
 kbd_buf_tail: db 0
