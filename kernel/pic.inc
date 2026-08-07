@@ -70,8 +70,9 @@ pit_init:
 ; been armed (current_task != NULL, see sched.inc) -- performs a full
 ; context switch every SCHED_QUANTUM ticks: save the interrupted task's
 ; RSP (which by now points at a complete GPR+interrupt frame on its own
-; stack, built either by this same prologue or by task_create), advance
-; to the next task in the ready ring, load its RSP, and let the shared
+; stack, built either by this same prologue or by task_create), ask
+; sched_pick_next for the next task to run (skipping/reaping any
+; terminated ones found along the way), load its RSP, and let the shared
 ; pop+iretq tail resume it. Interrupts stay off for the whole handler
 ; (interrupt-gate entry clears IF automatically), so no nested timer tick
 ; can land mid-switch.
@@ -108,7 +109,7 @@ irq0_stub:
     mov dword [rel sched_quantum_counter], 0
 
     mov [rax+TCB_RSP], rsp              ; save the outgoing task's context
-    mov rcx, [rax+TCB_NEXT]
+    call sched_pick_next                ; rax=outgoing (unchanged); rcx=next
     mov [rel current_task], rcx
     mov rsp, [rcx+TCB_RSP]              ; switch to the incoming task's stack
 

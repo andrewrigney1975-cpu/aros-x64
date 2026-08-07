@@ -257,6 +257,37 @@ entry:
     cmp rax, r12
     jne .kheap_bad                      ; freed block should be reused
 
+    ; Coalescing: two freshly carved, address-adjacent blocks, freed in
+    ; order (so the second free() finds the first, already-free one as
+    ; its predecessor and merges into it), must reassemble into one block
+    ; big enough for a request neither alone could satisfy -- and the
+    ; result must start exactly where the first block did, proving a
+    ; genuine merge rather than two blocks that just happen to both be
+    ; free.
+    mov ecx, 96
+    call kmalloc
+    test rax, rax
+    jz .kheap_bad
+    mov r12, rax                        ; r12 = block C
+
+    mov ecx, 96
+    call kmalloc
+    test rax, rax
+    jz .kheap_bad
+    mov r13, rax                        ; r13 = block D (immediately after C)
+
+    mov rcx, r12
+    call kfree                          ; free C first
+    mov rcx, r13
+    call kfree                          ; then D -- should coalesce into C's block
+
+    mov ecx, 150                        ; bigger than either C or D alone
+    call kmalloc
+    test rax, rax
+    jz .kheap_bad
+    cmp rax, r12
+    jne .kheap_bad                      ; must be the coalesced C+D block
+
     ; Multi-page allocation: 10000 bytes spans 3 pages. Write recognizable
     ; bytes at the start, at each page boundary, and near the end, proving
     ; the VMM really stitched (possibly non-contiguous) physical pages
@@ -556,6 +587,7 @@ entry:
     mov r15, rax                        ; r15 = main task's TCB
     mov qword [r15+TCB_RSP], 0
     mov qword [r15+TCB_STACK], 0
+    mov dword [r15+TCB_STATE], TCB_STATE_ALIVE
 
     mov rcx, test_task_a
     xor edx, edx
@@ -573,9 +605,36 @@ entry:
     jz .sched_bad
     mov r14, rax                        ; r14 = task B's TCB
 
-    mov [r15+TCB_NEXT], r13             ; ring: main -> A -> B -> main
+    mov rcx, test_task_exit
+    xor edx, edx
+    mov r8, 16384
+    call task_create
+    test rax, rax
+    jz .sched_bad
+    mov r10, rax                        ; r10 = exit-demo task's TCB
+
+    mov rcx, test_task_crash
+    xor edx, edx
+    mov r8, 16384
+    call task_create
+    test rax, rax
+    jz .sched_bad
+    mov r11, rax                        ; r11 = crash-demo task's TCB
+
+    mov rcx, test_task_overflow
+    xor edx, edx
+    mov r8, 16384
+    call task_create
+    test rax, rax
+    jz .sched_bad
+    mov r9, rax                         ; r9 = overflow-demo task's TCB
+
+    mov [r15+TCB_NEXT], r13             ; ring: main -> A -> B -> exit -> crash -> overflow -> main
     mov [r13+TCB_NEXT], r14
-    mov [r14+TCB_NEXT], r15
+    mov [r14+TCB_NEXT], r10
+    mov [r10+TCB_NEXT], r11
+    mov [r11+TCB_NEXT], r9
+    mov [r9+TCB_NEXT], r15
 
     mov [rel current_task], r15         ; arms the scheduler (irq0_stub
                                          ; starts switching on the next tick)
@@ -625,6 +684,71 @@ entry:
     lea r8, [rel msg_sched_verify_bad]
     call fb_draw_string
 .sched_verify_done:
+
+    ; Verify process termination: by now test_task_exit, test_task_crash,
+    ; and test_task_overflow should each have hit their counter bound (3)
+    ; and ended themselves -- voluntarily, via a deliberate #DE exception,
+    ; and via a deliberate stack overflow caught by the canary guard,
+    ; respectively. Capture their counters, wait again, and confirm: (a)
+    ; they stopped exactly at 3 (never got a 4th increment, proving they
+    ; really terminated rather than just running slowly), and (b) A/B
+    ; kept advancing throughout (proving none of the termination paths
+    ; took the rest of the system down with it).
+    mov rax, [rel test_task_exit_counter]
+    cmp rax, 3
+    jne .term_verify_bad
+    mov rax, [rel test_task_crash_counter]
+    cmp rax, 3
+    jne .term_verify_bad
+    mov rax, [rel test_task_overflow_counter]
+    cmp rax, 3
+    jne .term_verify_bad
+
+    mov r12, [rel test_task_a_counter]  ; r12 = A's counter, pre-second-wait
+    mov r13, [rel test_task_b_counter]  ; r13 = B's counter, pre-second-wait
+
+    mov rcx, 300000000
+.term_wait:
+    dec rcx
+    jnz .term_wait
+
+    cmp qword [rel test_task_exit_counter], 3
+    jne .term_verify_bad                ; must not have incremented again
+    cmp qword [rel test_task_crash_counter], 3
+    jne .term_verify_bad
+    cmp qword [rel test_task_overflow_counter], 3
+    jne .term_verify_bad
+
+    mov rax, [rel test_task_a_counter]
+    cmp rax, r12
+    jle .term_verify_bad                ; A must have kept advancing
+    mov rax, [rel test_task_b_counter]
+    cmp rax, r13
+    jle .term_verify_bad                ; B must have kept advancing
+
+    ; Both terminated tasks should now be sitting on the zombie list,
+    ; discovered whenever something walked past them in the ring.
+    ; Reaping runs from ordinary context (never from the ISR/exception
+    ; handler, which only queue) -- confirm it actually frees them.
+    call sched_reap_zombies
+    cmp qword [rel sched_zombie_list], 0
+    jne .term_verify_bad
+
+    lea rcx, [rel msg_term_verify_ok]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 48
+    lea r8, [rel msg_term_verify_ok]
+    call fb_draw_string
+    jmp .term_verify_done
+.term_verify_bad:
+    lea rcx, [rel msg_term_verify_bad]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 48
+    lea r8, [rel msg_term_verify_bad]
+    call fb_draw_string
+.term_verify_done:
 
     ; Smoke-test the BASIX64 compiler: compile and run a trivial program.
     ; This only proves the pipeline works end to end (compiles without
@@ -676,6 +800,73 @@ test_task_b:
     dec rcx
     jnz .delay
     jmp .loop
+
+; -------------------------------------------------------------------------
+; test_task_exit / test_task_crash: process-termination demo/regression
+; tasks. Each bumps its counter a few times like A/B, then deliberately
+; ends itself -- one voluntarily (task_exit), one via an unhandled CPU
+; exception (integer divide by zero, vector 0). Neither counter should
+; ever exceed 3; if the kernel is still alive and A/B are still counting
+; afterward, both termination paths worked without taking the system
+; down with them.
+; -------------------------------------------------------------------------
+test_task_exit:
+.loop:
+    inc qword [rel test_task_exit_counter]
+    mov rcx, 5000000
+.delay:
+    dec rcx
+    jnz .delay
+    cmp qword [rel test_task_exit_counter], 3
+    jl .loop
+    call task_exit                      ; never returns
+
+test_task_crash:
+.loop:
+    inc qword [rel test_task_crash_counter]
+    mov rcx, 5000000
+.delay:
+    dec rcx
+    jnz .delay
+    cmp qword [rel test_task_crash_counter], 3
+    jl .loop
+    xor edx, edx                        ; deliberate #DE (divide by zero)
+    mov eax, 1
+    xor ecx, ecx
+    div ecx                             ; the exception handler terminates
+    jmp .loop                           ; us here; never actually reached
+
+; -------------------------------------------------------------------------
+; test_task_overflow: canary-guard demo/regression task. Bumps its counter
+; like the others, then deliberately blows its own stack -- 2200 qword
+; pushes (17600 bytes) against a 16384-byte (2048-qword) allocation, with
+; no matching pops, guaranteed to sink RSP past the canary at the stack's
+; lowest address. Nothing pops it back afterward, so this task never
+; touches its (now invalid) stack again; the very next time sched_pick_next
+; considers it as an outgoing task, the corrupted canary gets caught and
+; it's marked terminated exactly like the crash task.
+; -------------------------------------------------------------------------
+test_task_overflow:
+.loop:
+    inc qword [rel test_task_overflow_counter]
+    mov rcx, 5000000
+.delay:
+    dec rcx
+    jnz .delay
+    cmp qword [rel test_task_overflow_counter], 3
+    jl .loop
+    mov rcx, 2200
+.blow:
+    push rax
+    dec rcx
+    jnz .blow
+.hang:
+    hlt                                 ; RSP is wrecked by now; stop here
+    jmp .hang                           ; (rather than looping back and
+                                         ; blowing it again every pass) and
+                                         ; wait to be switched away from --
+                                         ; the canary check ends this task
+                                         ; for good on the next context switch
 
 ; -------------------------------------------------------------------------
 ; storage_init_and_test: locate an AHCI controller over PCI, bring up its
@@ -1600,6 +1791,8 @@ shell_main:
     call console_puts
 
 .prompt:
+    call sched_reap_zombies              ; free any tasks that ended since last prompt
+
     lea rcx, [rel msg_shell_prompt]
     call console_puts
 
@@ -1737,15 +1930,20 @@ exfat_crtest_name:    db 'CRTEST.TXT', 0
 msg_wftest_ok:        db 'exFAT: exfat_write_file multi-cluster round-trip OK', 13, 10, 0
 msg_wftest_bad:       db 'exFAT: exfat_write_file multi-cluster round-trip FAILED', 13, 10, 0
 exfat_wtest_name:     db 'WFTEST.TXT', 0
-msg_sched_ok:         db 'Scheduler: armed (main + 2 test tasks)', 13, 10, 0
+msg_sched_ok:         db 'Scheduler: armed (main + 5 test tasks)', 13, 10, 0
 msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
 msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0
 msg_sched_verify_bad: db 'Scheduler: a test task made no progress (preemption FAILED)', 13, 10, 0
+msg_term_verify_ok:   db 'Scheduler: task_exit and exception isolation both OK, zombies reaped', 13, 10, 0
+msg_term_verify_bad:  db 'Scheduler: process termination verification FAILED', 13, 10, 0
 msg_task_a:           db '[taskA]', 13, 10, 0
 msg_task_b:           db '[taskB]', 13, 10, 0
 
 test_task_a_counter: dq 0
 test_task_b_counter: dq 0
+test_task_exit_counter:  dq 0
+test_task_crash_counter: dq 0
+test_task_overflow_counter: dq 0
 exfat_test_name:      db 'TEST.TXT', 0
 exfat_marker:         db 'END-OF-FILE-MARKER'
 

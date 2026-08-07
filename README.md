@@ -9,7 +9,7 @@ BASIX64: a mixed-case-keyword BASIC-inspired language with `sfloat`,
 `dfloat`, matrices, and 3D/GUI-oriented math, compiled directly to native
 machine code by a compiler running inside the kernel itself.
 
-## Status: Phase 9 — BASIX64 language polish and vector/matrix math
+## Status: Phase 10 — process termination and kernel hardening
 
 This is an as-built log: each phase below is implemented, tested (either via
 the boot-time regression suite or interactively through QEMU), and merged.
@@ -152,12 +152,60 @@ kernel are read back correctly by Windows' own exFAT driver.
   Windows confirming it exists with correct content -- noted for follow-up,
   not blocking (a fresh file under a different name works perfectly).
 
+### Phase 10 — process termination and kernel hardening
+- **Process termination** (`sched.inc`) — a `TCB_STATE` field
+  (alive/terminated) added to every task. A task can end itself
+  (`task_exit`, called voluntarily) or be ended by the kernel; either way
+  this just flags the TCB and stops scheduling it. `sched_pick_next` is now
+  the single shared routine both the timer ISR and the exception handler
+  call to find the next task to run — it's also where a terminated task
+  gets spliced out of the ready ring and queued onto `sched_zombie_list`
+  (reusing its now-dead `TCB_NEXT` field as the zombie-list link). It never
+  calls `kmalloc`/`kfree`, so it's safe from interrupt/exception context;
+  the actual `kfree` of a zombie's TCB+stack happens later, from ordinary
+  context, via `sched_reap_zombies` (wired into the shell's prompt loop).
+- **Exception-triggered task isolation** (`idt.inc`) — `isr_common`, after
+  dumping diagnostics, now checks whether the scheduler is armed. If so, an
+  unhandled CPU exception (divide-by-zero, GPF, page fault, ...) takes down
+  only the ONE faulting task — mark it terminated and switch to the next
+  task via `sched_pick_next` — instead of halting the whole system. This is
+  valid because a fault lands on the faulting task's own kernel stack
+  (IST=0, no alternate exception stack) with a GPR frame built identically
+  to the timer ISR's, so "switch to a different task's saved RSP and
+  pop+iretq" is exactly as sound here as on a normal preemption. Falls back
+  to the original halt-the-system behavior only if the scheduler isn't
+  armed yet (a fault during early boot still needs to be fatal and loud).
+- **Stack canary guard** (`sched.inc`) — `task_create` writes a known
+  sentinel at the lowest address of every task's kmalloc'd kernel stack;
+  `sched_pick_next` checks the outgoing task's canary on every scheduling
+  decision (skipped for the main task, which runs on the kernel's own boot
+  stack rather than a kmalloc'd one) and terminates it — same path as an
+  unhandled exception — if a stack overflow has clobbered it.
+- **`kmalloc`/`kfree` splitting and coalescing** (`kheap.inc`) — `kmalloc`'s
+  small-block path now splits a found block down to the requested size
+  when the leftover is worth keeping as its own free block, instead of
+  always handing out the whole thing (previously a single 32-byte
+  allocation would permanently consume an entire 4080-byte free block).
+  `kfree` now scans for address-adjacent free neighbors and merges with
+  them, so a page carved into many small pieces can still reassemble once
+  everything on it is freed again.
+- All four verified with dedicated demo/regression tasks in the boot-time
+  self-test (`test_task_exit`, `test_task_crash`, `test_task_overflow`
+  alongside the original preemption pair) and an extended `kmalloc`/`kfree`
+  self-test: counters that must settle at an exact value and never advance
+  again, A/B tasks that must keep advancing throughout (proving no
+  termination path takes the rest of the system down with it), a zombie
+  list that must end up empty after reaping, and a coalesced-block
+  allocation that must return the exact address of the earlier of the two
+  merged blocks. Confirmed stable across multiple consecutive full boots.
+
 Current boot sequence (verified via serial log and QEMU screendumps):
-GDT/IDT/PIC/timer → paging → PMM/VMM/heap self-tests → AHCI + NVMe device
-bring-up and LBA0 read → exFAT mount (GPT or MBR), file lookup, read-back,
-write-path self-tests (bitmap/FAT-chain/directory/file write) → scheduler
-bring-up and preemption proof → BASIX64 compile-and-run smoke test → drops
-into the interactive shell.
+GDT/IDT/PIC/timer → paging → PMM/VMM/heap self-tests (including
+split/coalesce) → AHCI + NVMe device bring-up and LBA0 read → exFAT mount
+(GPT or MBR), file lookup, read-back, write-path self-tests
+(bitmap/FAT-chain/directory/file write) → scheduler bring-up, preemption
+proof, and process-termination/canary-guard verification → BASIX64
+compile-and-run smoke test → drops into the interactive shell.
 
 ## Toolchain
 
@@ -195,7 +243,10 @@ concern once more of the kernel exists.
 ## Known limitations (tracked, not forgotten)
 
 - Physical memory tracked up to 128GB; identity map covers up to 1TB.
-- `kmalloc` doesn't split or coalesce free blocks yet.
+- Tasks are kernel-only (ring 0) and share one address space — no per-task
+  CR3/page tables yet, so isolation is cooperative (a fault or bad canary
+  ends a task) rather than memory-protected (nothing stops one task's code
+  from directly reading/writing another's memory).
 - exFAT reader/writer assumes the volume's sector size matches the
   underlying device's native sector size (true almost always in practice).
 - exFAT write path: file names capped at 15 ASCII characters (one

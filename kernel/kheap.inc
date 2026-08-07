@@ -1,12 +1,16 @@
 ; =============================================================================
 ; Kernel heap: kmalloc/kfree, split across two paths.
 ;
-; Small allocations (<= KHEAP_MAX_ALLOC, one page's worth) use the original
+; Small allocations (<= KHEAP_MAX_ALLOC, one page's worth) use a classic
 ; free-list scheme: growth requests one fresh physical page directly
-; (identity-mapped, so no VMM involvement needed) and carves the whole
-; thing into a single free block. Blocks are never split or coalesced, so
-; a churn pattern can fragment this path; a natural follow-up once
-; something actually needs it.
+; (identity-mapped, so no VMM involvement needed) and adds it as a single
+; free block. kmalloc splits a block that's bigger than needed (leaving
+; the leftover tail as a new, smaller free block) rather than handing out
+; the whole thing, and kfree coalesces a freed block with any
+; address-adjacent free neighbor(s) it finds in the list -- otherwise a
+; page carved into many small allocations could never be reassembled into
+; anything bigger than its smallest piece, even after everything on it is
+; freed.
 ;
 ; Larger allocations go through kmalloc_large: several physical pages,
 ; likely non-contiguous, get mapped into one contiguous virtual range in
@@ -35,6 +39,8 @@ kmalloc:
     push rdx
     push rsi
     push rdi
+    push r8
+    push r9
 
     add rcx, 15
     and rcx, ~15                        ; round up to 16-byte alignment
@@ -66,8 +72,32 @@ kmalloc:
     jmp .search
 
 .use_block:
+    ; rdi = candidate block, rdx = its usable size, rbx = size actually
+    ; needed. If there's enough left over to form a worthwhile block of
+    ; its own (header + at least 16 bytes usable), split: shrink this
+    ; block to exactly rbx and splice a new free block, covering the
+    ; leftover, into the list in its place. Otherwise just hand out the
+    ; whole block as-is (the leftover would be too small to ever satisfy
+    ; another request anyway).
+    mov rax, rdx
+    sub rax, rbx                        ; rax = leftover bytes
+    cmp rax, KHEAP_BLOCK_HEADER + 16
+    jb .no_split
+
+    mov [rdi+0], rbx                    ; this block now covers just rbx
+    lea r8, [rdi+rbx+16]                ; r8 = new block's header address
+    mov r9, rax
+    sub r9, KHEAP_BLOCK_HEADER          ; r9 = new block's usable size
+    mov [r8+0], r9
+    mov rax, [rdi+8]                    ; old next
+    mov [r8+8], rax
+    mov [rsi], r8                       ; replace this block with the new one
+    jmp .use_block_out
+
+.no_split:
     mov rax, [rdi+8]                    ; unlink: *rsi = block->next
     mov [rsi], rax
+.use_block_out:
     lea rax, [rdi+16]                   ; usable pointer, past the header
     jmp .out
 
@@ -76,6 +106,8 @@ kmalloc:
     ; prologue/epilogue, so leaving ours on the stack here would corrupt
     ; the return address once it hits its own RET.
     mov rax, rbx                        ; rax survives the pops below
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -87,6 +119,8 @@ kmalloc:
 .fail:
     xor eax, eax
 .out:
+    pop r9
+    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -166,7 +200,11 @@ kmalloc_large:
     ret
 
 ; -------------------------------------------------------------------------
-; kfree: RCX = pointer previously returned by kmalloc/kmalloc_large.
+; kfree: RCX = pointer previously returned by kmalloc/kmalloc_large. The
+; small-block path coalesces the freed block with any free neighbor(s)
+; immediately before or after it in memory, so pages carved into many
+; small allocations can still reassemble into larger blocks once
+; everything on them is freed again.
 ; -------------------------------------------------------------------------
 kfree:
     push rax
@@ -176,12 +214,60 @@ kfree:
     jae kfree_large
 
     push rax
+    push rbx
     push rdx
-    lea rax, [rcx-16]                   ; rax = block header
-    mov rdx, [rel kheap_free_list]
-    mov [rax+8], rdx
-    mov [rel kheap_free_list], rax
+    push rsi
+    push rdi
+    push r8
+    push r9
+
+    lea r8, [rcx-16]                    ; r8 = freed block's header
+    mov r9, [r8+0]                      ; r9 = its usable size
+
+    lea rsi, [rel kheap_free_list]      ; rsi = &(prev's next field, or head)
+.scan:
+    mov rdi, [rsi]
+    test rdi, rdi
+    jz .done_scan
+    mov rax, [rdi+0]                    ; candidate's usable size
+    lea rbx, [rdi+rax+16]               ; candidate's end address
+    cmp rbx, r8
+    je .merge_pred                      ; candidate ends exactly where we start
+    lea rbx, [r8+r9+16]                 ; our (possibly already-merged) end
+    cmp rbx, rdi
+    je .merge_succ                      ; candidate starts exactly where we end
+    lea rsi, [rdi+8]
+    jmp .scan
+
+.merge_pred:
+    mov rax, [rdi+8]                    ; unlink candidate
+    mov [rsi], rax
+    add r9, 16
+    add r9, [rdi+0]                     ; candidate absorbs us: grow its size
+    mov r8, rdi                         ; our block is now the candidate's
+    lea rsi, [rel kheap_free_list]      ; restart -- the new extent may merge again
+    jmp .scan
+
+.merge_succ:
+    mov rax, [rdi+8]                    ; unlink candidate
+    mov [rsi], rax
+    add r9, 16
+    add r9, [rdi+0]                     ; we absorb candidate: grow our size
+    lea rsi, [rel kheap_free_list]      ; restart -- the new extent may merge again
+    jmp .scan
+
+.done_scan:
+    mov [r8+0], r9
+    mov rax, [rel kheap_free_list]
+    mov [r8+8], rax
+    mov [rel kheap_free_list], r8
+
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
     pop rdx
+    pop rbx
     pop rax
     ret
 
