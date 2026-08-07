@@ -39,7 +39,12 @@ entry:
 
     call gdt_install
     call idt_install
+    call irq_install
+    sti
     call paging_init
+
+    mov rcx, rbx                        ; boot_info
+    call pmm_init
 
     call fb_clear
     mov ecx, 4                          ; column
@@ -101,6 +106,118 @@ entry:
     lea r8, [rel msg_exfat_bad]
     call fb_draw_string
 .exfat_done:
+
+    ; Prove the timer IRQ is actually firing: busy-wait a bit, then check
+    ; that timer_ticks moved. A real scheduler will use this tick later;
+    ; for now it's just evidence interrupts genuinely work end to end.
+    mov rcx, 200000000
+.delay:
+    dec rcx
+    jnz .delay
+
+    mov rax, [rel timer_ticks]
+    test rax, rax
+    jz .timer_bad
+    lea rcx, [rel msg_timer_ok]
+    call serial_puts
+    mov rax, [rel timer_ticks]
+    call dbg_hex64
+    mov ecx, 4
+    mov edx, 13
+    lea r8, [rel msg_timer_ok]
+    call fb_draw_string
+    jmp .timer_done
+.timer_bad:
+    lea rcx, [rel msg_timer_bad]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 13
+    lea r8, [rel msg_timer_bad]
+    call fb_draw_string
+.timer_done:
+
+    ; Exercise the physical allocator: two distinct pages, free one, then
+    ; confirm the freed frame gets reused (first-fit scans from the start).
+    call pmm_alloc_page
+    test rax, rax
+    jz .pmm_bad
+    mov r12, rax                        ; r12 = page A
+    call pmm_alloc_page
+    test rax, rax
+    jz .pmm_bad
+    mov r13, rax                        ; r13 = page B
+    cmp r12, r13
+    je .pmm_bad                         ; must be distinct frames
+
+    mov rcx, r12
+    call pmm_free_page
+    call pmm_alloc_page
+    test rax, rax
+    jz .pmm_bad
+    cmp rax, r12
+    jne .pmm_bad                        ; freed frame should be reused
+
+    lea rcx, [rel msg_pmm_ok]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 15
+    lea r8, [rel msg_pmm_ok]
+    call fb_draw_string
+    jmp .pmm_done
+.pmm_bad:
+    lea rcx, [rel msg_pmm_bad]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 15
+    lea r8, [rel msg_pmm_bad]
+    call fb_draw_string
+.pmm_done:
+
+    ; Exercise the heap: two live blocks with different content (proving
+    ; no overlap), free one, and confirm the freed block gets reused.
+    mov ecx, 64
+    call kmalloc
+    test rax, rax
+    jz .kheap_bad
+    mov r12, rax                        ; r12 = block A
+    mov byte [rax], 0xAA
+
+    mov ecx, 128
+    call kmalloc
+    test rax, rax
+    jz .kheap_bad
+    mov r13, rax                        ; r13 = block B
+    mov byte [rax], 0xBB
+
+    cmp byte [r12], 0xAA                ; A must still read back correctly
+    jne .kheap_bad
+    cmp byte [r13], 0xBB
+    jne .kheap_bad
+
+    mov rcx, r12
+    call kfree
+    mov ecx, 64
+    call kmalloc
+    test rax, rax
+    jz .kheap_bad
+    cmp rax, r12
+    jne .kheap_bad                      ; freed block should be reused
+
+    lea rcx, [rel msg_kheap_ok]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 17
+    lea r8, [rel msg_kheap_ok]
+    call fb_draw_string
+    jmp .kheap_done
+.kheap_bad:
+    lea rcx, [rel msg_kheap_bad]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 17
+    lea r8, [rel msg_kheap_bad]
+    call fb_draw_string
+.kheap_done:
 
 .hang:
     jmp .hang
@@ -548,6 +665,12 @@ serial_puts:
 ; =========================================================================
 msg_exfat_ok:         db 'exFAT: TEST.TXT found and read back correctly', 13, 10, 0
 msg_exfat_bad:        db 'exFAT: mount, find, or read FAILED', 13, 10, 0
+msg_timer_ok:         db 'Timer: IRQ0 firing, ticks=', 0
+msg_timer_bad:        db 'Timer: no ticks observed', 13, 10, 0
+msg_pmm_ok:           db 'PMM: alloc/free/reuse OK', 13, 10, 0
+msg_pmm_bad:          db 'PMM: alloc/free/reuse FAILED', 13, 10, 0
+msg_kheap_ok:         db 'kmalloc/kfree: alloc/content/reuse OK', 13, 10, 0
+msg_kheap_bad:        db 'kmalloc/kfree: FAILED', 13, 10, 0
 exfat_test_name:      db 'TEST.TXT', 0
 exfat_marker:         db 'END-OF-FILE-MARKER'
 
@@ -598,7 +721,10 @@ gdt_descriptor:
 
 %include "font8x16.inc"
 %include "idt.inc"
+%include "pic.inc"
 %include "paging.inc"
+%include "pmm.inc"
+%include "kheap.inc"
 %include "pci.inc"
 %include "ahci.inc"
 %include "nvme.inc"

@@ -268,6 +268,13 @@ entry:
     lea rcx, [rel msg_ebs_ok]
     call serial_puts
 
+    lea rax, [rel var_map_buf]
+    mov [rel boot_info+32], rax
+    mov rax, [rel var_map_size]
+    mov [rel boot_info+40], rax
+    mov rax, [rel var_desc_size]
+    mov [rel boot_info+48], rax
+
     ; ---------------------------------------------------------------
     ; Hand off to the kernel: RCX = pointer to boot_info
     ; ---------------------------------------------------------------
@@ -460,6 +467,10 @@ boot_info:
     dd 0            ; +20 Height
     dd 0            ; +24 PixelsPerScanLine
     dd 0            ; +28 PixelFormat (0=RGB,1=BGR,2=BitMask,3=BltOnly)
+    dq 0            ; +32 MemoryMapBase (array of EFI_MEMORY_DESCRIPTOR)
+    dq 0            ; +40 MemoryMapSize (bytes)
+    dq 0            ; +48 MemoryMapDescSize (bytes per descriptor -- always
+                    ;     use this stride, never assume sizeof(EFI_MEMORY_DESCRIPTOR))
 
 code_end:
     align FILE_ALIGN, db 0
