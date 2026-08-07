@@ -45,8 +45,113 @@ entry:
     lea r8, [rel msg_hello]
     call fb_draw_string
 
+    call storage_init_and_test
+
 .hang:
     jmp .hang
+
+; -------------------------------------------------------------------------
+; storage_init_and_test: locate an AHCI controller over PCI, bring up its
+; first active SATA port, read LBA 0 and check the 0xAA55 boot-sector
+; signature. Reports the outcome via serial and on-screen text. This is
+; phase 3's proof that the kernel can drive real storage hardware without
+; any help from firmware -- general read/write and the exFAT layer that
+; will sit on top of it are follow-up work.
+; -------------------------------------------------------------------------
+storage_init_and_test:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+
+    mov cl, 0x01                        ; class    = mass storage
+    mov ch, 0x06                        ; subclass = SATA
+    mov dl, 0x01                        ; progif   = AHCI
+    call pci_find_class
+    jc .no_controller
+
+    mov esi, ecx                        ; esi = device's config-space base
+
+    mov ecx, esi
+    add ecx, 0x04                       ; PCI command register
+    call pci_read32
+    or eax, 0x00000006                  ; Memory Space Enable | Bus Master Enable
+    call pci_write32
+
+    mov ecx, esi
+    add ecx, 0x24                       ; BAR5 = ABAR
+    call pci_read32
+    and eax, 0xFFFFFFF0
+    mov ecx, eax                        ; zero-extends into rcx
+
+    call ahci_init
+    test eax, eax
+    jz .no_port
+
+    lea rcx, [rel ahci_databuf]
+    call ahci_read_lba0
+    test eax, eax
+    jz .read_failed
+
+    lea rcx, [rel msg_ahci_ok]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 4
+    lea r8, [rel msg_ahci_ok]
+    call fb_draw_string
+
+    mov ax, [rel ahci_databuf+510]
+    cmp ax, 0xAA55
+    jne .bad_sig
+    lea rcx, [rel msg_sig_ok]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 5
+    lea r8, [rel msg_sig_ok]
+    call fb_draw_string
+    jmp .done
+
+.bad_sig:
+    lea rcx, [rel msg_sig_bad]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 5
+    lea r8, [rel msg_sig_bad]
+    call fb_draw_string
+    jmp .done
+
+.read_failed:
+    lea rcx, [rel msg_ahci_read_fail]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 4
+    lea r8, [rel msg_ahci_read_fail]
+    call fb_draw_string
+    jmp .done
+
+.no_port:
+    lea rcx, [rel msg_ahci_no_port]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 4
+    lea r8, [rel msg_ahci_no_port]
+    call fb_draw_string
+    jmp .done
+
+.no_controller:
+    lea rcx, [rel msg_ahci_not_found]
+    call serial_puts
+    mov ecx, 4
+    mov edx, 4
+    lea r8, [rel msg_ahci_not_found]
+    call fb_draw_string
+
+.done:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
 
 ; -------------------------------------------------------------------------
 ; gdt_install: load our own flat 64-bit GDT and reload every segment
@@ -266,7 +371,13 @@ serial_puts:
 ; =========================================================================
 ; Data
 ; =========================================================================
-msg_hello: db 'Hello, kernal!', 0
+msg_hello:            db 'Hello, kernal!', 13, 10, 0
+msg_ahci_not_found:   db 'AHCI: no controller found', 13, 10, 0
+msg_ahci_no_port:     db 'AHCI: no active SATA port', 13, 10, 0
+msg_ahci_read_fail:   db 'AHCI: LBA0 read failed/timed out', 13, 10, 0
+msg_ahci_ok:          db 'AHCI: LBA0 read OK', 13, 10, 0
+msg_sig_ok:           db 'AHCI: boot signature 0xAA55 OK', 13, 10, 0
+msg_sig_bad:          db 'AHCI: boot signature mismatch', 13, 10, 0
 
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.
@@ -295,3 +406,5 @@ gdt_descriptor:
     dq gdt_start                         ; base (absolute: fixed load addr)
 
 %include "font8x16.inc"
+%include "pci.inc"
+%include "ahci.inc"

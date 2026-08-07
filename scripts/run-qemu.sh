@@ -16,6 +16,7 @@ ARGS=(
   -m 256M
   -drive if=pflash,format=raw,readonly=on,file="$OVMF"
   -drive file=fat:rw:"$DISK",format=raw,if=virtio
+  -drive file=fat:rw:"$DISK",format=raw,if=ide
   -net none
 )
 
