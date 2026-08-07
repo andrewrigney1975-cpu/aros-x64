@@ -319,6 +319,111 @@ basix_emit_ret_instr:
     jmp basix_emit_bytes
 
 ; =========================================================================
+; Float (SSE2) instruction patterns. Internally, every float value is
+; carried as a double in XMM0 (sfloat values get widened via CVTSS2SD on
+; load and narrowed via CVTSD2SS on store) -- one code path instead of
+; two. XMM registers have no "moffs" load/store form like RAX does, so
+; float variable access is always two steps: load the address into RAX
+; (MOV RAX, imm64), then MOVSD/MOVSS through [RAX].
+; =========================================================================
+basix_i_push_xmm0:    db 0x48,0x83,0xEC,0x08, 0xF2,0x0F,0x11,0x04,0x24   ; sub rsp,8; movsd [rsp],xmm0
+basix_i_pop_xmm0:     db 0xF2,0x0F,0x10,0x04,0x24, 0x48,0x83,0xC4,0x08   ; movsd xmm0,[rsp]; add rsp,8
+basix_i_mov_xmm1_xmm0: db 0xF2,0x0F,0x10,0xC8                            ; movsd xmm1,xmm0
+basix_i_addsd:        db 0xF2,0x0F,0x58,0xC1                             ; addsd xmm0,xmm1
+basix_i_subsd:        db 0xF2,0x0F,0x5C,0xC1                             ; subsd xmm0,xmm1
+basix_i_mulsd:        db 0xF2,0x0F,0x59,0xC1                             ; mulsd xmm0,xmm1
+basix_i_divsd:        db 0xF2,0x0F,0x5E,0xC1                             ; divsd xmm0,xmm1
+basix_i_comisd:       db 0x66,0x0F,0x2F,0xC1                             ; comisd xmm0,xmm1
+basix_i_negsd:        db 0x66,0x0F,0xEF,0xC9, 0xF2,0x0F,0x5C,0xC8, 0xF2,0x0F,0x10,0xC1 ; pxor xmm1,xmm1; subsd xmm1,xmm0; movsd xmm0,xmm1
+basix_i_cvtsi2sd_x0_rax: db 0xF2,0x48,0x0F,0x2A,0xC0                     ; cvtsi2sd xmm0,rax
+basix_i_cvtsi2sd_x1_rax: db 0xF2,0x48,0x0F,0x2A,0xC8                     ; cvtsi2sd xmm1,rax
+basix_i_cvttsd2si_rax_x0: db 0xF2,0x48,0x0F,0x2C,0xC0                    ; cvttsd2si rax,xmm0
+basix_i_cvtsd2ss_x0_x0:  db 0xF2,0x0F,0x5A,0xC0                          ; cvtsd2ss xmm0,xmm0
+basix_i_cvtss2sd_x0_x0:  db 0xF3,0x0F,0x5A,0xC0                          ; cvtss2sd xmm0,xmm0
+basix_i_movsd_load_rax:  db 0xF2,0x0F,0x10,0x00                          ; movsd xmm0,[rax]
+basix_i_movsd_store_rax: db 0xF2,0x0F,0x11,0x00                          ; movsd [rax],xmm0
+basix_i_movss_load_rax:  db 0xF3,0x0F,0x10,0x00                          ; movss xmm0,[rax]
+basix_i_movss_store_rax: db 0xF3,0x0F,0x11,0x00                          ; movss [rax],xmm0
+basix_i_movq_xmm0_rax:   db 0x66,0x48,0x0F,0x6E,0xC0                     ; movq xmm0,rax
+
+basix_emit_push_xmm0:
+    lea rcx, [rel basix_i_push_xmm0]
+    mov edx, 9
+    jmp basix_emit_bytes
+basix_emit_pop_xmm0:
+    lea rcx, [rel basix_i_pop_xmm0]
+    mov edx, 9
+    jmp basix_emit_bytes
+basix_emit_mov_xmm1_xmm0:
+    lea rcx, [rel basix_i_mov_xmm1_xmm0]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_addsd:
+    lea rcx, [rel basix_i_addsd]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_subsd:
+    lea rcx, [rel basix_i_subsd]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_mulsd:
+    lea rcx, [rel basix_i_mulsd]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_divsd:
+    lea rcx, [rel basix_i_divsd]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_comisd:
+    lea rcx, [rel basix_i_comisd]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_negsd:
+    lea rcx, [rel basix_i_negsd]
+    mov edx, 12
+    jmp basix_emit_bytes
+basix_emit_cvtsi2sd_x0_rax:
+    lea rcx, [rel basix_i_cvtsi2sd_x0_rax]
+    mov edx, 5
+    jmp basix_emit_bytes
+basix_emit_cvtsi2sd_x1_rax:
+    lea rcx, [rel basix_i_cvtsi2sd_x1_rax]
+    mov edx, 5
+    jmp basix_emit_bytes
+basix_emit_cvttsd2si_rax_x0:
+    lea rcx, [rel basix_i_cvttsd2si_rax_x0]
+    mov edx, 5
+    jmp basix_emit_bytes
+basix_emit_cvtsd2ss_x0_x0:
+    lea rcx, [rel basix_i_cvtsd2ss_x0_x0]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_cvtss2sd_x0_x0:
+    lea rcx, [rel basix_i_cvtss2sd_x0_x0]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_movsd_load_rax:
+    lea rcx, [rel basix_i_movsd_load_rax]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_movsd_store_rax:
+    lea rcx, [rel basix_i_movsd_store_rax]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_movss_load_rax:
+    lea rcx, [rel basix_i_movss_load_rax]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_movss_store_rax:
+    lea rcx, [rel basix_i_movss_store_rax]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_movq_xmm0_rax:
+    lea rcx, [rel basix_i_movq_xmm0_rax]
+    mov edx, 5
+    jmp basix_emit_bytes
+
+; =========================================================================
 ; Data
 ; =========================================================================
 basix_code_pos: dd 0

@@ -9,7 +9,7 @@ BASIX64: a mixed-case-keyword BASIC-inspired language with `sfloat`,
 `dfloat`, matrices, and 3D/GUI-oriented math, compiled directly to native
 machine code by a compiler running inside the kernel itself.
 
-## Status: Phase 8 — keyboard, shell, and a working BASIX64 compiler (v1 core)
+## Status: Phase 8 — keyboard, shell, and a working BASIX64 compiler (with real sfloat/dfloat math)
 
 This is an as-built log: each phase below is implemented, tested (either via
 the boot-time regression suite or interactively through QEMU), and merged.
@@ -81,15 +81,14 @@ kernel are read back correctly by Windows' own exFAT driver.
   framebuffer scroll, not just a screen clear) with a small line-edited
   REPL: `HELP`, `DIR`, `TYPE <file>`, `WRITE <file> <text>`,
   `RUN <file.bas>`, `CLEAR`.
-- **BASIX64 compiler v1** (`basix_lexer.inc`, `basix_codegen.inc`,
+- **BASIX64 compiler** (`basix_lexer.inc`, `basix_codegen.inc`,
   `basix_symbols.inc`, `basix_runtime.inc`, `basix_parser.inc`) — a real
   single-pass compiler: a lexer (float literals parsed via genuine SSE2
   arithmetic at lex time), and a recursive-descent parser that emits native
   x64 machine code directly as it parses — no AST, no linker, no external
   assembler. Variable/label addresses are embedded as absolute 64-bit
   constants (`MOV RAX, moffs64`) since this kernel is a flat, fixed-address,
-  non-relocatable binary. Current scope (integers only — `sfloat`/`dfloat`
-  parse and `DIM` but aren't yet usable in expressions): `LET`, `PRINT`,
+  non-relocatable binary. Language scope: `LET`, `PRINT`,
   `IF/THEN/ELSE/ENDIF` (block form), `FOR/NEXT`, `WHILE/WEND`,
   `GOTO/GOSUB/RETURN` with named labels, arithmetic (`+ - * / MOD`, unary
   minus, parens), and comparisons (valid only as an `IF`/`WHILE` condition,
@@ -98,6 +97,20 @@ kernel are read back correctly by Windows' own exFAT driver.
   the shell's `RUN` command: arithmetic, loops, conditionals, and
   subroutines with both forward and backward label references all produce
   correct output.
+- **Real `sfloat`/`dfloat` arithmetic** (stage 2) — every expression-
+  producing codegen routine now tracks its result's type (int in RAX, or
+  double in XMM0 — `sfloat` is transparently widened to double on load via
+  `CVTSS2SD` and narrowed back via `CVTSD2SS` only when stored into an
+  `sfloat` variable, so there's one internal float code path, not two).
+  Binary ops promote int operands to double automatically when mixed with
+  a float operand; float comparisons use `COMISD` with the unsigned-style
+  jump-condition mapping float flags actually require (not the signed
+  mapping integer `CMP` uses). `PRINT` of a float value goes through a new
+  `basix_rt_print_double` runtime helper (sign, integer part, fixed 6
+  fractional digits). Verified with real compiled-and-executed programs:
+  float literals, arithmetic (`+ - * /`), int→float promotion on
+  assignment, `sfloat` round-tripping, and float comparisons inside both
+  `IF` and `WHILE` all produce correct output.
 
 Current boot sequence (verified via serial log and QEMU screendumps):
 GDT/IDT/PIC/timer → paging → PMM/VMM/heap self-tests → AHCI + NVMe device
@@ -150,8 +163,10 @@ concern once more of the kernel exists.
 - Keyboard driver: no extended-key (arrow keys, right-Ctrl/Alt) support
   yet — the 0xE0 prefix is recognized and safely discarded.
 - Shell: single-line command input only, no history/tab-completion.
-- BASIX64: integers only (`sfloat`/`dfloat` are lexed and can be `DIM`'d
-  but aren't usable in expressions yet), no matrices/vectors, no 3D/GUI
-  math, no single-line `IF`, no `AND`/`OR`/`NOT`, names limited to 15
-  ASCII characters, no nested nested-FOR beyond 8 levels deep. These are
-  the explicitly deferred "stage 2" scope, not oversights.
+- BASIX64: no matrices/vectors, no 3D/GUI math, no single-line `IF`, no
+  `AND`/`OR`/`NOT`, no float literal exponent notation, `MOD` is int-only,
+  `FOR` loop control values are always truncated to int, names limited to
+  15 ASCII characters, no nested-FOR beyond 8 levels deep, `PRINT` of a
+  float always shows exactly 6 fractional digits (no trimming, no
+  scientific notation). These are explicitly deferred scope, not
+  oversights.

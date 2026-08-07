@@ -95,6 +95,54 @@ basix_rt_print_str:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_rt_print_double: XMM0 = double value. Prints sign, integer part
+; (reusing basix_rt_print_int), a decimal point, and a fixed 6 fractional
+; digits (no trailing-zero trimming or scientific notation -- v1
+; simplification, not a general-purpose float formatter).
+; -------------------------------------------------------------------------
+basix_rt_print_double:
+    push rax
+    push rcx
+    push r8
+
+    xorpd xmm1, xmm1
+    comisd xmm0, xmm1
+    jae .positive
+    mov al, '-'
+    call console_putc
+    xorpd xmm1, xmm1
+    subsd xmm1, xmm0
+    movsd xmm0, xmm1
+.positive:
+    cvttsd2si rcx, xmm0
+    call basix_rt_print_int
+
+    mov al, '.'
+    call console_putc
+
+    cvtsi2sd xmm1, rcx
+    subsd xmm0, xmm1            ; xmm0 = fractional part, 0 <= frac < 1
+
+    mov r8d, 6
+.digit_loop:
+    test r8d, r8d
+    jz .done
+    mulsd xmm0, [rel basix_rt_ten]
+    cvttsd2si rcx, xmm0
+    mov eax, ecx
+    add al, '0'
+    call console_putc
+    cvtsi2sd xmm1, rcx
+    subsd xmm0, xmm1
+    dec r8d
+    jmp .digit_loop
+.done:
+    pop r8
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_rt_newline: prints CRLF.
 ; -------------------------------------------------------------------------
 basix_rt_newline:
@@ -110,3 +158,6 @@ basix_rt_newline:
 ; Data
 ; =========================================================================
 basix_rt_digit_buf: times 20 db 0
+
+align 8
+basix_rt_ten: dq 10.0

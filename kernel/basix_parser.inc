@@ -1,8 +1,9 @@
 ; =============================================================================
 ; BASIX64 recursive-descent parser + single-pass code generator.
 ;
-; Grammar (v1, integers only -- sfloat/dfloat are lexed/DIMmed but not
-; yet usable in expressions; that's stage 2):
+; Grammar (stage 2: sfloat/dfloat are now real, usable numeric types --
+; see basix_combine_operands/basix_emit_store_var below for the int/float
+; promotion rules):
 ;
 ;   program   := (statement NEWLINE)* EOF
 ;   statement := LET ident '=' expr
@@ -46,8 +47,120 @@ basix_expect:
     ret
 
 ; -------------------------------------------------------------------------
-; basix_parse_primary: leaves runtime code that computes the primary's
-; value into RAX.
+; Value-type convention for every expression-producing routine below
+; (basix_parse_primary/unary/term/arith/condition): the routine emits
+; code that computes the value at runtime into RAX (int) or XMM0 (float
+; -- sfloat widened to double via CVTSS2SD on load, narrowed back via
+; CVTSD2SS only when stored into an sfloat variable, so there is exactly
+; one float code path internally), and returns EAX_TYPE in R11D: 0=int,
+; 2=float. (1, TOK type SFLOAT's value, is never returned by an
+; expression -- it only appears as a variable's *declared* storage type.)
+; -------------------------------------------------------------------------
+
+; -------------------------------------------------------------------------
+; basix_emit_push_operand: R10D = type of the value currently computed
+; (RAX if int, XMM0 if float). Emits the matching push.
+; -------------------------------------------------------------------------
+basix_emit_push_operand:
+    test r10d, r10d
+    jnz .float
+    jmp basix_emit_push_rax
+.float:
+    jmp basix_emit_push_xmm0
+
+; -------------------------------------------------------------------------
+; basix_combine_operands: R10D = left's type (left was already pushed via
+; basix_emit_push_operand), R11D = right's type (right's value currently
+; in RAX or XMM0, per R11D). Arranges the final operand pair for a binary
+; op -- RAX=left/RCX=right if both int, else XMM0=left/XMM1=right (both
+; widened to double) -- and returns EAX = the combined type.
+; -------------------------------------------------------------------------
+basix_combine_operands:
+    test r10d, r10d
+    jnz .left_float
+    test r11d, r11d
+    jnz .left_int_right_float
+    call basix_emit_mov_rcx_rax
+    call basix_emit_pop_rax
+    xor eax, eax
+    ret
+.left_int_right_float:
+    call basix_emit_mov_xmm1_xmm0
+    call basix_emit_pop_rax
+    call basix_emit_cvtsi2sd_x0_rax
+    mov eax, 2
+    ret
+.left_float:
+    test r11d, r11d
+    jnz .both_float
+    call basix_emit_cvtsi2sd_x1_rax
+    call basix_emit_pop_xmm0
+    mov eax, 2
+    ret
+.both_float:
+    call basix_emit_mov_xmm1_xmm0
+    call basix_emit_pop_xmm0
+    mov eax, 2
+    ret
+
+; -------------------------------------------------------------------------
+; basix_ensure_int: R11D = a value's type. If float, truncates XMM0 into
+; RAX (used where a construct is int-only in v1, e.g. FOR loop control).
+; -------------------------------------------------------------------------
+basix_ensure_int:
+    cmp r11d, 0
+    je .done
+    jmp basix_emit_cvttsd2si_rax_x0
+.done:
+    ret
+
+; -------------------------------------------------------------------------
+; basix_emit_store_var: EAX = variable index, R11D = the just-evaluated
+; expression's type (value in RAX or XMM0). Converts as needed for the
+; variable's DECLARED type and emits the store.
+; -------------------------------------------------------------------------
+basix_emit_store_var:
+    push r9
+    push r10
+    mov r10d, eax
+    mov r9d, [rel basix_var_type + rax*4]
+
+    cmp r9d, 0
+    jne .target_float
+    cmp r11d, 0
+    je .store_int_direct
+    call basix_emit_cvttsd2si_rax_x0
+.store_int_direct:
+    mov eax, r10d
+    call basix_var_slot_addr
+    call basix_emit_mov_moffs_rax
+    jmp .out
+
+.target_float:
+    cmp r11d, 0
+    jne .value_already_float
+    call basix_emit_cvtsi2sd_x0_rax
+.value_already_float:
+    cmp r9d, 1
+    jne .store_dfloat
+    call basix_emit_cvtsd2ss_x0_x0
+    mov eax, r10d
+    call basix_var_slot_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movss_store_rax
+    jmp .out
+.store_dfloat:
+    mov eax, r10d
+    call basix_var_slot_addr
+    call basix_emit_mov_rax_imm64
+    call basix_emit_movsd_store_rax
+.out:
+    pop r10
+    pop r9
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_primary
 ; -------------------------------------------------------------------------
 basix_parse_primary:
     mov eax, [rel basix_tok_type]
@@ -62,29 +175,52 @@ basix_parse_primary:
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
+    xor r11d, r11d
     ret
 
 .int_lit:
     mov rax, [rel basix_tok_ival]
     call basix_emit_mov_rax_imm64
     call basix_lex_next
+    xor r11d, r11d
     ret
 
 .float_lit:
-    ; v1: truncate to int64 (real float support is stage 2)
-    movsd xmm0, [rel basix_tok_dval]
-    cvttsd2si rax, xmm0
-    call basix_emit_mov_rax_imm64
+    mov rax, [rel basix_tok_dval]        ; raw IEEE754 bits (compile-time)
+    call basix_emit_mov_rax_imm64        ; runtime: mov rax, <those bits>
+    call basix_emit_movq_xmm0_rax        ; runtime: movq xmm0, rax
     call basix_lex_next
+    mov r11d, 2
     ret
 
 .ident:
     mov rcx, [rel basix_tok_text]
     mov edx, [rel basix_tok_len]
     call basix_var_find_or_create
+    mov r10d, eax
+    mov r9d, [rel basix_var_type + r10*4]
+    mov eax, r10d
     call basix_var_slot_addr
+
+    cmp r9d, 0
+    jne .ident_float
     call basix_emit_mov_rax_moffs
     call basix_lex_next
+    xor r11d, r11d
+    ret
+
+.ident_float:
+    call basix_emit_mov_rax_imm64        ; runtime: mov rax, <slot addr>
+    cmp r9d, 1
+    je .ident_sfloat
+    call basix_emit_movsd_load_rax
+    jmp .ident_float_done
+.ident_sfloat:
+    call basix_emit_movss_load_rax
+    call basix_emit_cvtss2sd_x0_x0
+.ident_float_done:
+    call basix_lex_next
+    mov r11d, 2
     ret
 
 .paren:
@@ -103,14 +239,20 @@ basix_parse_unary:
     jne basix_parse_primary
     call basix_lex_next
     call basix_parse_unary
+    cmp r11d, 0
+    je .int_neg
+    jmp basix_emit_negsd
+.int_neg:
     jmp basix_emit_neg_rax
 
 ; -------------------------------------------------------------------------
 ; basix_parse_term
 ; -------------------------------------------------------------------------
 basix_parse_term:
+    push r10
     push r12
     call basix_parse_unary
+    mov r10d, r11d                      ; running left type
 .loop:
     mov r12d, [rel basix_tok_type]
     cmp r12d, TOK_STAR
@@ -122,31 +264,55 @@ basix_parse_term:
     jmp .done
 .op:
     call basix_lex_next
-    call basix_emit_push_rax
-    call basix_parse_unary
-    call basix_emit_mov_rcx_rax
-    call basix_emit_pop_rax
+    call basix_emit_push_operand
+    call basix_parse_unary               ; r11d = right's type
+    call basix_combine_operands          ; eax = combined type
+    mov r10d, eax
+
+    cmp r12d, TOK_MOD
+    je .domod
+    cmp r10d, 0
+    jne .float_op
     cmp r12d, TOK_STAR
-    je .mul
+    je .imul
     call basix_emit_cqo
     call basix_emit_idiv_rcx
-    cmp r12d, TOK_MOD
-    jne .loop
-    call basix_emit_mov_rax_rdx
     jmp .loop
-.mul:
+.imul:
     call basix_emit_imul_rax_rcx
     jmp .loop
+.float_op:
+    cmp r12d, TOK_STAR
+    je .fmul
+    call basix_emit_divsd
+    jmp .loop
+.fmul:
+    call basix_emit_mulsd
+    jmp .loop
+.domod:
+    cmp r10d, 0
+    je .domod_int
+    mov dword [rel basix_compile_ok], 0  ; MOD requires both operands int
+    jmp .loop
+.domod_int:
+    call basix_emit_cqo
+    call basix_emit_idiv_rcx
+    call basix_emit_mov_rax_rdx
+    jmp .loop
 .done:
+    mov r11d, r10d
     pop r12
+    pop r10
     ret
 
 ; -------------------------------------------------------------------------
 ; basix_parse_arith
 ; -------------------------------------------------------------------------
 basix_parse_arith:
+    push r10
     push r12
     call basix_parse_term
+    mov r10d, r11d
 .loop:
     mov r12d, [rel basix_tok_type]
     cmp r12d, TOK_PLUS
@@ -156,31 +322,47 @@ basix_parse_arith:
     jmp .done
 .op:
     call basix_lex_next
-    call basix_emit_push_rax
-    call basix_parse_term
-    call basix_emit_mov_rcx_rax
-    call basix_emit_pop_rax
+    call basix_emit_push_operand
+    call basix_parse_term                ; r11d = right's type
+    call basix_combine_operands          ; eax = combined type
+    mov r10d, eax
+
+    cmp r10d, 0
+    jne .float_op
     cmp r12d, TOK_PLUS
-    je .add
+    je .iadd
     call basix_emit_sub_rax_rcx
     jmp .loop
-.add:
+.iadd:
     call basix_emit_add_rax_rcx
     jmp .loop
+.float_op:
+    cmp r12d, TOK_PLUS
+    je .fadd
+    call basix_emit_subsd
+    jmp .loop
+.fadd:
+    call basix_emit_addsd
+    jmp .loop
 .done:
+    mov r11d, r10d
     pop r12
+    pop r10
     ret
 
 ; -------------------------------------------------------------------------
 ; basix_parse_condition: parses "arith relop arith", emits the comparison
-; and an inverted conditional jump (taken when the condition is FALSE).
-; Returns RAX = absolute address of the jump's rel32 field, to be patched
-; later with the false-branch target via basix_patch_rel32.
+; (integer CMP or float COMISD, per the combined operand type) and an
+; inverted conditional jump (taken when the condition is FALSE). Returns
+; RAX = absolute address of the jump's rel32 field, to be patched later
+; with the false-branch target via basix_patch_rel32.
 ; -------------------------------------------------------------------------
 basix_parse_condition:
+    push r10
     push r12
     call basix_parse_arith
-    call basix_emit_push_rax
+    mov r10d, r11d
+    call basix_emit_push_operand
 
     mov r12d, [rel basix_tok_type]
     cmp r12d, TOK_EQ
@@ -201,11 +383,45 @@ basix_parse_condition:
     call basix_lex_next
 .after_relop:
 
-    call basix_parse_arith
-    call basix_emit_mov_rcx_rax
-    call basix_emit_pop_rax
-    call basix_emit_cmp_rax_rcx
+    call basix_parse_arith               ; r11d = right's type
+    call basix_combine_operands          ; eax = combined type
 
+    cmp eax, 0
+    jne .float_cmp
+    call basix_emit_cmp_rax_rcx
+    jmp .pick_jcc_int
+.float_cmp:
+    call basix_emit_comisd
+
+    cmp r12d, TOK_EQ
+    je .finv_ne
+    cmp r12d, TOK_NE
+    je .finv_eq
+    cmp r12d, TOK_LT
+    je .finv_ge
+    cmp r12d, TOK_GT
+    je .finv_le
+    cmp r12d, TOK_LE
+    je .finv_gt
+    mov al, 0x82                        ; TOK_GE -> JB
+    jmp .emit_jcc
+.finv_ne:
+    mov al, 0x85                        ; JNE
+    jmp .emit_jcc
+.finv_eq:
+    mov al, 0x84                        ; JE
+    jmp .emit_jcc
+.finv_ge:
+    mov al, 0x83                        ; JAE
+    jmp .emit_jcc
+.finv_le:
+    mov al, 0x86                        ; JBE
+    jmp .emit_jcc
+.finv_gt:
+    mov al, 0x87                        ; JA
+    jmp .emit_jcc
+
+.pick_jcc_int:
     cmp r12d, TOK_EQ
     je .inv_ne
     cmp r12d, TOK_NE
@@ -235,6 +451,7 @@ basix_parse_condition:
 .emit_jcc:
     call basix_emit_jcc_placeholder
     pop r12
+    pop r10
     ret
 
 ; -------------------------------------------------------------------------
@@ -296,11 +513,10 @@ basix_parse_assignment:
     call basix_lex_next
     mov eax, TOK_EQ
     call basix_expect
-    call basix_parse_arith
+    call basix_parse_arith              ; r11d = expr type
 
     pop rax
-    call basix_var_slot_addr
-    call basix_emit_mov_moffs_rax
+    call basix_emit_store_var
 
     pop rdx
     pop rbx
@@ -394,13 +610,15 @@ basix_parse_for:
 
     mov eax, TOK_EQ
     call basix_expect
-    call basix_parse_arith
-    mov rax, r14
+    call basix_parse_arith              ; FOR control values are int-only
+    call basix_ensure_int               ; in v1 -- truncate if a float
+    mov rax, r14                        ; expression sneaks in here.
     call basix_emit_mov_moffs_rax
 
     mov eax, TOK_TO
     call basix_expect
     call basix_parse_arith
+    call basix_ensure_int
     mov eax, r15d
     imul eax, eax, 8
     lea rax, [rel basix_for_end_temps + rax]
@@ -410,6 +628,7 @@ basix_parse_for:
     jne .default_step
     call basix_lex_next
     call basix_parse_arith
+    call basix_ensure_int
     jmp .store_step
 .default_step:
     mov rax, 1
@@ -527,8 +746,14 @@ basix_parse_print_list:
     cmp dword [rel basix_tok_type], TOK_STRING
     je .str_item
     call basix_parse_arith
+    cmp r11d, 0
+    jne .print_float
     call basix_emit_mov_rcx_rax
     lea rcx, [rel basix_rt_print_int]
+    call basix_emit_call_to
+    jmp .after_item
+.print_float:
+    lea rcx, [rel basix_rt_print_double]
     call basix_emit_call_to
     jmp .after_item
 .str_item:
@@ -654,10 +879,9 @@ basix_parse_statement:
     call basix_var_find_or_create
     pop rbx
     push rax
-    call basix_parse_arith
+    call basix_parse_arith              ; r11d = expr type
     pop rax
-    call basix_var_slot_addr
-    call basix_emit_mov_moffs_rax
+    call basix_emit_store_var
     jmp .out
 
 .label_def:
