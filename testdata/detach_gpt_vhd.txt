@@ -1,0 +1,2 @@
+select vdisk file="F:\Src\aros-x64\testdata\gpt_test.vhd"
+detach vdisk

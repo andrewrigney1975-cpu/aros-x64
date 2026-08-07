@@ -302,6 +302,242 @@ entry:
     call fb_draw_string
 .kheap_done:
 
+    ; Verify storage_write_sectors against a scratch LBA far beyond
+    ; anything the exFAT volume currently uses, so this can't corrupt the
+    ; boot sector, partition table, or the TEST.TXT content already there.
+    ; (AHCI's write path was separately hand-verified the same way,
+    ; against its own smaller vvfat-backed disk -- not kept as a
+    ; permanent test since forcing a driver switch mid-boot is more
+    ; disruptive than it's worth for routine regression checking.)
+    mov rcx, 100000
+    mov edx, 1
+    lea r8, [rel exfat_test_buf]
+    mov byte [rel exfat_test_buf], 0x5A
+    mov byte [rel exfat_test_buf+511], 0xA5
+    call storage_write_sectors
+    test eax, eax
+    jz .wtest_bad
+
+    mov rcx, 100000
+    mov edx, 1
+    lea r8, [rel exfat_test_buf]
+    mov byte [rel exfat_test_buf], 0
+    mov byte [rel exfat_test_buf+511], 0
+    call storage_read_sectors
+    test eax, eax
+    jz .wtest_bad
+    cmp byte [rel exfat_test_buf], 0x5A
+    jne .wtest_bad
+    cmp byte [rel exfat_test_buf+511], 0xA5
+    jne .wtest_bad
+
+    lea rcx, [rel msg_wtest_ok]
+    call serial_puts
+    jmp .wtest_done
+.wtest_bad:
+    lea rcx, [rel msg_wtest_bad]
+    call serial_puts
+.wtest_done:
+
+    ; Verify the allocation bitmap: mount it, allocate a cluster, confirm
+    ; it now reads back as allocated, then free it again. This ends with
+    ; the on-disk bitmap byte-for-byte unchanged (alloc then free of the
+    ; same cluster is a net no-op), so it's safe to run every boot.
+    call exfat_bitmap_mount
+    test eax, eax
+    jz .btest_bad
+
+    call exfat_alloc_cluster
+    test eax, eax
+    jz .btest_bad
+    mov ebx, eax                        ; ebx = allocated cluster
+
+    mov ecx, ebx
+    call exfat_bitmap_test_free
+    test eax, eax
+    jnz .btest_bad                      ; should now read as NOT free
+
+    mov ecx, ebx
+    call exfat_free_cluster
+    test eax, eax
+    jz .btest_bad
+
+    mov ecx, ebx
+    call exfat_bitmap_test_free
+    test eax, eax
+    jz .btest_bad                       ; should be free again
+
+    lea rcx, [rel msg_btest_ok]
+    call serial_puts
+    jmp .btest_done
+.btest_bad:
+    lea rcx, [rel msg_btest_bad]
+    call serial_puts
+.btest_done:
+
+    ; Verify FAT chain writing: allocate two clusters, link A->B, terminate
+    ; B with an end-of-chain marker, confirm exfat_fat_next_cluster follows
+    ; the link and then the EOC, then clear both FAT entries and free both
+    ; clusters again -- a net no-op on the real volume, safe every boot.
+    call exfat_alloc_cluster
+    test eax, eax
+    jz .ctest_bad
+    mov ebx, eax                        ; ebx = cluster A
+
+    call exfat_alloc_cluster
+    test eax, eax
+    jz .ctest_bad
+    mov esi, eax                        ; esi = cluster B
+
+    mov ecx, ebx
+    mov edx, esi
+    call exfat_fat_set_entry            ; A -> B
+    test eax, eax
+    jz .ctest_bad
+
+    mov ecx, esi
+    mov edx, 0xFFFFFFFF
+    call exfat_fat_set_entry            ; B -> EOC
+    test eax, eax
+    jz .ctest_bad
+
+    mov ecx, ebx
+    call exfat_fat_next_cluster
+    cmp eax, esi
+    jne .ctest_bad
+
+    mov ecx, esi
+    call exfat_fat_next_cluster
+    cmp eax, 0xFFFFFFFF
+    jne .ctest_bad
+
+    mov ecx, ebx
+    xor edx, edx
+    call exfat_fat_set_entry
+    test eax, eax
+    jz .ctest_bad
+    mov ecx, esi
+    xor edx, edx
+    call exfat_fat_set_entry
+    test eax, eax
+    jz .ctest_bad
+
+    mov ecx, ebx
+    call exfat_free_cluster
+    test eax, eax
+    jz .ctest_bad
+    mov ecx, esi
+    call exfat_free_cluster
+    test eax, eax
+    jz .ctest_bad
+
+    lea rcx, [rel msg_ctest_ok]
+    call serial_puts
+    jmp .ctest_done
+.ctest_bad:
+    lea rcx, [rel msg_ctest_bad]
+    call serial_puts
+.ctest_done:
+
+    ; Verify directory entry construction: create an empty test file in
+    ; the root directory. Idempotent across reboots of the same VHD -- if
+    ; a prior boot already created it, this just confirms it's still
+    ; found rather than creating a duplicate entry.
+    lea rcx, [rel exfat_crtest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .crtest_exists
+
+    lea rcx, [rel exfat_crtest_name]
+    call exfat_create_file
+    test eax, eax
+    jz .crtest_bad
+
+    lea rcx, [rel exfat_crtest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .crtest_bad
+.crtest_exists:
+    cmp qword [rel exfat_find_result+8], 0   ; DataLength must be 0 (empty)
+    jne .crtest_bad
+
+    lea rcx, [rel msg_crtest_ok]
+    call serial_puts
+    jmp .crtest_done
+.crtest_bad:
+    lea rcx, [rel msg_crtest_bad]
+    call serial_puts
+.crtest_done:
+
+    ; Verify exfat_write_file: create a new file spanning more than one
+    ; cluster (exercises FAT chain writing on the data itself, not just
+    ; the bitmap/FAT tests above), then read it back and confirm the
+    ; content round-trips. Idempotent across reboots of the same VHD.
+    lea rcx, [rel exfat_wtest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .wftest_verify
+
+    lea rdi, [rel exfat_wtest_src]
+    xor ecx, ecx
+.wftest_fill:
+    cmp ecx, 6000
+    jge .wftest_fill_done
+    mov eax, ecx
+    and eax, 0xFF
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .wftest_fill
+.wftest_fill_done:
+
+    lea rcx, [rel exfat_wtest_name]
+    lea r8, [rel exfat_wtest_src]
+    mov r9, 6000
+    call exfat_write_file
+    test eax, eax
+    jz .wftest_bad
+
+    lea rcx, [rel exfat_wtest_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .wftest_bad
+
+.wftest_verify:
+    cmp qword [rel exfat_find_result+8], 6000
+    jne .wftest_bad
+
+    mov ecx, [rel exfat_find_result+0]   ; FirstCluster
+    mov rdx, [rel exfat_find_result+8]   ; DataLength
+    lea r8, [rel exfat_wtest_read]
+    mov r9d, [rel exfat_find_result+16]  ; NoFatChain
+    call exfat_read_file
+    test eax, eax
+    jz .wftest_bad
+
+    lea rsi, [rel exfat_wtest_read]
+    xor ecx, ecx
+.wftest_cmp:
+    cmp ecx, 6000
+    jge .wftest_ok
+    mov al, [rsi+rcx]
+    mov ah, cl
+    cmp al, ah
+    jne .wftest_bad
+    inc ecx
+    jmp .wftest_cmp
+.wftest_ok:
+    lea rcx, [rel msg_wftest_ok]
+    call serial_puts
+    jmp .wftest_done
+.wftest_bad:
+    lea rcx, [rel msg_wftest_bad]
+    call serial_puts
+.wftest_done:
+
     ; Bring up the scheduler: the current flow becomes the "main" task
     ; (its TCB.rsp gets filled in on its own first save -- it doesn't need
     ; a hand-built frame like task_create produces, since it's already
@@ -906,6 +1142,18 @@ msg_vmm_ok:           db 'VMM: virtual->physical mapping OK', 13, 10, 0
 msg_vmm_bad:          db 'VMM: virtual->physical mapping FAILED', 13, 10, 0
 msg_kheap_ok:         db 'kmalloc/kfree: alloc/content/reuse OK', 13, 10, 0
 msg_kheap_bad:        db 'kmalloc/kfree: FAILED', 13, 10, 0
+msg_wtest_ok:         db 'storage_write_sectors: scratch write/read-back OK', 13, 10, 0
+msg_wtest_bad:        db 'storage_write_sectors: scratch write/read-back FAILED', 13, 10, 0
+msg_btest_ok:         db 'exFAT: allocation bitmap alloc/free round-trip OK', 13, 10, 0
+msg_btest_bad:        db 'exFAT: allocation bitmap alloc/free round-trip FAILED', 13, 10, 0
+msg_ctest_ok:         db 'exFAT: FAT chain link/follow/free round-trip OK', 13, 10, 0
+msg_ctest_bad:        db 'exFAT: FAT chain link/follow/free round-trip FAILED', 13, 10, 0
+msg_crtest_ok:        db 'exFAT: directory entry creation OK', 13, 10, 0
+msg_crtest_bad:       db 'exFAT: directory entry creation FAILED', 13, 10, 0
+exfat_crtest_name:    db 'CRTEST.TXT', 0
+msg_wftest_ok:        db 'exFAT: exfat_write_file multi-cluster round-trip OK', 13, 10, 0
+msg_wftest_bad:       db 'exFAT: exfat_write_file multi-cluster round-trip FAILED', 13, 10, 0
+exfat_wtest_name:     db 'WFTEST.TXT', 0
 msg_sched_ok:         db 'Scheduler: armed (main + 2 test tasks)', 13, 10, 0
 msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
 msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0
@@ -923,6 +1171,8 @@ exfat_find_result: times 24 db 0
 
 align 4096
 exfat_test_buf: times 8192 db 0
+exfat_wtest_src:  times 6000 db 0
+exfat_wtest_read: times 6000 db 0
 
 msg_hello:            db 'Hello, kernal!', 13, 10, 0
 msg_ahci_not_found:   db 'AHCI: no controller found', 13, 10, 0

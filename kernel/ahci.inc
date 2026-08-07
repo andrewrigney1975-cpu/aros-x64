@@ -296,6 +296,100 @@ ahci_read_sectors:
     pop rbx
     ret
 
+; -------------------------------------------------------------------------
+; ahci_write_sectors: RCX = LBA (48-bit), RDX = sector count (1-65535),
+; R8 = source buffer (contiguous, >= count*ahci_sector_size bytes). Same
+; shape as ahci_read_sectors, just WRITE DMA EXT and the command header's
+; Write bit set so the PRDT is read FROM memory instead of written to it.
+; Returns EAX=1 on success, EAX=0 on timeout/error.
+; -------------------------------------------------------------------------
+ahci_write_sectors:
+    push rbx
+    push rdx
+    push rsi
+    push rdi
+    push r9
+    push r10
+
+    mov r10, rcx                        ; r10 = LBA
+    mov rdi, r8                         ; rdi = source buffer
+
+    mov rbx, [rel ahci_abar]
+    mov eax, [rel ahci_port]
+    mov esi, eax
+    shl esi, 7
+    add esi, 0x100
+
+    ; Command header 0: CFL=5 dwords, Write=1, PRDTL=1
+    lea rax, [rel ahci_cmdtable]
+    lea rcx, [rel ahci_cmdlist]
+    mov dword [rcx+0x00], (1 << 16) | (1 << 6) | 5  ; PRDTL=1, W=1, CFL=5
+    mov dword [rcx+0x04], 0
+    mov [rcx+0x08], eax
+    mov dword [rcx+0x0C], 0
+
+    ; Command table: H2D register FIS requesting WRITE DMA EXT
+    lea rcx, [rel ahci_cmdtable]
+    mov dword [rcx+0x00], 0
+    mov dword [rcx+0x04], 0
+    mov dword [rcx+0x08], 0
+    mov dword [rcx+0x0C], 0
+    mov dword [rcx+0x10], 0
+    mov byte  [rcx+0x00], 0x27          ; FIS type = H2D register
+    mov byte  [rcx+0x01], 0x80          ; C=1
+    mov byte  [rcx+0x02], 0x35          ; command = WRITE DMA EXT
+    mov rax, r10
+    mov [rcx+0x04], al
+    shr rax, 8
+    mov [rcx+0x05], al
+    shr rax, 8
+    mov [rcx+0x06], al
+    mov byte [rcx+0x07], 0x40           ; device: LBA mode
+    shr rax, 8
+    mov [rcx+0x08], al
+    shr rax, 8
+    mov [rcx+0x09], al
+    shr rax, 8
+    mov [rcx+0x0A], al
+    mov [rcx+0x0C], dx
+
+    mov eax, edi
+    mov [rcx+0x80], eax                 ; DBA
+    mov dword [rcx+0x84], 0
+    mov dword [rcx+0x88], 0
+    movzx eax, dx
+    imul eax, [rel ahci_sector_size]
+    dec eax
+    mov [rcx+0x8C], eax
+
+    mov dword [rbx+rsi+0x38], 1
+    mov r9d, 20000000
+.wait_cmd:
+    mov eax, [rbx+rsi+0x38]
+    test eax, 1
+    jz .cmd_done
+    dec r9d
+    jnz .wait_cmd
+    xor eax, eax
+    jmp .out
+
+.cmd_done:
+    mov eax, [rbx+rsi+0x20]
+    test al, 0x01
+    jnz .fail
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r10
+    pop r9
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rbx
+    ret
+
 ; =========================================================================
 ; Data (statically reserved, physically addressed via the identity map)
 ; =========================================================================
