@@ -76,8 +76,8 @@ exfat_mount:
     test eax, eax
     jz .try_mbr
 
+    call storage_sector_size             ; eax = the device's native sector size
     xor edx, edx
-    mov eax, 512
     mov ecx, [rel exfat_gpt_entry_size]
     test ecx, ecx
     jz .try_mbr
@@ -177,17 +177,36 @@ exfat_mount:
     mov [rel exfat_root_dir_cluster], eax
 
     movzx ecx, byte [rsi+108]           ; BytesPerSectorShift
+    mov [rel exfat_sector_shift], cl
     mov eax, 1
     shl eax, cl
     mov [rel exfat_bytes_per_sector], eax
+    dec eax
+    mov [rel exfat_sector_mask], eax    ; bytes_per_sector - 1
 
     movzx ecx, byte [rsi+109]           ; SectorsPerClusterShift
     mov eax, 1
     shl eax, cl
     mov [rel exfat_sectors_per_cluster], eax
 
+    ; Every LBA/count this file computes for storage_read_sectors/
+    ; storage_write_sectors is expressed in units of exFAT sectors
+    ; (BytesPerSectorShift), but those calls hand that number straight to
+    ; the device driver, which interprets it in units of the device's own
+    ; native sector size. That's only correct if the two actually match --
+    ; true for every real volume/device combination seen so far (Windows'
+    ; own exFAT formatter always matches the device's reported logical
+    ; sector size), but silently wrong data corruption is a much worse
+    ; failure mode than refusing to mount, so check it explicitly.
+    call storage_sector_size
+    cmp eax, [rel exfat_bytes_per_sector]
+    jne .sector_size_mismatch
+
     mov eax, 1
     jmp .out
+.sector_size_mismatch:
+    lea rcx, [rel msg_exfat_sector_mismatch]
+    call serial_puts
 .fail:
     xor eax, eax
 .out:
@@ -247,12 +266,16 @@ exfat_fat_next_cluster:
     push r8
 
     mov ebx, ecx                        ; ebx = cluster
-    ; byte offset within the FAT = cluster*4; sector = FatOffset + offset/512
+    ; byte offset within the FAT = cluster*4; sector = FatOffset +
+    ; offset/bytes_per_sector (the volume's own sector size, not a
+    ; hardcoded 512 -- see the mount-time check in exfat_mount for why
+    ; that's also required to equal the device's native sector size)
     mov eax, ebx
     shl eax, 2
     mov edx, eax
-    shr edx, 9                          ; edx = sector index within the FAT
-    and eax, 0x1FF                      ; eax = byte offset within that sector
+    movzx ecx, byte [rel exfat_sector_shift]
+    shr edx, cl                         ; edx = sector index within the FAT
+    and eax, [rel exfat_sector_mask]    ; eax = byte offset within that sector
 
     push rax                            ; save in-sector byte offset
     mov ecx, [rel exfat_fat_offset]
@@ -296,8 +319,9 @@ exfat_fat_set_entry:
     mov eax, ebx
     shl eax, 2
     mov edx, eax
-    shr edx, 9                          ; edx = sector index within the FAT
-    and eax, 0x1FF                      ; eax = byte offset within that sector
+    movzx ecx, byte [rel exfat_sector_shift]
+    shr edx, cl                         ; edx = sector index within the FAT
+    and eax, [rel exfat_sector_mask]    ; eax = byte offset within that sector
     mov esi, eax                        ; esi = in-sector byte offset
 
     mov ecx, [rel exfat_fat_offset]
@@ -1529,8 +1553,12 @@ exfat_cluster_heap_offset: dd 0
 exfat_cluster_count:       dd 0
 exfat_root_dir_cluster:    dd 0
 exfat_bytes_per_sector:    dd 0
+exfat_sector_shift:        db 0
+exfat_sector_mask:         dd 0
 exfat_sectors_per_cluster: dd 0
 exfat_gpt_entry_size:      dd 0
+
+msg_exfat_sector_mismatch: db 'exFAT: volume sector size does not match device native sector size, refusing to mount', 13, 10, 0
 
 exfat_list_cluster:           dd 0
 exfat_list_offset:            dd 0
@@ -1542,9 +1570,14 @@ exfat_bitmap_cache_chain_idx: dd 0
 exfat_bitmap_cache_cluster:   dd 0
 
 align 512
-exfat_vbr_buf:        times 512 db 0
-exfat_fat_sector_buf: times 512 db 0
-exfat_gpt_buf:        times 512 db 0
+; Sized for the largest native device sector size these drivers report
+; (4096, e.g. NVMe 4Kn or Advanced Format), not just the common 512 --
+; each of these is filled by a single storage_read_sectors(count=1)
+; call, which reads exactly one *device* sector, so a 512-byte buffer
+; would overflow on hardware with a larger native sector size.
+exfat_vbr_buf:        times 4096 db 0
+exfat_fat_sector_buf: times 4096 db 0
+exfat_gpt_buf:        times 4096 db 0
 
 ; NOTE: sized for our test volume's 4096-byte clusters. Real volumes can
 ; use larger clusters (up to 32MB per spec); once the heap allocator
