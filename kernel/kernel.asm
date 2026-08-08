@@ -2118,7 +2118,7 @@ console_puts:
 ; bring-up above), so rbx (boot_info*) is already valid here.
 ; =============================================================================
 SHELL_LINE_MAX equ 120
-SHELL_TYPE_BUF_MAX equ 8191             ; exfat_test_buf is 8192 bytes; -1 for NUL
+SHELL_TYPE_BUF_MAX equ 65535             ; exfat_test_buf is 65536 bytes; -1 for NUL
 SHELL_HISTORY_MAX equ 8                 ; recalled via Up/Down, see shell_history_recall
 
 ; -------------------------------------------------------------------------
@@ -3419,7 +3419,7 @@ align 8
 exfat_find_result: times 32 db 0
 
 align 4096
-exfat_test_buf: times 8192 db 0
+exfat_test_buf: times 65536 db 0
 exfat_wtest_src:  times 6000 db 0
 exfat_wtest_read: times 6000 db 0
 exfat_lntest_read: times 64 db 0

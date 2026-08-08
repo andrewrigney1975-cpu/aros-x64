@@ -18,9 +18,15 @@ basix_emit_u8:
     push rbx
     push rcx
     mov ecx, [rel basix_code_pos]
+    cmp ecx, BASIX_CODE_BUF_SIZE
+    jae .overflow
     lea rbx, [rel basix_code_buf]
     mov [rbx+rcx], al
     inc dword [rel basix_code_pos]
+    jmp .out
+.overflow:
+    mov dword [rel basix_compile_ok], 0
+.out:
     pop rcx
     pop rbx
     ret
@@ -34,9 +40,15 @@ basix_emit_u32:
     push rdx
     mov edx, eax
     mov ecx, [rel basix_code_pos]
+    cmp ecx, BASIX_CODE_BUF_SIZE - 4
+    ja .overflow
     lea rbx, [rel basix_code_buf]
     mov [rbx+rcx], edx
     add dword [rel basix_code_pos], 4
+    jmp .out
+.overflow:
+    mov dword [rel basix_compile_ok], 0
+.out:
     pop rdx
     pop rcx
     pop rbx
@@ -51,9 +63,15 @@ basix_emit_u64:
     push rdx
     mov rdx, rax
     mov ecx, [rel basix_code_pos]
+    cmp ecx, BASIX_CODE_BUF_SIZE - 8
+    ja .overflow
     lea rbx, [rel basix_code_buf]
     mov [rbx+rcx], rdx
     add dword [rel basix_code_pos], 8
+    jmp .out
+.overflow:
+    mov dword [rel basix_compile_ok], 0
+.out:
     pop rdx
     pop rcx
     pop rbx
