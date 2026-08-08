@@ -1674,6 +1674,130 @@ exfat_chain_advance:
     ret
 
 ; -------------------------------------------------------------------------
+; exfat_read_file_at: RCX = first cluster, RDX = starting byte offset
+; within the file, R8 = byte count to read, R9 = destination buffer,
+; R10D = NoFatChain flag. A sibling of exfat_read_file that can start
+; mid-file -- used by the BASIX64 compiler's streaming lexer (RUN no
+; longer needs the whole program resident in one buffer). Uses
+; exfat_chain_advance to skip to the cluster containing the start
+; offset, then runs the same read-cluster/copy/advance loop
+; exfat_read_file already uses, except the first cluster's copy starts
+; partway through it (at the offset within that cluster) instead of at
+; its beginning. Returns EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_read_file_at:
+    push rbx
+    push rbp
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r15d, r10d                      ; r15d = NoFatChain flag
+    mov r14, r8                         ; r14 = remaining bytes to read
+    mov r13, r9                         ; r13 = current destination ptr
+
+    mov eax, [rel exfat_sectors_per_cluster]
+    imul eax, [rel exfat_bytes_per_sector]
+    mov r12d, eax                       ; r12d = bytes per cluster
+
+    ; clusters_to_skip = start_offset / bytes_per_cluster,
+    ; sub_offset = start_offset mod bytes_per_cluster
+    mov eax, edx                        ; start offset (32 bits is ample
+                                         ; for a BASIX64 source file)
+    xor edx, edx
+    div r12d
+    mov r11d, eax                       ; r11d = clusters_to_skip
+    mov ebp, edx                        ; ebp = sub-offset, first
+                                         ; cluster of this read only --
+                                         ; zeroed after that cluster
+
+    mov edx, r11d
+    mov r10d, r15d
+    call exfat_chain_advance            ; ECX (first cluster) already
+                                         ; holds the right argument
+    test eax, eax
+    jz .fail                            ; 0 = ran off the end (cluster
+                                         ; 0 is never a valid data
+                                         ; cluster in exFAT)
+    mov ebx, eax                        ; ebx = starting cluster
+
+.loop:
+    test r14, r14
+    jz .done
+    mov ecx, ebx
+    lea r8, [rel exfat_dir_buf]
+    call exfat_read_cluster
+    test eax, eax
+    jz .fail
+
+    mov eax, r12d
+    sub eax, ebp                        ; room left in this cluster
+    mov rcx, r14
+    cmp rcx, rax
+    jbe .copy_amt_ok
+    mov rcx, rax
+.copy_amt_ok:
+    push rcx
+    lea rsi, [rel exfat_dir_buf]
+    add rsi, rbp
+    mov rdi, r13
+    cld
+    rep movsb
+    pop rcx
+
+    add r13, rcx
+    sub r14, rcx
+    xor ebp, ebp                        ; only the first cluster of
+                                         ; this read has a sub-offset
+    test r14, r14
+    jz .done
+
+    test r15d, r15d
+    jz .use_fat
+    inc ebx                             ; NoFatChain: contiguous
+    jmp .loop
+.use_fat:
+    mov ecx, ebx
+    call exfat_fat_next_cluster
+    test eax, eax
+    jz .fail
+    cmp eax, 0xFFFFFFF8
+    jae .fail
+    mov ebx, eax
+    jmp .loop
+
+.done:
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbp
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
 ; exfat_free_cluster_run: ECX = starting cluster, R9 = count (>=1),
 ; R10D = NoFatChain flag. Frees exactly `count` consecutive clusters
 ; starting at ECX (contiguous +1 for NoFatChain, or following the real

@@ -2355,8 +2355,19 @@ basix_parse_dim:
     cmp dword [rel basix_tok_type], TOK_IDENT
     jne .bail
 
-    push qword [rel basix_tok_text]
-    push qword [rel basix_tok_len]
+    ; Copy the identifier's name out immediately (basix_save_ident) --
+    ; NOT the lexer's shared basix_tok_text_buf, which the "AS"
+    ; keyword and the type keyword a few lines below both also lex
+    ; (through the very same identifier/keyword scan path) before this
+    ; name is finally used, silently overwriting it if we only held
+    ; onto the pointer. Caught via a large streamed program with many
+    ; DIM statements compiling "successfully" but rendering wrong --
+    ; every declared name had been quietly clobbered by whatever type
+    ; keyword followed it.
+    mov rcx, [rel basix_tok_text]
+    mov edx, [rel basix_tok_len]
+    call basix_save_ident
+    push qword [rel basix_saved_ident_len]
     call basix_lex_next
 
     ; Optional "(size)" -- an array declaration. r12d = element count,
@@ -2426,7 +2437,7 @@ basix_parse_dim:
 .not_array:
 
     pop rdx
-    pop rcx
+    lea rcx, [rel basix_saved_ident_buf]
     push r12
     push r8
     call basix_var_find_or_create
@@ -2466,7 +2477,6 @@ basix_parse_dim:
 
 .bail_after_push:
     pop rdx
-    pop rcx
 .bail:
     mov dword [rel basix_compile_ok], 0
 .out:
@@ -2675,11 +2685,15 @@ basix_parse_statement:
     jne .bad_target
     mov rcx, [rel basix_tok_text]
     mov edx, [rel basix_tok_len]
-    push rcx
-    push rdx
+    call basix_save_ident               ; see basix_saved_ident_buf's
+                                         ; comment -- the lookahead
+                                         ; lex_next below could lex
+                                         ; another identifier/keyword
+                                         ; and clobber a merely-saved
+                                         ; pointer
     call basix_lex_next
-    pop rdx
-    pop rcx
+    lea rcx, [rel basix_saved_ident_buf]
+    mov edx, [rel basix_saved_ident_len]
     xor r8d, r8d
     call basix_goto_or_gosub_emit
     jmp .out
@@ -2690,11 +2704,10 @@ basix_parse_statement:
     jne .bad_target
     mov rcx, [rel basix_tok_text]
     mov edx, [rel basix_tok_len]
-    push rcx
-    push rdx
+    call basix_save_ident
     call basix_lex_next
-    pop rdx
-    pop rcx
+    lea rcx, [rel basix_saved_ident_buf]
+    mov edx, [rel basix_saved_ident_len]
     mov r8d, 1
     call basix_goto_or_gosub_emit
     jmp .out
@@ -2726,13 +2739,15 @@ basix_parse_statement:
     ret
 
 ; -------------------------------------------------------------------------
-; basix_compile: RCX = ptr to a NUL-terminated BASIX64 source buffer.
-; Compiles it into basix_code_buf (callable at that address on success).
-; Returns EAX=1/0.
+; basix_compile_reset_state: shared by basix_compile/basix_compile_file
+; -- clears every piece of per-compile state (variables, labels,
+; fixups, FOR nesting, the array arena, the emitted-code position, and
+; the overall ok flag) before a fresh compile begins. Touches no
+; registers beyond EAX-free `mov [mem], imm` forms, so it's safe to
+; call before either entry point has finished unpacking its own
+; incoming arguments out of RCX/RDX/R8.
 ; -------------------------------------------------------------------------
-basix_compile:
-    push rbx
-
+basix_compile_reset_state:
     mov dword [rel basix_compile_ok], 1
     mov dword [rel basix_code_pos], 0
     mov dword [rel basix_var_count], 0
@@ -2740,10 +2755,41 @@ basix_compile:
     mov dword [rel basix_fixup_count], 0
     mov dword [rel basix_for_depth], 0
     mov dword [rel basix_array_arena_pos], 0
+    ret
 
+; -------------------------------------------------------------------------
+; basix_compile: RCX = ptr to a NUL-terminated BASIX64 source buffer
+; already fully resident in memory. Compiles it into basix_code_buf
+; (callable at that address on success). Returns EAX=1/0.
+; -------------------------------------------------------------------------
+basix_compile:
+    push rbx
+    call basix_compile_reset_state
     call basix_lex_init
     call basix_lex_next
+    jmp basix_compile_tail
 
+; -------------------------------------------------------------------------
+; basix_compile_file: ECX = first cluster, RDX = file length (bytes),
+; R8D = NoFatChain flag. Compiles a BASIX64 program straight from
+; exFAT via the streaming lexer (basix_lex_init_stream/basix_lex_next's
+; refill check) instead of requiring the whole source resident in one
+; buffer first -- what RUN uses. Returns EAX=1/0.
+; -------------------------------------------------------------------------
+basix_compile_file:
+    push rbx
+    call basix_compile_reset_state
+    call basix_lex_init_stream
+    call basix_lex_next
+    jmp basix_compile_tail
+
+; -------------------------------------------------------------------------
+; basix_compile_tail: the parse loop and finalization shared by both
+; entry points above -- identical either way once the source is
+; flowing through basix_tok_*, regardless of whether it's backed by a
+; fully-resident buffer or the streaming window.
+; -------------------------------------------------------------------------
+basix_compile_tail:
 .loop:
     cmp dword [rel basix_tok_type], TOK_EOF
     je .done

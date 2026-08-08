@@ -118,6 +118,38 @@ basix_name_copy_upper:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_save_ident: RCX = name ptr, EDX = len. Copies (clamped to 31
+; bytes) into basix_saved_ident_buf/basix_saved_ident_len -- see the
+; comment there for why this exists.
+; -------------------------------------------------------------------------
+basix_save_ident:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    mov eax, edx
+    cmp eax, 31
+    jbe .len_ok
+    mov eax, 31
+.len_ok:
+    mov [rel basix_saved_ident_len], eax
+
+    mov rsi, rcx                        ; source pointer
+    lea rdi, [rel basix_saved_ident_buf]
+    mov ecx, eax                        ; copy count
+    cld
+    rep movsb
+
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_var_find_or_create: RCX = name ptr, EDX = len. Returns EAX =
 ; variable index, creating a new INTEGER-typed variable if not found.
 ; -------------------------------------------------------------------------
@@ -460,3 +492,15 @@ basix_for_depth: dd 0
 align 8
 basix_for_end_temps:  times BASIX_MAX_FOR_DEPTH dq 0
 basix_for_step_temps: times BASIX_MAX_FOR_DEPTH dq 0
+
+; Shared scratch for any parser call site that needs an identifier's
+; text to survive a later basix_lex_next call (basix_parse_dim's own
+; name across the "AS"/type-keyword tokens; GOTO/GOSUB's target name
+; across the lookahead lex_next that follows it) -- copied immediately
+; via basix_save_ident rather than trusting the lexer's shared
+; tok_text_buf to survive whatever gets lexed next, which silently
+; overwrites it if that next token is itself an identifier/keyword.
+; Never used by two call sites at once (DIM/GOTO/GOSUB parsing never
+; nests), so one shared buffer is enough.
+basix_saved_ident_buf: times 32 db 0
+basix_saved_ident_len: dd 0

@@ -2949,24 +2949,16 @@ shell_dispatch:
     test eax, eax
     jz .run_notfound
 
-    mov rax, [rel exfat_find_result+8]
-    cmp rax, SHELL_TYPE_BUF_MAX
-    ja .run_toobig
-
-    mov ecx, [rel exfat_find_result+0]
-    mov rdx, [rel exfat_find_result+8]
-    lea r8, [rel exfat_test_buf]
-    mov r9d, [rel exfat_find_result+16]
-    call exfat_read_file
-    test eax, eax
-    jz .run_readfail
-
-    mov rax, [rel exfat_find_result+8]
-    lea rdi, [rel exfat_test_buf]
-    mov byte [rdi+rax], 0
-
-    lea rcx, [rel exfat_test_buf]
-    call basix_compile
+    ; Stream-compile straight from exFAT (basix_compile_file /
+    ; basix_lex_init_stream) instead of reading the whole program into
+    ; one buffer first -- program size is no longer bounded by
+    ; exfat_test_buf/SHELL_TYPE_BUF_MAX at all (that limit still
+    ; applies to TYPE, which genuinely needs the whole file resident
+    ; to display it).
+    mov ecx, [rel exfat_find_result+0]  ; FirstCluster
+    mov rdx, [rel exfat_find_result+8]  ; DataLength
+    mov r8d, [rel exfat_find_result+16] ; NoFatChain
+    call basix_compile_file
     test eax, eax
     jz .run_compilefail
 
@@ -2978,14 +2970,6 @@ shell_dispatch:
     jmp .out
 .run_notfound:
     lea rcx, [rel msg_shell_notfound]
-    call console_puts
-    jmp .out
-.run_toobig:
-    lea rcx, [rel msg_shell_toobig]
-    call console_puts
-    jmp .out
-.run_readfail:
-    lea rcx, [rel msg_shell_readfail]
     call console_puts
     jmp .out
 .run_compilefail:
