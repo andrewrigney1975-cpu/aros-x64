@@ -85,6 +85,12 @@ xhci_find_and_probe:
     add rax, rcx
     mov [rel xhci_rt_base], rax         ; Runtime Registers base
 
+    mov ecx, [rbx+0x14]                 ; DBOFF (bits 0-1 reserved)
+    and ecx, 0xFFFFFFFC
+    mov rax, rbx
+    add rax, rcx
+    mov [rel xhci_db_base], rax         ; Doorbell Array base
+
     mov eax, 1
     jmp .out
 .not_found:
@@ -289,6 +295,142 @@ xhci_reset_and_start:
     pop rbx
     ret
 
+; -------------------------------------------------------------------------
+; xhci_noop_test: submits a No-Op Command TRB through the command ring,
+; rings the command doorbell, and polls the event ring (bounded wait)
+; for the resulting Command Completion Event. Proves the full ring
+; mechanism end to end -- command submission, doorbell, controller
+; processing, event generation, event ring polling -- before any of it
+; gets reused for real device-slot commands. Returns EAX=1/0.
+;
+; The result is held in R15D until the very end rather than EAX,
+; because ERDP has to be written back (updating the controller's
+; dequeue pointer, clearing Event Handler Busy) on every path out of
+; this routine regardless of outcome, and that update's own arithmetic
+; needs EAX -- a lesson already paid for elsewhere this session.
+; -------------------------------------------------------------------------
+XHCI_TRB_TYPE_NOOP_CMD equ 23
+XHCI_TRB_TYPE_CMD_COMPLETION equ 33
+
+xhci_noop_test:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r15
+
+    ; Write the No-Op Command TRB at the current enqueue slot.
+    mov rax, [rel xhci_cmdring_enqueue]
+    lea rdi, [rel xhci_cmdring]
+    mov rcx, rax
+    shl rcx, 4                          ; * 16 bytes/TRB
+    add rdi, rcx
+
+    mov qword [rdi+0], 0                ; Parameter
+    mov dword [rdi+8], 0                ; Status
+    mov eax, XHCI_TRB_TYPE_NOOP_CMD
+    shl eax, 10
+    mov rbx, [rel xhci_cmdring_cycle]
+    or eax, ebx                         ; Cycle bit
+    mov [rdi+12], eax
+
+    ; Advance the enqueue pointer, following the Link TRB (slot 255,
+    ; where this ring's usable range ends) and toggling cycle state
+    ; exactly as the controller itself will when it reaches that link.
+    mov rax, [rel xhci_cmdring_enqueue]
+    inc rax
+    cmp rax, 255
+    jl .no_enq_wrap
+    xor rax, rax
+    mov rbx, [rel xhci_cmdring_cycle]
+    xor rbx, 1
+    mov [rel xhci_cmdring_cycle], rbx
+.no_enq_wrap:
+    mov [rel xhci_cmdring_enqueue], rax
+
+    mov rbx, [rel xhci_db_base]
+    mov dword [rbx+0], 0                ; ring doorbell 0 (command ring)
+
+    mov r9d, 20000000
+.poll:
+    mov rax, [rel xhci_evtring_dequeue]
+    lea rsi, [rel xhci_evtring]
+    mov rcx, rax
+    shl rcx, 4
+    add rsi, rcx                        ; rsi -> next event TRB slot
+
+    mov eax, [rsi+12]                   ; Control
+    mov ebx, eax
+    and ebx, 1                          ; this TRB's cycle bit
+    mov rdx, [rel xhci_evtring_cycle]
+    cmp ebx, edx
+    jne .not_yet                        ; cycle mismatch: controller
+                                         ; hasn't produced this entry yet
+
+    mov ecx, eax
+    shr ecx, 10
+    and ecx, 0x3F                       ; TRB Type
+    cmp ecx, XHCI_TRB_TYPE_CMD_COMPLETION
+    jne .advance_dequeue
+
+    mov r15d, 1
+    call .advance_dequeue_once
+    jmp .writeback
+
+.advance_dequeue:
+    call .advance_dequeue_once
+    jmp .poll
+
+.not_yet:
+    dec r9d
+    jnz .poll
+    xor r15d, r15d
+    jmp .writeback
+
+.advance_dequeue_once:
+    push rax
+    push rbx
+    mov rax, [rel xhci_evtring_dequeue]
+    inc rax
+    cmp rax, 256
+    jl .adv_no_wrap
+    xor rax, rax
+    mov rbx, [rel xhci_evtring_cycle]
+    xor rbx, 1
+    mov [rel xhci_evtring_cycle], rbx
+.adv_no_wrap:
+    mov [rel xhci_evtring_dequeue], rax
+    pop rbx
+    pop rax
+    ret
+
+.writeback:
+    ; Update ERDP to the current dequeue position, clearing Event
+    ; Handler Busy -- required on every path out of here, success,
+    ; failure, or timeout alike.
+    mov rbx, [rel xhci_rt_base]
+    add rbx, 0x20
+    mov rax, [rel xhci_evtring_dequeue]
+    shl rax, 4
+    lea rdx, [rel xhci_evtring]
+    add rax, rdx
+    or al, 8                            ; EHB (write-1-clear)
+    mov [rbx+0x18], rax                 ; ERDP
+
+    mov eax, r15d
+    pop r15
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================
@@ -296,6 +438,7 @@ xhci_pci_addr:    dd 0
 xhci_mmio_base:   dq 0
 xhci_op_base:     dq 0
 xhci_rt_base:     dq 0
+xhci_db_base:     dq 0
 xhci_caplength:   db 0
 xhci_hciversion:  dw 0
 xhci_hcsparams1:  dd 0
