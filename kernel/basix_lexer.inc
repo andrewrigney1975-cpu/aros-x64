@@ -86,6 +86,14 @@ TOK_MVMUL   equ 74
 TOK_PSET    equ 75
 TOK_LINE    equ 76
 
+; Trig functions (expression-level, IDENT-like: TOK_x LPAREN expr RPAREN)
+TOK_SIN     equ 77
+TOK_COS     equ 78
+TOK_TAN     equ 79
+TOK_ASIN    equ 80
+TOK_ACOS    equ 81
+TOK_ATAN    equ 82
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -792,5 +800,29 @@ basix_keywords:
     db 4
     dd TOK_LINE
     db 'LINE', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 3
+    dd TOK_SIN
+    db 'SIN', 0,0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 3
+    dd TOK_COS
+    db 'COS', 0,0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 3
+    dd TOK_TAN
+    db 'TAN', 0,0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_ASIN
+    db 'ASIN', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_ACOS
+    db 'ACOS', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_ATAN
+    db 'ATAN', 0,0,0,0,0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table

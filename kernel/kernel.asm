@@ -44,6 +44,7 @@ entry:
     sti
     call paging_init
     call lapic_init
+    call basix_fpu_init
 
     mov rcx, rbx                        ; boot_info
     call pmm_init

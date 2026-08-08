@@ -345,6 +345,121 @@ basix_rt_line:
     pop rax
     ret
 
+; -------------------------------------------------------------------------
+; basix_rt_sin / basix_rt_cos / basix_rt_tan / basix_rt_asin /
+; basix_rt_acos / basix_rt_atan: XMM0 = argument (radians), returns
+; XMM0 = result. Bridges to the x87 FPU for the actual transcendental
+; instructions (FSIN/FCOS/FPTAN/FPATAN) -- SSE2 has no equivalent, and
+; hand-rolling correctly-range-reduced polynomial approximations from
+; scratch is real work this kernel doesn't need to take on when the
+; CPU already does it in hardware. x87 is otherwise completely unused
+; in this kernel (pure SSE2 throughout), but CR0.EM is already clear
+; and CR4.OSFXSR already set -- required for the SSE2 this kernel uses
+; everywhere else to work at all -- so x87 opcodes execute with no
+; further CR0/CR4 changes; basix_fpu_init (called once at boot, see
+; kernel.asm) just runs FNINIT to get a sane control/tag word, since
+; UEFI makes no promise about x87 state the way it does about CR0/CR4.
+;
+; ASIN/ACOS have no direct x87 opcode; they're derived from FPATAN
+; (which computes a true atan2, not a bare atan) plus a square root:
+;   asin(v) = atan2(v, sqrt(1-v^2))
+;   acos(v) = atan2(sqrt(1-v^2), v)
+; The sqrt(1-v^2) term is computed in SSE2 (mulsd/subsd/sqrtsd, all
+; already used elsewhere in this file) since that part needs no x87 at
+; all; only the final FPATAN crosses over.
+;
+; None of these are reentrant (shared scratch qwords, no locking) --
+; fine here since BASIX64 programs run single-threaded and
+; synchronously, same assumption every other runtime helper in this
+; file already makes.
+; -------------------------------------------------------------------------
+basix_rt_sin:
+    push rax
+    movsd [rel basix_rt_trig_a], xmm0
+    fld qword [rel basix_rt_trig_a]
+    fsin
+    fstp qword [rel basix_rt_trig_a]
+    movsd xmm0, [rel basix_rt_trig_a]
+    pop rax
+    ret
+
+basix_rt_cos:
+    push rax
+    movsd [rel basix_rt_trig_a], xmm0
+    fld qword [rel basix_rt_trig_a]
+    fcos
+    fstp qword [rel basix_rt_trig_a]
+    movsd xmm0, [rel basix_rt_trig_a]
+    pop rax
+    ret
+
+basix_rt_tan:
+    push rax
+    movsd [rel basix_rt_trig_a], xmm0
+    fld qword [rel basix_rt_trig_a]
+    fptan                                ; ST0=1.0 (pushed), ST1=tan(x)
+    fstp st0                             ; discard the pushed 1.0
+    fstp qword [rel basix_rt_trig_a]     ; store tan(x), pop
+    movsd xmm0, [rel basix_rt_trig_a]
+    pop rax
+    ret
+
+basix_rt_asin:
+    push rax
+    movsd [rel basix_rt_trig_a], xmm0    ; a = v (this call's y)
+    movsd xmm1, xmm0
+    mulsd xmm1, xmm1                     ; xmm1 = v*v
+    movsd xmm2, [rel basix_rt_trig_one]
+    subsd xmm2, xmm1                     ; xmm2 = 1 - v*v
+    sqrtsd xmm2, xmm2                    ; xmm2 = sqrt(1-v*v) = this call's x
+    movsd [rel basix_rt_trig_b], xmm2
+    fld qword [rel basix_rt_trig_a]      ; ST0 = y = v
+    fld qword [rel basix_rt_trig_b]      ; ST0 = x, ST1 = y
+    fpatan                               ; ST0 = atan(y/x) = asin(v)
+    fstp qword [rel basix_rt_trig_a]
+    movsd xmm0, [rel basix_rt_trig_a]
+    pop rax
+    ret
+
+basix_rt_acos:
+    push rax
+    movsd [rel basix_rt_trig_a], xmm0    ; a = v (this call's x)
+    movsd xmm1, xmm0
+    mulsd xmm1, xmm1
+    movsd xmm2, [rel basix_rt_trig_one]
+    subsd xmm2, xmm1
+    sqrtsd xmm2, xmm2                    ; xmm2 = sqrt(1-v*v) = this call's y
+    movsd [rel basix_rt_trig_b], xmm2
+    fld qword [rel basix_rt_trig_b]      ; ST0 = y = sqrt(1-v*v)
+    fld qword [rel basix_rt_trig_a]      ; ST0 = x = v, ST1 = y
+    fpatan                               ; ST0 = atan(y/x) = acos(v)
+    fstp qword [rel basix_rt_trig_a]
+    movsd xmm0, [rel basix_rt_trig_a]
+    pop rax
+    ret
+
+basix_rt_atan:
+    push rax
+    movsd [rel basix_rt_trig_a], xmm0    ; a = y = x (this call's argument)
+    fld qword [rel basix_rt_trig_a]      ; ST0 = y
+    fld1                                  ; ST0 = 1.0 = x, ST1 = y
+    fpatan                                ; ST0 = atan(y/1) = atan(x)
+    fstp qword [rel basix_rt_trig_a]
+    movsd xmm0, [rel basix_rt_trig_a]
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_fpu_init: FNINIT, called once at boot before any BASIX64
+; program can run -- establishes a sane x87 control/tag word (UEFI
+; guarantees CR0/CR4 are already right for SSE2, which is why the rest
+; of this kernel's float code needs no init call of its own, but makes
+; no equivalent promise about x87 register/control state).
+; -------------------------------------------------------------------------
+basix_fpu_init:
+    fninit
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================
@@ -355,3 +470,8 @@ basix_rt_ten: dq 10.0
 basix_rt_frac_buf: times 6 db 0
 basix_rt_line_x2: dd 0
 basix_rt_line_y2: dd 0
+
+align 8
+basix_rt_trig_a:   dq 0
+basix_rt_trig_b:   dq 0
+basix_rt_trig_one: dq 1.0

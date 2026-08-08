@@ -1227,6 +1227,27 @@ basix_parse_line:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_parse_trig_arg: shared by SIN/COS/TAN/ASIN/ACOS/ATAN -- parses
+; "(expr)" (the function keyword itself already consumed by the
+; caller), coercing an int result to float (XMM0) since every one of
+; these runtime routines expects its argument there, matching the
+; convention basix_emit_addsd/mulsd/etc. already use throughout this
+; file ("everything stays in XMM0", basix_codegen.inc's float-op
+; block comment).
+; -------------------------------------------------------------------------
+basix_parse_trig_arg:
+    mov eax, TOK_LPAREN
+    call basix_expect
+    call basix_parse_arith               ; r11d = expr type
+    test r11d, r11d
+    jnz .already_float
+    call basix_emit_cvtsi2sd_x0_rax
+.already_float:
+    mov eax, TOK_RPAREN
+    call basix_expect
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_parse_primary
 ; -------------------------------------------------------------------------
 basix_parse_primary:
@@ -1239,10 +1260,65 @@ basix_parse_primary:
     je .ident
     cmp eax, TOK_LPAREN
     je .paren
+    cmp eax, TOK_SIN
+    je .do_sin
+    cmp eax, TOK_COS
+    je .do_cos
+    cmp eax, TOK_TAN
+    je .do_tan
+    cmp eax, TOK_ASIN
+    je .do_asin
+    cmp eax, TOK_ACOS
+    je .do_acos
+    cmp eax, TOK_ATAN
+    je .do_atan
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
     xor r11d, r11d
+    ret
+
+.do_sin:
+    call basix_lex_next
+    call basix_parse_trig_arg
+    lea rcx, [rel basix_rt_sin]
+    call basix_emit_call_to
+    mov r11d, 2
+    ret
+.do_cos:
+    call basix_lex_next
+    call basix_parse_trig_arg
+    lea rcx, [rel basix_rt_cos]
+    call basix_emit_call_to
+    mov r11d, 2
+    ret
+.do_tan:
+    call basix_lex_next
+    call basix_parse_trig_arg
+    lea rcx, [rel basix_rt_tan]
+    call basix_emit_call_to
+    mov r11d, 2
+    ret
+.do_asin:
+    call basix_lex_next
+    call basix_parse_trig_arg
+    lea rcx, [rel basix_rt_asin]
+    call basix_emit_call_to
+    mov r11d, 2
+    ret
+.do_acos:
+    call basix_lex_next
+    call basix_parse_trig_arg
+    lea rcx, [rel basix_rt_acos]
+    call basix_emit_call_to
+    mov r11d, 2
+    ret
+.do_atan:
+    call basix_lex_next
+    call basix_parse_trig_arg
+    lea rcx, [rel basix_rt_atan]
+    call basix_emit_call_to
+    mov r11d, 2
     ret
 
 .int_lit:
