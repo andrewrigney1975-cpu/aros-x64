@@ -1593,6 +1593,14 @@ xhci_probe_and_report:
     jz .noop_failed
     lea rcx, [rel msg_xhci_noop_ok]
     call serial_puts
+
+    call xhci_scan_ports
+    push rax                            ; connected-port count -- serial_puts
+                                         ; below doesn't preserve eax
+    lea rcx, [rel msg_xhci_ports]
+    call serial_puts
+    pop rax
+    call dbg_hex64
     jmp .out
 .noop_failed:
     lea rcx, [rel msg_xhci_noop_fail]
@@ -3312,6 +3320,7 @@ msg_xhci_running:     db 'xHCI: controller reset and running OK', 13, 10, 0
 msg_xhci_reset_fail:  db 'xHCI: reset/bring-up FAILED (timed out)', 13, 10, 0
 msg_xhci_noop_ok:     db 'xHCI: No-Op command completion event received OK', 13, 10, 0
 msg_xhci_noop_fail:   db 'xHCI: No-Op command FAILED (no completion event)', 13, 10, 0
+msg_xhci_ports:       db 'xHCI: ports with a device connected:', 13, 10, 0
 
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.

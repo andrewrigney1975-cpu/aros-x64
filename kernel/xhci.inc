@@ -296,6 +296,70 @@ xhci_reset_and_start:
     ret
 
 ; -------------------------------------------------------------------------
+; xhci_scan_ports: reads PORTSC for every port the controller reports
+; (HCSPARAMS1's MaxPorts field) and records which ones currently have a
+; device connected (CCS, bit0) along with that port's negotiated speed
+; (bits 10-13) -- read-only, no state changes to the controller. Device
+; enumeration (the next phase) needs to know which port to actually
+; address; this is that lookup. Returns EAX = number of ports with a
+; device connected (0 is a valid, non-error result -- an idle QEMU
+; xhci0 with nothing attached to it looks exactly like this).
+; -------------------------------------------------------------------------
+xhci_scan_ports:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    mov eax, [rel xhci_hcsparams1]
+    shr eax, 24
+    and eax, 0xFF                       ; MaxPorts
+    mov [rel xhci_max_ports], eax
+
+    lea rdi, [rel xhci_port_connected]
+    mov ecx, eax
+    xor eax, eax
+    cld
+    rep stosb
+
+    mov rbx, [rel xhci_op_base]
+    add rbx, 0x400                      ; first Port Register Set
+    xor esi, esi                        ; esi = connected-port count
+    xor ecx, ecx                        ; ecx = port index (0-based)
+.port_loop:
+    cmp ecx, [rel xhci_max_ports]
+    jge .done
+
+    mov eax, [rbx]                      ; PORTSC
+    test eax, 0x00000001                ; CCS (Current Connect Status)
+    jz .next_port
+
+    lea rdx, [rel xhci_port_connected]
+    mov byte [rdx+rcx], 1
+    inc esi
+
+.next_port:
+    add rbx, 0x10                       ; each Port Register Set is 4
+                                         ; dwords (PORTSC/PORTPMSC/PORTLI/
+                                         ; PORTHLPMC)
+    inc ecx
+    jmp .port_loop
+.done:
+    mov eax, esi
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    add rsp, 8                          ; drop the saved rax -- the port
+                                         ; count return value lives in
+                                         ; eax already, restoring the
+                                         ; caller's old rax would stomp it
+    ret
+
+; -------------------------------------------------------------------------
 ; xhci_noop_test: submits a No-Op Command TRB through the command ring,
 ; rings the command doorbell, and polls the event ring (bounded wait)
 ; for the resulting Command Completion Event. Proves the full ring
@@ -439,6 +503,10 @@ xhci_mmio_base:   dq 0
 xhci_op_base:     dq 0
 xhci_rt_base:     dq 0
 xhci_db_base:     dq 0
+xhci_max_ports:   dd 0
+xhci_port_connected: times 32 db 0      ; 1 byte per port index (0-based);
+                                         ; MaxPorts is an 8-bit HCSPARAMS1
+                                         ; field, so 32 is a generous cap
 xhci_caplength:   db 0
 xhci_hciversion:  dw 0
 xhci_hcsparams1:  dd 0
