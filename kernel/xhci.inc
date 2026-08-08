@@ -73,6 +73,16 @@ xhci_find_and_probe:
     mov [rel xhci_hciversion], ax
     mov eax, [rbx+0x04]                 ; HCSPARAMS1
     mov [rel xhci_hcsparams1], eax
+    mov eax, [rbx+0x10]                 ; HCCPARAMS1
+    mov [rel xhci_hccparams1], eax
+    and eax, 0x00000004                 ; CSZ (bit 2): 0 = 32-byte contexts,
+                                         ; 1 = 64-byte contexts
+    jz .csz32
+    mov dword [rel xhci_context_size], 64
+    jmp .csz_done
+.csz32:
+    mov dword [rel xhci_context_size], 32
+.csz_done:
 
     movzx ecx, byte [rel xhci_caplength]
     mov rax, rbx
@@ -301,9 +311,10 @@ xhci_reset_and_start:
 ; device connected (CCS, bit0) along with that port's negotiated speed
 ; (bits 10-13) -- read-only, no state changes to the controller. Device
 ; enumeration (the next phase) needs to know which port to actually
-; address; this is that lookup. Returns EAX = number of ports with a
-; device connected (0 is a valid, non-error result -- an idle QEMU
-; xhci0 with nothing attached to it looks exactly like this).
+; address, and the negotiated speed value goes straight into that
+; device's Slot Context; this is that lookup. Returns EAX = number of
+; ports with a device connected (0 is a valid, non-error result -- an
+; idle QEMU xhci0 with nothing attached to it looks exactly like this).
 ; -------------------------------------------------------------------------
 xhci_scan_ports:
     push rax
@@ -323,6 +334,11 @@ xhci_scan_ports:
     xor eax, eax
     cld
     rep stosb
+    lea rdi, [rel xhci_port_speed]
+    mov ecx, [rel xhci_max_ports]
+    xor eax, eax
+    cld
+    rep stosb
 
     mov rbx, [rel xhci_op_base]
     add rbx, 0x400                      ; first Port Register Set
@@ -339,6 +355,12 @@ xhci_scan_ports:
     lea rdx, [rel xhci_port_connected]
     mov byte [rdx+rcx], 1
     inc esi
+
+    mov edx, eax
+    shr edx, 10
+    and edx, 0x0F                       ; Port Speed (bits 10-13)
+    lea rax, [rel xhci_port_speed]
+    mov [rax+rcx], dl
 
 .next_port:
     add rbx, 0x10                       ; each Port Register Set is 4
@@ -495,6 +517,190 @@ xhci_noop_test:
     pop rbx
     ret
 
+; -------------------------------------------------------------------------
+; xhci_submit_command: generic command-ring submission, used by every
+; xHCI command from here on (Enable Slot, Address Device, Configure
+; Endpoint, ...) instead of duplicating xhci_noop_test's ring/doorbell/
+; poll dance at each call site. Writes a TRB at the current enqueue
+; slot, rings the command doorbell, and polls the event ring (bounded)
+; for the matching Command Completion Event.
+;
+; Input:  RDI = TRB Parameter (64-bit, command-specific -- e.g. an Input
+;         Context pointer for Address Device; 0 for Enable Slot),
+;         ESI = TRB Status (32-bit, command-specific; 0 for both of the
+;         above), ECX = TRB Type (6-bit value, e.g. 9=Enable Slot,
+;         11=Address Device -- NOT pre-shifted).
+; Output: EAX = 1 if a Command Completion Event was seen before the
+;         poll bound, 0 on timeout. On EAX=1: R12 = completion event's
+;         Parameter (bits 0-31 hold the Input/Device Context pointer
+;         low bits for some commands; unused for Enable Slot), R13D =
+;         completion event's Status (bits 24-31 = Completion Code, 1 =
+;         Success), R14D = completion event's Control (bits 24-31 =
+;         Slot ID assigned/addressed).
+; -------------------------------------------------------------------------
+xhci_submit_command:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+
+    mov r8, rdi                         ; r8 = TRB Parameter (survives the
+                                         ; ring-address math below)
+    mov r9d, esi                        ; r9d = TRB Status
+    mov edx, ecx                        ; edx = TRB Type
+
+    mov rax, [rel xhci_cmdring_enqueue]
+    lea rdi, [rel xhci_cmdring]
+    mov rcx, rax
+    shl rcx, 4                          ; * 16 bytes/TRB
+    add rdi, rcx
+
+    mov [rdi+0], r8                     ; Parameter
+    mov [rdi+8], r9d                    ; Status
+    mov eax, edx
+    shl eax, 10
+    mov rbx, [rel xhci_cmdring_cycle]
+    or eax, ebx                         ; Cycle bit
+    mov [rdi+12], eax
+
+    ; Advance the enqueue pointer, following the Link TRB (slot 255)
+    ; and toggling cycle state exactly as the controller will.
+    mov rax, [rel xhci_cmdring_enqueue]
+    inc rax
+    cmp rax, 255
+    jl .no_enq_wrap
+    xor rax, rax
+    mov rbx, [rel xhci_cmdring_cycle]
+    xor rbx, 1
+    mov [rel xhci_cmdring_cycle], rbx
+.no_enq_wrap:
+    mov [rel xhci_cmdring_enqueue], rax
+
+    mov rbx, [rel xhci_db_base]
+    mov dword [rbx+0], 0                ; ring doorbell 0 (command ring)
+
+    mov r9d, 20000000
+.poll:
+    mov rax, [rel xhci_evtring_dequeue]
+    lea rsi, [rel xhci_evtring]
+    mov rcx, rax
+    shl rcx, 4
+    add rsi, rcx                        ; rsi -> next event TRB slot
+
+    mov eax, [rsi+12]                   ; Control
+    mov ebx, eax
+    and ebx, 1                          ; this TRB's cycle bit
+    mov rdx, [rel xhci_evtring_cycle]
+    cmp ebx, edx
+    jne .not_yet
+
+    mov ecx, eax
+    shr ecx, 10
+    and ecx, 0x3F                       ; TRB Type
+    cmp ecx, XHCI_TRB_TYPE_CMD_COMPLETION
+    jne .advance_dequeue
+
+    mov r12, [rsi+0]                    ; completion Parameter
+    mov r13d, [rsi+8]                   ; completion Status
+    mov r14d, [rsi+12]                  ; completion Control
+    mov ebx, 1                          ; result, parked past the pops below
+    call .advance_dequeue_once
+    jmp .writeback
+
+.advance_dequeue:
+    call .advance_dequeue_once
+    jmp .poll
+
+.not_yet:
+    dec r9d
+    jnz .poll
+    xor ebx, ebx
+    jmp .writeback
+
+.advance_dequeue_once:
+    push rax
+    push rdx
+    mov rax, [rel xhci_evtring_dequeue]
+    inc rax
+    cmp rax, 256
+    jl .adv_no_wrap
+    xor rax, rax
+    mov rdx, [rel xhci_evtring_cycle]
+    xor rdx, 1
+    mov [rel xhci_evtring_cycle], rdx
+.adv_no_wrap:
+    mov [rel xhci_evtring_dequeue], rax
+    pop rdx
+    pop rax
+    ret
+
+.writeback:
+    mov rax, [rel xhci_rt_base]
+    add rax, 0x20
+    push rax
+    mov rax, [rel xhci_evtring_dequeue]
+    shl rax, 4
+    lea rdx, [rel xhci_evtring]
+    add rax, rdx
+    or al, 8                            ; EHB (write-1-clear)
+    pop rdx
+    mov [rdx+0x18], rax                 ; ERDP
+
+    mov eax, ebx
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_enable_slot: submits an Enable Slot Command and returns the Slot
+; ID the controller assigned. First real device-management command --
+; every later step (Address Device, Configure Endpoint, transfers) is
+; addressed by this Slot ID. Returns EAX = Slot ID (1-255) on success,
+; 0 on failure (no completion event, or a non-Success completion code).
+; -------------------------------------------------------------------------
+XHCI_TRB_TYPE_ENABLE_SLOT equ 9
+XHCI_COMPLETION_SUCCESS equ 1
+
+xhci_enable_slot:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    xor edi, edi                        ; Parameter = 0
+    xor esi, esi                        ; Status = 0
+    mov ecx, XHCI_TRB_TYPE_ENABLE_SLOT
+    call xhci_submit_command
+    test eax, eax
+    jz .fail
+
+    mov ebx, r13d
+    shr ebx, 24
+    and ebx, 0xFF                       ; Completion Code
+    cmp ebx, XHCI_COMPLETION_SUCCESS
+    jne .fail
+
+    mov eax, r14d
+    shr eax, 24
+    and eax, 0xFF                       ; Slot ID
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================
@@ -507,9 +713,12 @@ xhci_max_ports:   dd 0
 xhci_port_connected: times 32 db 0      ; 1 byte per port index (0-based);
                                          ; MaxPorts is an 8-bit HCSPARAMS1
                                          ; field, so 32 is a generous cap
+xhci_port_speed:  times 32 db 0         ; PORTSC bits 10-13 per port index
 xhci_caplength:   db 0
 xhci_hciversion:  dw 0
 xhci_hcsparams1:  dd 0
+xhci_hccparams1:  dd 0
+xhci_context_size: dd 32                ; 32 or 64 bytes/context, per CSZ
 xhci_slots_enabled: dd 0
 
 xhci_cmdring_cycle:    dq 0

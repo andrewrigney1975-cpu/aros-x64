@@ -1601,6 +1601,22 @@ xhci_probe_and_report:
     call serial_puts
     pop rax
     call dbg_hex64
+
+    test eax, eax
+    jz .out
+
+    call xhci_enable_slot
+    test eax, eax
+    jz .enable_slot_failed
+    push rax
+    lea rcx, [rel msg_xhci_slot_ok]
+    call serial_puts
+    pop rax
+    call dbg_hex64
+    jmp .out
+.enable_slot_failed:
+    lea rcx, [rel msg_xhci_slot_fail]
+    call serial_puts
     jmp .out
 .noop_failed:
     lea rcx, [rel msg_xhci_noop_fail]
@@ -3321,6 +3337,8 @@ msg_xhci_reset_fail:  db 'xHCI: reset/bring-up FAILED (timed out)', 13, 10, 0
 msg_xhci_noop_ok:     db 'xHCI: No-Op command completion event received OK', 13, 10, 0
 msg_xhci_noop_fail:   db 'xHCI: No-Op command FAILED (no completion event)', 13, 10, 0
 msg_xhci_ports:       db 'xHCI: ports with a device connected:', 13, 10, 0
+msg_xhci_slot_ok:     db 'xHCI: Enable Slot OK, slot ID:', 13, 10, 0
+msg_xhci_slot_fail:   db 'xHCI: Enable Slot FAILED', 13, 10, 0
 
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.
