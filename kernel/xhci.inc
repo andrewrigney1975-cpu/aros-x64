@@ -1819,6 +1819,408 @@ xhci_configure_endpoints:
     pop rbx
     ret
 
+; -------------------------------------------------------------------------
+; xhci_bulk_transfer: enqueues a single Normal TRB on the device's
+; Bulk IN or Bulk OUT ring (whichever the caller asks for -- direction
+; is implicit in which physical endpoint/ring is used, unlike control
+; transfers, so the TRB itself carries no DIR bit), rings that
+; endpoint's own doorbell (Target = its Device Context Index), and
+; polls for the resulting Transfer Event. This is the single building
+; block the BOT protocol's CBW/data-stage/CSW all reduce to. One TRB
+; is enough for every transfer this driver issues (CBW=31 bytes,
+; CSW=13 bytes, sector data well under a TRB's 64KB Transfer Length
+; limit at the block counts this driver deals with).
+;
+; Input:  ECX = Slot ID, RDI = buffer pointer, R8D = length in bytes,
+;         R9B = direction (1 = Bulk IN, 0 = Bulk OUT -- selects both
+;         the ring and the doorbell target).
+; Output: EAX = 1 on Success/Short-Packet completion, 0 on timeout or
+;         any other completion code.
+; -------------------------------------------------------------------------
+XHCI_TRB_TYPE_NORMAL equ 1
+
+xhci_bulk_transfer:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r14d, ecx                       ; r14d = Slot ID
+    mov bl, r9b                         ; bl = direction (rbx is pushed,
+                                         ; safe scratch for the rest of
+                                         ; this routine)
+
+    cmp bl, 1
+    je .pick_in
+    lea r10, [rel xhci_bulk_out_ring]
+    lea r11, [rel xhci_bulk_out_ring_cycle]
+    lea r12, [rel xhci_bulk_out_ring_enqueue]
+    mov r15d, [rel xhci_bulk_out_ep_index]
+    jmp .picked
+.pick_in:
+    lea r10, [rel xhci_bulk_in_ring]
+    lea r11, [rel xhci_bulk_in_ring_cycle]
+    lea r12, [rel xhci_bulk_in_ring_enqueue]
+    mov r15d, [rel xhci_bulk_in_ep_index]
+.picked:
+
+    ; RDI already holds the buffer pointer (this routine's own input
+    ; register matches xhci_ring_enqueue_trb's Parameter input).
+    mov esi, r8d                        ; Status = TRB Transfer Length
+    mov eax, XHCI_TRB_TYPE_NORMAL
+    shl eax, 10
+    or eax, (1 << 5)                    ; IOC
+    mov edx, eax
+    call xhci_ring_enqueue_trb
+
+    ; Ring this endpoint's own doorbell (Target = its DCI).
+    mov rbx, [rel xhci_db_base]
+    mov rcx, r14
+    shl rcx, 2
+    mov dword [rbx+rcx], r15d
+
+    mov r9d, 20000000
+.poll:
+    mov rax, [rel xhci_evtring_dequeue]
+    lea rsi, [rel xhci_evtring]
+    mov rcx, rax
+    shl rcx, 4
+    add rsi, rcx
+
+    mov eax, [rsi+12]                   ; Control
+    mov ebx, eax
+    and ebx, 1
+    mov rdx, [rel xhci_evtring_cycle]
+    cmp ebx, edx
+    jne .not_yet
+
+    mov ecx, eax
+    shr ecx, 10
+    and ecx, 0x3F                       ; TRB Type
+    cmp ecx, XHCI_TRB_TYPE_TRANSFER_EVENT
+    jne .advance_dequeue
+
+    mov eax, [rsi+8]                    ; completion Status
+    shr eax, 24
+    and eax, 0xFF                       ; Completion Code
+    mov ebx, 0
+    cmp eax, XHCI_COMPLETION_SUCCESS
+    je .mark_ok
+    cmp eax, XHCI_COMPLETION_SHORT_PACKET
+    jne .not_ok
+.mark_ok:
+    mov ebx, 1
+.not_ok:
+    call .advance_dequeue_once
+    jmp .writeback
+
+.advance_dequeue:
+    call .advance_dequeue_once
+    jmp .poll
+
+.not_yet:
+    dec r9d
+    jnz .poll
+    xor ebx, ebx
+    jmp .writeback
+
+.advance_dequeue_once:
+    push rax
+    push rdx
+    mov rax, [rel xhci_evtring_dequeue]
+    inc rax
+    cmp rax, 256
+    jl .adv_no_wrap
+    xor rax, rax
+    mov rdx, [rel xhci_evtring_cycle]
+    xor rdx, 1
+    mov [rel xhci_evtring_cycle], rdx
+.adv_no_wrap:
+    mov [rel xhci_evtring_dequeue], rax
+    pop rdx
+    pop rax
+    ret
+
+.writeback:
+    mov rax, [rel xhci_rt_base]
+    add rax, 0x20
+    push rax
+    mov rax, [rel xhci_evtring_dequeue]
+    shl rax, 4
+    lea rdx, [rel xhci_evtring]
+    add rax, rdx
+    or al, 8                            ; EHB (write-1-clear)
+    pop rdx
+    mov [rdx+0x18], rax                 ; ERDP
+
+    mov eax, ebx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_msd_command: the USB Mass Storage Bulk-Only Transport protocol,
+; built on xhci_bulk_transfer -- send a 31-byte Command Block Wrapper
+; on Bulk OUT carrying the caller's SCSI CDB, transfer the data phase
+; (if any) in the direction the caller asks, then read back the
+; 13-byte Command Status Wrapper on Bulk IN and check its signature/
+; tag/status. This is the one routine every SCSI command (INQUIRY,
+; READ CAPACITY, READ(10), WRITE(10)) funnels through.
+;
+; Input:  ECX = Slot ID, RSI = pointer to the SCSI CDB bytes (up to 16),
+;         R8B = CDB length, RDI = data buffer pointer (0 if this
+;         command has no data phase), R10D = data length in bytes (0
+;         if none), R11B = data direction (1 = IN, 0 = OUT; only
+;         meaningful when R10D != 0).
+; Output: EAX = 1 on a clean CBW send + data phase (if any) + a CSW
+;         reporting bCSWStatus=0 (Good) with a matching signature and
+;         tag; 0 on any failure along the way.
+; -------------------------------------------------------------------------
+XHCI_CBW_SIGNATURE equ 0x43425355
+XHCI_CSW_SIGNATURE equ 0x53425355
+
+xhci_msd_command:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+
+    mov r12d, ecx                       ; r12d = Slot ID
+    mov r13, rdi                        ; r13 = data buffer pointer
+    mov r14d, r10d                      ; r14d = data length
+    mov bl, r11b                        ; bl = data direction
+
+    ; Build the CBW.
+    lea rdi, [rel xhci_cbw_buffer]
+    mov dword [rdi+0], XHCI_CBW_SIGNATURE
+    mov eax, [rel xhci_msd_tag]
+    inc eax
+    mov [rel xhci_msd_tag], eax
+    mov [rdi+4], eax                    ; dCBWTag
+    mov [rdi+8], r14d                   ; dCBWDataTransferLength
+    mov byte [rdi+12], 0
+    cmp bl, 1
+    jne .cbw_flags_out
+    mov byte [rdi+12], 0x80             ; bmCBWFlags: data-in
+.cbw_flags_out:
+    mov byte [rdi+13], 0                ; bCBWLUN
+    mov byte [rdi+14], r8b              ; bCBWCBLength
+
+    lea rdi, [rel xhci_cbw_buffer]
+    add rdi, 15                         ; -> CBWCB[16]
+    xor eax, eax
+    mov ecx, 16
+    cld
+    rep stosb                           ; zero-pad the full 16 bytes...
+    lea rdi, [rel xhci_cbw_buffer]
+    add rdi, 15
+    movzx ecx, r8b
+    cld
+    rep movsb                           ; ...then copy the real CDB over it
+
+    ; Send the CBW (always Bulk OUT, always exactly 31 bytes).
+    mov ecx, r12d
+    lea rdi, [rel xhci_cbw_buffer]
+    mov r8d, 31
+    xor r9d, r9d                        ; OUT
+    call xhci_bulk_transfer
+    test eax, eax
+    jz .fail
+
+    ; Data phase, if the caller has one.
+    test r14d, r14d
+    jz .no_data_phase
+    mov ecx, r12d
+    mov rdi, r13
+    mov r8d, r14d
+    mov r9b, bl
+    call xhci_bulk_transfer
+    test eax, eax
+    jz .fail
+.no_data_phase:
+
+    ; Read the CSW.
+    mov ecx, r12d
+    lea rdi, [rel xhci_csw_buffer]
+    mov r8d, 13
+    mov r9d, 1                          ; IN
+    call xhci_bulk_transfer
+    test eax, eax
+    jz .fail
+
+    lea rdi, [rel xhci_csw_buffer]
+    cmp dword [rdi+0], XHCI_CSW_SIGNATURE
+    jne .fail
+    mov eax, [rel xhci_msd_tag]
+    cmp [rdi+4], eax
+    jne .fail
+    cmp byte [rdi+12], 0                ; bCSWStatus = Good
+    jne .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_msd_inquiry: issues SCSI INQUIRY (allocation length 36) via
+; xhci_msd_command, filling xhci_msd_inquiry_data. Mainly a proof
+; point that the whole CBW/data/CSW pipeline works end to end before
+; trusting it for READ CAPACITY / READ(10) / WRITE(10).
+;
+; Input:  ECX = Slot ID.
+; Output: EAX = 1/0.
+; -------------------------------------------------------------------------
+xhci_msd_inquiry:
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    push r10
+    push r11
+
+    mov r8d, ecx
+
+    lea rdi, [rel xhci_msd_cdb]
+    xor eax, eax
+    mov ecx, 16
+    cld
+    rep stosb
+    mov byte [rel xhci_msd_cdb+0], 0x12     ; INQUIRY
+    mov byte [rel xhci_msd_cdb+4], 36       ; allocation length
+
+    mov ecx, r8d
+    lea rsi, [rel xhci_msd_cdb]
+    mov r8b, 6                          ; CDB length
+    lea rdi, [rel xhci_msd_inquiry_data]
+    mov r10d, 36
+    mov r11b, 1                         ; IN
+    call xhci_msd_command
+
+    pop r11
+    pop r10
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_msd_read_capacity: issues SCSI READ CAPACITY(10) via
+; xhci_msd_command, converting the big-endian response fields into
+; xhci_msd_sector_count (the highest valid LBA, not a count -- callers
+; needing a count add 1) and xhci_msd_sector_size.
+;
+; Input:  ECX = Slot ID.
+; Output: EAX = 1/0.
+; -------------------------------------------------------------------------
+xhci_msd_read_capacity:
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    push r10
+    push r11
+
+    mov r8d, ecx
+
+    lea rdi, [rel xhci_msd_cdb]
+    xor eax, eax
+    mov ecx, 16
+    cld
+    rep stosb
+    mov byte [rel xhci_msd_cdb+0], 0x25     ; READ CAPACITY(10)
+
+    mov ecx, r8d
+    lea rsi, [rel xhci_msd_cdb]
+    mov r8b, 10
+    lea rdi, [rel xhci_msd_read_capacity_data]
+    mov r10d, 8
+    mov r11b, 1                         ; IN
+    call xhci_msd_command
+    test eax, eax
+    jz .fail
+
+    lea rsi, [rel xhci_msd_read_capacity_data]
+    movzx eax, byte [rsi+0]
+    shl eax, 24
+    movzx ecx, byte [rsi+1]
+    shl ecx, 16
+    or eax, ecx
+    movzx ecx, byte [rsi+2]
+    shl ecx, 8
+    or eax, ecx
+    movzx ecx, byte [rsi+3]
+    or eax, ecx
+    mov [rel xhci_msd_sector_count], eax     ; highest valid LBA
+
+    movzx eax, byte [rsi+4]
+    shl eax, 24
+    movzx ecx, byte [rsi+5]
+    shl ecx, 16
+    or eax, ecx
+    movzx ecx, byte [rsi+6]
+    shl ecx, 8
+    or eax, ecx
+    movzx ecx, byte [rsi+7]
+    or eax, ecx
+    mov [rel xhci_msd_sector_size], eax
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r11
+    pop r10
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================
@@ -1894,3 +2296,18 @@ align 4096
 xhci_bulk_in_ring:  times 4096 db 0
 align 4096
 xhci_bulk_out_ring: times 4096 db 0
+
+xhci_msd_tag: dd 0
+
+align 16
+xhci_cbw_buffer: times 31 db 0
+align 16
+xhci_csw_buffer: times 13 db 0
+align 16
+xhci_msd_cdb: times 16 db 0
+align 16
+xhci_msd_inquiry_data: times 36 db 0
+align 16
+xhci_msd_read_capacity_data: times 8 db 0
+xhci_msd_sector_count: dd 0             ; highest valid LBA (not a count)
+xhci_msd_sector_size:  dd 0

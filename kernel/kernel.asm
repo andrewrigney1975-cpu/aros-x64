@@ -1716,14 +1716,46 @@ xhci_probe_and_report:
     call serial_puts
 
     pop rcx                             ; slot ID
+    push rcx
     call xhci_configure_endpoints
     test eax, eax
-    jz .configure_ep_failed
-    lea rcx, [rel msg_xhci_configep_ok]
+    jnz .configure_ep_ok
+    add rsp, 8
+    lea rcx, [rel msg_xhci_configep_fail]
     call serial_puts
     jmp .out
-.configure_ep_failed:
-    lea rcx, [rel msg_xhci_configep_fail]
+.configure_ep_ok:
+    lea rcx, [rel msg_xhci_configep_ok]
+    call serial_puts
+
+    pop rcx                             ; slot ID
+    push rcx
+    call xhci_msd_inquiry
+    test eax, eax
+    jnz .inquiry_ok
+    add rsp, 8
+    lea rcx, [rel msg_xhci_inquiry_fail]
+    call serial_puts
+    jmp .out
+.inquiry_ok:
+    lea rcx, [rel msg_xhci_inquiry_ok]
+    call serial_puts
+    movzx eax, byte [rel xhci_msd_inquiry_data+8]    ; T10 Vendor ID, byte 0
+    call dbg_hex64
+
+    pop rcx                             ; slot ID
+    call xhci_msd_read_capacity
+    test eax, eax
+    jz .read_capacity_failed
+    lea rcx, [rel msg_xhci_readcap_ok]
+    call serial_puts
+    mov eax, [rel xhci_msd_sector_count]
+    call dbg_hex64
+    mov eax, [rel xhci_msd_sector_size]
+    call dbg_hex64
+    jmp .out
+.read_capacity_failed:
+    lea rcx, [rel msg_xhci_readcap_fail]
     call serial_puts
     jmp .out
 .address_device_failed:
@@ -3472,6 +3504,10 @@ msg_xhci_setcfg_ok:   db 'xHCI: SET_CONFIGURATION OK', 13, 10, 0
 msg_xhci_setcfg_fail: db 'xHCI: SET_CONFIGURATION FAILED', 13, 10, 0
 msg_xhci_configep_ok:   db 'xHCI: Configure Endpoint (Bulk IN/OUT) OK', 13, 10, 0
 msg_xhci_configep_fail: db 'xHCI: Configure Endpoint (Bulk IN/OUT) FAILED', 13, 10, 0
+msg_xhci_inquiry_ok:    db 'xHCI: USB MSD SCSI INQUIRY OK, vendor ID byte0:', 13, 10, 0
+msg_xhci_inquiry_fail:  db 'xHCI: USB MSD SCSI INQUIRY FAILED', 13, 10, 0
+msg_xhci_readcap_ok:    db 'xHCI: USB MSD READ CAPACITY(10) OK, last LBA/sector size:', 13, 10, 0
+msg_xhci_readcap_fail:  db 'xHCI: USB MSD READ CAPACITY(10) FAILED', 13, 10, 0
 
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.
