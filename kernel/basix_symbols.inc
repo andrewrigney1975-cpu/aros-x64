@@ -12,6 +12,22 @@ BASIX_MAX_LABELS  equ 32
 BASIX_MAX_FIXUPS  equ 64
 BASIX_MAX_FOR_DEPTH equ 8
 
+; var_type encoding continued (0=INT,1=SFLOAT,2=DFLOAT,3=VECTOR2,
+; 4=VECTOR3,5=VECTOR4,6=MATRIX4 -- see basix_parser.inc's DIM parsing):
+; 1D arrays are 7/8. Both SFLOAT and DFLOAT array elements use
+; BASIX_VARTYPE_ARRAY_FLOAT (8-byte double storage per element either
+; way) -- unlike scalar SFLOAT, arrays don't get the 4-byte-per-element
+; packing, a deliberate simplification since nothing here needs the
+; memory savings and it avoids array code needing to track a second,
+; smaller element size.
+BASIX_VARTYPE_ARRAY_INT   equ 7
+BASIX_VARTYPE_ARRAY_FLOAT equ 8
+
+BASIX_ARRAY_ARENA_SIZE equ 262144        ; 256KB, bump-allocated by DIM's
+                                          ; array path; ~32K doubles total
+                                          ; across however many arrays a
+                                          ; program declares
+
 ; -------------------------------------------------------------------------
 ; basix_name_eq: RCX = candidate ptr, EDX = candidate len, R8 = stored
 ; name field (32 bytes, NUL-padded, already upper-case). Returns EAX=1/0,
@@ -418,6 +434,11 @@ basix_var_slots: times BASIX_MAX_VARS dq 0
 
 align 8
 basix_var_wide_slots: times (BASIX_MAX_VARS * 128) db 0
+
+basix_var_arr_len: times BASIX_MAX_VARS dd 0   ; element count, arrays only
+basix_array_arena_pos: dd 0
+align 8
+basix_array_arena: times BASIX_ARRAY_ARENA_SIZE db 0
 
 align 8
 basix_vec_scalar_temp: dq 0              ; accumulator for dot/length/matmul

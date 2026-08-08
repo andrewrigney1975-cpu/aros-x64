@@ -1345,11 +1345,21 @@ basix_parse_primary:
     mov r9d, [rel basix_var_type + r10*4]
     call basix_lex_next                   ; consume the identifier
 
+    cmp r9d, BASIX_VARTYPE_ARRAY_INT
+    je .ident_array
+    cmp r9d, BASIX_VARTYPE_ARRAY_FLOAT
+    je .ident_array
+
     cmp dword [rel basix_tok_type], TOK_LBRACKET
     jne .ident_no_index
 
     ; indexed access: v[N] -- N must be an integer literal (v1 scope;
-    ; no runtime-computed indices).
+    ; no runtime-computed indices). Real 1D arrays (BASIX_VARTYPE_
+    ; ARRAY_INT/ARRAY_FLOAT) are handled separately below in
+    ; .ident_array, which DOES support a runtime-computed index --
+    ; this compile-time-constant-only path stays exactly as it was for
+    ; VECTOR2/3/4/MATRIX4 component access, since there's no reason to
+    ; add runtime-index overhead there.
     call basix_lex_next                   ; consume '['
     cmp dword [rel basix_tok_type], TOK_INT
     jne .index_bad
@@ -1368,6 +1378,109 @@ basix_parse_primary:
     pop r12
     ret
 .index_bad:
+    mov dword [rel basix_compile_ok], 0
+    mov r11d, 2
+    pop r12
+    ret
+
+; -------------------------------------------------------------------------
+; .ident_array: arr[i] read, i a general runtime expression (not just a
+; literal). Emits a bounds check (index unsigned >= length, so a
+; negative index -- reinterpreted as a huge unsigned value -- fails
+; the same single compare a too-large index does) before computing
+; base+index*8 and loading; out of range silently yields 0/0.0 rather
+; than touching memory outside the array, matching basix_rt_pset's
+; silent-clip precedent (basix_runtime.inc) since this compiler has no
+; runtime error/panic mechanism to invent one for here.
+; -------------------------------------------------------------------------
+.ident_array:
+    push r13
+
+    cmp dword [rel basix_tok_type], TOK_LBRACKET
+    jne .index_bad_arr
+    call basix_lex_next                   ; consume '['
+    push r9                               ; preserve this array's own
+    push r10                              ; var_type/var_index across
+                                           ; the index expression -- it
+                                           ; may itself reference another
+                                           ; variable, recursing back
+                                           ; into .ident and clobbering
+                                           ; r9/r10 as THAT call's own
+                                           ; scratch (real bug, caught
+                                           ; via "nums[i]" printing 0.0
+                                           ; instead of nums[i]'s value)
+    call basix_parse_arith                ; index expr; r11d = type
+    pop r10
+    pop r9
+    test r11d, r11d
+    jz .arr_idx_int
+    call basix_emit_cvttsd2si_rax_x0
+.arr_idx_int:
+    mov eax, TOK_RBRACKET
+    call basix_expect
+
+    mov eax, [rel basix_var_arr_len + r10*4]
+    call basix_emit_mov_rcx_imm64
+    call basix_emit_cmp_rax_rcx
+    mov al, 0x83                          ; JAE (unsigned >=)
+    call basix_emit_jcc_placeholder
+    mov r12, rax                          ; out-of-range patch address
+
+    mov eax, 8
+    call basix_emit_mov_rcx_imm64
+    call basix_emit_imul_rax_rcx          ; rax = index*8
+    mov eax, r10d
+    call basix_var_slot_addr
+    mov rax, [rax]                        ; this array's base address
+                                           ; (a compile-time-known value:
+                                           ; DIM already wrote it into
+                                           ; the var's slot earlier in
+                                           ; this same compile pass)
+    call basix_emit_mov_rcx_imm64
+    call basix_emit_add_rax_rcx           ; rax = base + index*8
+
+    cmp r9d, BASIX_VARTYPE_ARRAY_INT
+    je .arr_read_int_ok
+    call basix_emit_movsd_load_rax
+    jmp .arr_read_jmp_done
+.arr_read_int_ok:
+    call basix_emit_mov_rax_memrax
+.arr_read_jmp_done:
+    call basix_emit_jmp_placeholder
+    mov r13, rax                          ; skip-the-zero-path patch addr
+
+    call basix_emit_here                  ; out-of-range lands here
+    mov rcx, r12
+    mov rdx, rax
+    call basix_patch_rel32
+
+    cmp r9d, BASIX_VARTYPE_ARRAY_INT
+    je .arr_read_zero_int
+    call basix_emit_pxor_xmm0_xmm0
+    jmp .arr_read_zero_done
+.arr_read_zero_int:
+    xor eax, eax
+    call basix_emit_mov_rax_imm64
+.arr_read_zero_done:
+
+    call basix_emit_here
+    mov rcx, r13
+    mov rdx, rax
+    call basix_patch_rel32
+
+    pop r13
+    cmp r9d, BASIX_VARTYPE_ARRAY_INT
+    je .arr_read_result_int
+    mov r11d, 2
+    pop r12
+    ret
+.arr_read_result_int:
+    xor r11d, r11d
+    pop r12
+    ret
+
+.index_bad_arr:
+    pop r13
     mov dword [rel basix_compile_ok], 0
     mov r11d, 2
     pop r12
@@ -1772,6 +1885,7 @@ basix_parse_assignment:
     push rbx
     push rdx
     push r12
+    push r13
 
     mov rbx, [rel basix_tok_text]
     mov edx, [rel basix_tok_len]
@@ -1781,7 +1895,16 @@ basix_parse_assignment:
     pop rdx
     push rax
 
+    mov r13d, eax                        ; r13d = var index (also needed
+                                          ; by the array-write path)
+    mov r12d, [rel basix_var_type + r13*4]
+
     call basix_lex_next
+
+    cmp r12d, BASIX_VARTYPE_ARRAY_INT
+    je .assign_array
+    cmp r12d, BASIX_VARTYPE_ARRAY_FLOAT
+    je .assign_array
 
     cmp dword [rel basix_tok_type], TOK_LBRACKET
     jne .no_index
@@ -1811,8 +1934,118 @@ basix_parse_assignment:
     call basix_parse_arith              ; r11d = expr type
     pop rax
     call basix_emit_store_var
+    jmp .done
+
+; -------------------------------------------------------------------------
+; .assign_array: arr[i] = expr, i a general runtime expression. The
+; index is parsed (and pushed, via EMITTED code -- this is the
+; compiled program's own runtime stack, not this parser's) before the
+; value expression, since parsing the value clobbers RAX/XMM0 exactly
+; like parsing the index did; popping the index back afterward is
+; what lets both survive to the final address computation.
+;
+; INT and FLOAT arrays take genuinely different register shapes: a
+; float value lives in XMM0, never contending with the RAX/RCX the
+; index+address math uses, so it needs no extra care. An int value
+; DOES live in a GP register, so the index+address math is done
+; through RAX/RDX instead of the usual RAX/RCX specifically to leave
+; RCX free to hold the value untouched across it (see
+; basix_i_imul_rax_rdx/add_rax_rdx/cmp_rax_rdx in basix_codegen.inc).
+; -------------------------------------------------------------------------
+.assign_array:
+    pop rax                              ; drop the pushed var index --
+                                          ; already have it in r13d
+    cmp dword [rel basix_tok_type], TOK_LBRACKET
+    jne .assign_array_bad
+    call basix_lex_next                  ; consume '['
+    call basix_parse_arith               ; index expr; r11d = type
+    test r11d, r11d
+    jz .aidx_int
+    call basix_emit_cvttsd2si_rax_x0
+.aidx_int:
+    mov eax, TOK_RBRACKET
+    call basix_expect
+    call basix_emit_push_rax             ; save index (emitted code)
+
+    mov eax, TOK_EQ
+    call basix_expect
+    call basix_parse_arith               ; value expr; r11d = type
+
+    cmp r12d, BASIX_VARTYPE_ARRAY_INT
+    je .aval_int
+
+    ; FLOAT array: coerce the value to float (XMM0), then recover the
+    ; index into RAX -- XMM0 survives basix_emit_pop_rax untouched.
+    test r11d, r11d
+    jnz .aval_float_ready
+    call basix_emit_cvtsi2sd_x0_rax
+.aval_float_ready:
+    call basix_emit_pop_rax              ; rax = index, xmm0 = value
+
+    mov eax, [rel basix_var_arr_len + r13*4]
+    call basix_emit_mov_rcx_imm64
+    call basix_emit_cmp_rax_rcx
+    mov al, 0x83                          ; JAE
+    call basix_emit_jcc_placeholder
+    push rax                              ; skip-store patch addr
+
+    mov eax, 8
+    call basix_emit_mov_rcx_imm64
+    call basix_emit_imul_rax_rcx
+    mov eax, r13d
+    call basix_var_slot_addr
+    mov rax, [rax]
+    call basix_emit_mov_rcx_imm64
+    call basix_emit_add_rax_rcx
+    call basix_emit_movsd_store_rax
+
+    call basix_emit_here
+    pop rcx
+    mov rdx, rax
+    call basix_patch_rel32
+    jmp .done
+
+.aval_int:
+    ; INT array: coerce the value to int (RAX), then push it (so both
+    ; index and value ride the emitted stack) and pop them back out in
+    ; RCX (value) / RAX (index) -- freeing RAX for the address math
+    ; while RCX holds the value untouched throughout.
+    test r11d, r11d
+    jz .aval_int_ready
+    call basix_emit_cvttsd2si_rax_x0
+.aval_int_ready:
+    call basix_emit_push_rax             ; save value
+    call basix_emit_pop_rcx              ; rcx = value
+    call basix_emit_pop_rax              ; rax = index
+
+    mov eax, [rel basix_var_arr_len + r13*4]
+    call basix_emit_mov_rdx_imm64
+    call basix_emit_cmp_rax_rdx
+    mov al, 0x83                          ; JAE
+    call basix_emit_jcc_placeholder
+    push rax                              ; skip-store patch addr
+
+    mov eax, 8
+    call basix_emit_mov_rdx_imm64
+    call basix_emit_imul_rax_rdx
+    mov eax, r13d
+    call basix_var_slot_addr
+    mov rax, [rax]
+    call basix_emit_mov_rdx_imm64
+    call basix_emit_add_rax_rdx
+    call basix_emit_mov_memrax_rcx
+
+    call basix_emit_here
+    pop rcx
+    mov rdx, rax
+    call basix_patch_rel32
+    jmp .done
+
+.assign_array_bad:
+    mov dword [rel basix_compile_ok], 0
 
 .done:
+    pop r13
     pop r12
     pop rdx
     pop rbx
@@ -2116,12 +2349,32 @@ basix_parse_print_list:
 ; basix_parse_dim: DIM keyword already consumed.
 ; -------------------------------------------------------------------------
 basix_parse_dim:
+    push r12
+    push r13
+
     cmp dword [rel basix_tok_type], TOK_IDENT
     jne .bail
 
     push qword [rel basix_tok_text]
     push qword [rel basix_tok_len]
     call basix_lex_next
+
+    ; Optional "(size)" -- an array declaration. r12d = element count,
+    ; 0 meaning "not an array" (the ordinary scalar/vector/matrix path,
+    ; unchanged from before arrays existed).
+    xor r12d, r12d
+    cmp dword [rel basix_tok_type], TOK_LPAREN
+    jne .no_arrsize
+    call basix_lex_next                  ; consume '('
+    cmp dword [rel basix_tok_type], TOK_INT
+    jne .bail_after_push
+    mov r12, [rel basix_tok_ival]
+    cmp r12, 1
+    jl .bail_after_push                  ; zero/negative-sized array
+    call basix_lex_next                  ; consume the size literal
+    mov eax, TOK_RPAREN
+    call basix_expect
+.no_arrsize:
 
     mov eax, TOK_AS
     call basix_expect
@@ -2160,19 +2413,65 @@ basix_parse_dim:
 .type_ok:
     call basix_lex_next
 
+    test r12d, r12d
+    jz .not_array
+    cmp r8d, 2
+    ja .bail_after_push                  ; array of VECTOR*/MATRIX4: no
+    mov r13d, BASIX_VARTYPE_ARRAY_FLOAT
+    test r8d, r8d
+    jnz .arr_kind_set
+    mov r13d, BASIX_VARTYPE_ARRAY_INT
+.arr_kind_set:
+    mov r8d, r13d
+.not_array:
+
     pop rdx
     pop rcx
+    push r12
     push r8
     call basix_var_find_or_create
     pop r8
+    pop r12
     mov [rel basix_var_type + rax*4], r8d
-    ret
+
+    test r12d, r12d
+    jz .out                              ; scalar/vector/matrix: done
+
+    ; Array: bump-allocate r12*8 bytes from the array arena, record the
+    ; base address in this variable's (otherwise-unused-by-arrays) 8-
+    ; byte scalar slot and the element count in basix_var_arr_len.
+    mov r13d, eax                        ; r13d = this variable's index
+    mov ecx, r12d
+    shl ecx, 3                           ; bytes needed = size * 8
+    mov edx, [rel basix_array_arena_pos]
+    add edx, ecx
+    cmp edx, BASIX_ARRAY_ARENA_SIZE
+    ja .arena_overflow
+
+    mov eax, [rel basix_array_arena_pos]
+    lea rcx, [rel basix_array_arena]
+    add rcx, rax                         ; rcx = this array's base address
+    mov [rel basix_array_arena_pos], edx
+
+    mov eax, r13d
+    call basix_var_slot_addr
+    mov [rax], rcx
+    mov eax, r13d
+    mov [rel basix_var_arr_len + rax*4], r12d
+    jmp .out
+
+.arena_overflow:
+    mov dword [rel basix_compile_ok], 0
+    jmp .out
 
 .bail_after_push:
     pop rdx
     pop rcx
 .bail:
     mov dword [rel basix_compile_ok], 0
+.out:
+    pop r13
+    pop r12
     ret
 
 ; -------------------------------------------------------------------------
@@ -2440,6 +2739,7 @@ basix_compile:
     mov dword [rel basix_label_count], 0
     mov dword [rel basix_fixup_count], 0
     mov dword [rel basix_for_depth], 0
+    mov dword [rel basix_array_arena_pos], 0
 
     call basix_lex_init
     call basix_lex_next
