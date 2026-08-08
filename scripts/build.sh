@@ -16,3 +16,6 @@ if [[ -f "$ROOT/kernel/kernel.asm" ]]; then
 fi
 
 echo "Build OK -> $ROOT/disk"
+
+PYTHON="$(command -v python3 || command -v python)"
+"$PYTHON" "$ROOT/scripts/make_image.py"
