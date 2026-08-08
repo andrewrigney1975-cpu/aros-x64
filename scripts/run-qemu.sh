@@ -20,6 +20,7 @@ ARGS=(
   -drive file=fat:rw:"$DISK",format=raw,if=ide
   -drive if=none,id=nvmedisk,file="$EXFAT_VHD",format=vpc
   -device nvme,drive=nvmedisk,serial=deadbeef01
+  -device qemu-xhci,id=xhci0
   -net none
 )
 

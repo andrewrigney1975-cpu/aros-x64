@@ -59,6 +59,7 @@ entry:
     call storage_init_and_test
     call msi_test
     call nvme_init_and_test
+    call xhci_probe_and_report
 
     call exfat_mount
     test eax, eax
@@ -1556,6 +1557,34 @@ nvme_init_and_test:
     pop rsi
     pop rdx
     pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_probe_and_report: calls xhci_find_and_probe and prints what it
+; found (or that nothing was found) -- read-only detection/reporting
+; step, no controller reset or ring bring-up yet.
+; -------------------------------------------------------------------------
+xhci_probe_and_report:
+    push rax
+
+    call xhci_find_and_probe
+    test eax, eax
+    jz .not_found
+
+    lea rcx, [rel msg_xhci_ok]
+    call serial_puts
+    movzx eax, byte [rel xhci_caplength]
+    call dbg_hex64
+    movzx eax, word [rel xhci_hciversion]
+    call dbg_hex64
+    mov eax, [rel xhci_hcsparams1]
+    call dbg_hex64
+    jmp .out
+.not_found:
+    lea rcx, [rel msg_xhci_not_found]
+    call serial_puts
+.out:
     pop rax
     ret
 
@@ -3256,6 +3285,9 @@ msg_nvme_init_fail:   db 'NVMe: controller/queue init failed', 13, 10, 0
 msg_nvme_read_fail:   db 'NVMe: LBA0 read failed/timed out', 13, 10, 0
 msg_nvme_ok:          db 'NVMe: LBA0 read OK', 13, 10, 0
 
+msg_xhci_not_found:   db 'xHCI: no controller found', 13, 10, 0
+msg_xhci_ok:          db 'xHCI: controller found (CAPLENGTH, HCIVERSION, HCSPARAMS1):', 13, 10, 0
+
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.
 ; -------------------------------------------------------------------------
@@ -3295,6 +3327,7 @@ gdt_descriptor:
 %include "pci.inc"
 %include "ahci.inc"
 %include "nvme.inc"
+%include "xhci.inc"
 %include "storage.inc"
 %include "exfat.inc"
 %include "keyboard.inc"
