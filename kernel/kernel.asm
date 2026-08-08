@@ -1655,9 +1655,17 @@ xhci_probe_and_report:
     call serial_puts
 
     pop rcx                             ; slot ID
+    push rcx                            ; ...and re-save it, needed again
+                                         ; below after serial_puts clobbers
+                                         ; ecx
     call xhci_get_device_descriptor
     test eax, eax
-    jz .get_desc_failed
+    jnz .get_desc_ok
+    add rsp, 8                          ; drop the re-pushed slot ID
+    lea rcx, [rel msg_xhci_desc_fail]
+    call serial_puts
+    jmp .out
+.get_desc_ok:
     lea rcx, [rel msg_xhci_desc_ok]
     call serial_puts
     movzx eax, byte [rel xhci_device_descriptor+8]   ; idVendor low byte
@@ -1670,9 +1678,24 @@ xhci_probe_and_report:
     shl ecx, 8
     or eax, ecx
     call dbg_hex64
+
+    pop rcx                             ; slot ID
+    call xhci_get_config_descriptor
+    test eax, eax
+    jz .get_config_failed
+    lea rcx, [rel msg_xhci_config_ok]
+    call serial_puts
+    mov eax, [rel xhci_bulk_in_ep_index]
+    call dbg_hex64
+    mov eax, [rel xhci_bulk_out_ep_index]
+    call dbg_hex64
+    mov eax, [rel xhci_bulk_in_max_packet]
+    call dbg_hex64
+    mov eax, [rel xhci_bulk_out_max_packet]
+    call dbg_hex64
     jmp .out
-.get_desc_failed:
-    lea rcx, [rel msg_xhci_desc_fail]
+.get_config_failed:
+    lea rcx, [rel msg_xhci_config_fail]
     call serial_puts
     jmp .out
 .address_device_failed:
@@ -3415,6 +3438,8 @@ msg_xhci_addr_ok:     db 'xHCI: Address Device OK', 13, 10, 0
 msg_xhci_addr_fail:   db 'xHCI: Address Device FAILED', 13, 10, 0
 msg_xhci_desc_ok:     db 'xHCI: GET_DESCRIPTOR(Device) OK, idVendor/idProduct:', 13, 10, 0
 msg_xhci_desc_fail:   db 'xHCI: GET_DESCRIPTOR(Device) FAILED', 13, 10, 0
+msg_xhci_config_ok:   db 'xHCI: GET_DESCRIPTOR(Config) OK, bulk in/out EP index, in/out max packet:', 13, 10, 0
+msg_xhci_config_fail: db 'xHCI: GET_DESCRIPTOR(Config) FAILED (no BOT mass-storage interface found)', 13, 10, 0
 
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.
