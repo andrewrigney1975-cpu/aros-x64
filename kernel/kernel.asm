@@ -1641,11 +1641,38 @@ xhci_probe_and_report:
     call serial_puts
 
     pop rcx                             ; slot ID
+    push rcx                            ; ...and re-save it -- serial_puts
+                                         ; clobbers ecx, and it's needed
+                                         ; again for xhci_get_device_descriptor
     lea rdi, [rel xhci_input_ctx]
     call xhci_address_device
     test eax, eax
-    jz .address_device_failed
+    jnz .address_device_ok
+    add rsp, 8                          ; drop the re-pushed slot ID
+    jmp .address_device_failed
+.address_device_ok:
     lea rcx, [rel msg_xhci_addr_ok]
+    call serial_puts
+
+    pop rcx                             ; slot ID
+    call xhci_get_device_descriptor
+    test eax, eax
+    jz .get_desc_failed
+    lea rcx, [rel msg_xhci_desc_ok]
+    call serial_puts
+    movzx eax, byte [rel xhci_device_descriptor+8]   ; idVendor low byte
+    movzx ecx, byte [rel xhci_device_descriptor+9]   ; idVendor high byte
+    shl ecx, 8
+    or eax, ecx
+    call dbg_hex64
+    movzx eax, byte [rel xhci_device_descriptor+10]  ; idProduct low byte
+    movzx ecx, byte [rel xhci_device_descriptor+11]  ; idProduct high byte
+    shl ecx, 8
+    or eax, ecx
+    call dbg_hex64
+    jmp .out
+.get_desc_failed:
+    lea rcx, [rel msg_xhci_desc_fail]
     call serial_puts
     jmp .out
 .address_device_failed:
@@ -3386,6 +3413,8 @@ msg_xhci_setup_ok:    db 'xHCI: device slot context/EP0 ring setup OK', 13, 10, 
 msg_xhci_setup_fail:  db 'xHCI: device slot context/EP0 ring setup FAILED', 13, 10, 0
 msg_xhci_addr_ok:     db 'xHCI: Address Device OK', 13, 10, 0
 msg_xhci_addr_fail:   db 'xHCI: Address Device FAILED', 13, 10, 0
+msg_xhci_desc_ok:     db 'xHCI: GET_DESCRIPTOR(Device) OK, idVendor/idProduct:', 13, 10, 0
+msg_xhci_desc_fail:   db 'xHCI: GET_DESCRIPTOR(Device) FAILED', 13, 10, 0
 
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.
