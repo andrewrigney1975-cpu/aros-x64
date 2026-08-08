@@ -254,6 +254,10 @@ basix_emit_jcc_placeholder:
 basix_i_push_rax:    db 0x50
 basix_i_pop_rax:     db 0x58
 basix_i_pop_rcx:     db 0x59
+basix_i_pop_rdx:     db 0x5A
+basix_i_pop_r8:      db 0x41,0x58
+basix_i_pop_r9:      db 0x41,0x59
+basix_i_pop_r10:     db 0x41,0x5A
 basix_i_mov_rcx_rax: db 0x48,0x89,0xC1
 basix_i_mov_rax_rdx: db 0x48,0x89,0xD0
 basix_i_add_rax_rcx: db 0x48,0x01,0xC8
@@ -276,6 +280,26 @@ basix_emit_push_rax:
 basix_emit_pop_rax:
     lea rcx, [rel basix_i_pop_rax]
     mov edx, 1
+    jmp basix_emit_bytes
+basix_emit_pop_rcx:
+    lea rcx, [rel basix_i_pop_rcx]
+    mov edx, 1
+    jmp basix_emit_bytes
+basix_emit_pop_rdx:
+    lea rcx, [rel basix_i_pop_rdx]
+    mov edx, 1
+    jmp basix_emit_bytes
+basix_emit_pop_r8:
+    lea rcx, [rel basix_i_pop_r8]
+    mov edx, 2
+    jmp basix_emit_bytes
+basix_emit_pop_r9:
+    lea rcx, [rel basix_i_pop_r9]
+    mov edx, 2
+    jmp basix_emit_bytes
+basix_emit_pop_r10:
+    lea rcx, [rel basix_i_pop_r10]
+    mov edx, 2
     jmp basix_emit_bytes
 basix_emit_mov_rcx_rax:
     lea rcx, [rel basix_i_mov_rcx_rax]

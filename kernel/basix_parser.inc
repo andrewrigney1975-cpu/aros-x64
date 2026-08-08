@@ -1158,6 +1158,75 @@ basix_parse_mvmul:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_parse_int_arg_push: parses one arithmetic expression, converting
+; a float result to a truncated int (CVTTSD2SI) so PSET/LINE's pixel-
+; coordinate and color arguments are always plain integers by the time
+; they're pushed, then emits code pushing that int result. Shared by
+; basix_parse_pset/basix_parse_line so their argument lists don't repeat
+; this "parse, convert-if-float, push" sequence at every comma.
+; -------------------------------------------------------------------------
+basix_parse_int_arg_push:
+    call basix_parse_arith               ; r11d = expr type (0=int)
+    test r11d, r11d
+    jz .is_int
+    call basix_emit_cvttsd2si_rax_x0
+.is_int:
+    jmp basix_emit_push_rax              ; tail call -- returns to our
+                                          ; own caller directly
+
+; -------------------------------------------------------------------------
+; basix_parse_pset: "PSET x, y, color" -- sets one framebuffer pixel.
+; Arguments are pushed left to right, then popped in reverse into the
+; runtime call's registers (RCX=x, RDX=y, R8=color) so the last-pushed
+; value (color) comes off the stack first.
+; -------------------------------------------------------------------------
+basix_parse_pset:
+    call basix_parse_int_arg_push        ; x
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; y
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; color
+
+    call basix_emit_pop_r8               ; color
+    call basix_emit_pop_rdx              ; y
+    call basix_emit_pop_rcx              ; x
+    lea rcx, [rel basix_rt_pset]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_line: "LINE x1, y1, x2, y2, color" -- draws a line via the
+; runtime's Bresenham implementation. Same push-then-pop-in-reverse
+; argument marshaling as PSET, extended to five registers (RCX=x1,
+; RDX=y1, R8=x2, R9=y2, R10=color).
+; -------------------------------------------------------------------------
+basix_parse_line:
+    call basix_parse_int_arg_push        ; x1
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; y1
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; x2
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; y2
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; color
+
+    call basix_emit_pop_r10              ; color
+    call basix_emit_pop_r9               ; y2
+    call basix_emit_pop_r8               ; x2
+    call basix_emit_pop_rdx              ; y1
+    call basix_emit_pop_rcx              ; x1
+    lea rcx, [rel basix_rt_line]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_parse_primary
 ; -------------------------------------------------------------------------
 basix_parse_primary:
@@ -2084,6 +2153,10 @@ basix_parse_statement:
     je .do_mmul
     cmp r15d, TOK_MVMUL
     je .do_mvmul
+    cmp r15d, TOK_PSET
+    je .do_pset
+    cmp r15d, TOK_LINE
+    je .do_line
     cmp r15d, TOK_IDENT
     je .do_ident_stmt
 
@@ -2139,6 +2212,14 @@ basix_parse_statement:
 .do_mvmul:
     call basix_lex_next
     call basix_parse_mvmul
+    jmp .out
+.do_pset:
+    call basix_lex_next
+    call basix_parse_pset
+    jmp .out
+.do_line:
+    call basix_lex_next
+    call basix_parse_line
     jmp .out
 
 .do_ident_stmt:
