@@ -1608,11 +1608,37 @@ xhci_probe_and_report:
     call xhci_enable_slot
     test eax, eax
     jz .enable_slot_failed
-    push rax
+    push rax                            ; slot ID
     lea rcx, [rel msg_xhci_slot_ok]
     call serial_puts
     pop rax
+    push rax
     call dbg_hex64
+    pop rax
+
+    ; Find the first connected port's index (xhci_scan_ports already
+    ; recorded which ones -- this is the port the just-enabled slot
+    ; will be addressed against).
+    mov ecx, eax                        ; ecx = slot ID
+    xor edx, edx                        ; edx = port index (0-based)
+.find_port:
+    cmp edx, [rel xhci_max_ports]
+    jge .out
+    lea rax, [rel xhci_port_connected]
+    cmp byte [rax+rdx], 0
+    jne .port_found
+    inc edx
+    jmp .find_port
+.port_found:
+    call xhci_setup_device_slot
+    test eax, eax
+    jz .setup_slot_failed
+    lea rcx, [rel msg_xhci_setup_ok]
+    call serial_puts
+    jmp .out
+.setup_slot_failed:
+    lea rcx, [rel msg_xhci_setup_fail]
+    call serial_puts
     jmp .out
 .enable_slot_failed:
     lea rcx, [rel msg_xhci_slot_fail]
@@ -3339,6 +3365,8 @@ msg_xhci_noop_fail:   db 'xHCI: No-Op command FAILED (no completion event)', 13,
 msg_xhci_ports:       db 'xHCI: ports with a device connected:', 13, 10, 0
 msg_xhci_slot_ok:     db 'xHCI: Enable Slot OK, slot ID:', 13, 10, 0
 msg_xhci_slot_fail:   db 'xHCI: Enable Slot FAILED', 13, 10, 0
+msg_xhci_setup_ok:    db 'xHCI: device slot context/EP0 ring setup OK', 13, 10, 0
+msg_xhci_setup_fail:  db 'xHCI: device slot context/EP0 ring setup FAILED', 13, 10, 0
 
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.

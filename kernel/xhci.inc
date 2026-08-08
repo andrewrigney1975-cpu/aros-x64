@@ -701,6 +701,170 @@ xhci_enable_slot:
     pop rbx
     ret
 
+; -------------------------------------------------------------------------
+; xhci_setup_device_slot: builds the Input Context (Input Control + Slot
+; + EP0 contexts) and EP0 Transfer Ring for a device that has just been
+; given a Slot ID via xhci_enable_slot, and points DCBAA[slot_id] at a
+; freshly zeroed Device Context (the controller fills this in once
+; Address Device succeeds -- we only need to allocate and zero it here).
+; Does not touch the controller itself; xhci_address_device (next step)
+; is what actually submits the Input Context to hardware.
+;
+; This phase only ever has one device attached (the QEMU usb-storage
+; test device), so a single static set of buffers is enough -- a real
+; multi-device driver would index these per slot ID, but that's beyond
+; what this phase needs to prove.
+;
+; Input:  ECX = Slot ID (from xhci_enable_slot), EDX = port index
+;         (0-based, into xhci_port_connected/xhci_port_speed -- the
+;         port this device was found on by xhci_scan_ports).
+; Output: EAX = 1/0. Only fails if the Slot ID is out of DCBAA's range.
+; -------------------------------------------------------------------------
+XHCI_EP_TYPE_CONTROL equ 4
+
+xhci_setup_device_slot:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+
+    mov r8d, ecx                        ; r8d = Slot ID
+    mov r9d, edx                        ; r9d = port index
+
+    cmp r8d, 0
+    jz .fail
+    cmp r8d, XHCI_MAX_SLOTS
+    ja .fail
+
+    ; EP0 Transfer Ring: same ring discipline as the command/event rings
+    ; -- zeroed, Link TRB at the last of 256 slots, cycle state starts 1.
+    lea rdi, [rel xhci_ep0_ring]
+    mov ecx, 4096
+    xor eax, eax
+    cld
+    rep stosb
+
+    lea rsi, [rel xhci_ep0_ring]
+    lea rdi, [rel xhci_ep0_ring]
+    add rdi, 4096 - 16
+    mov [rdi+0], rsi
+    mov dword [rdi+8], 0
+    mov dword [rdi+12], (6 << 10) | 0x02 | 0x01   ; Type=Link, TC=1, Cycle=1
+    mov qword [rel xhci_ep0_ring_cycle], 1
+    mov qword [rel xhci_ep0_ring_enqueue], 0
+
+    ; Device Context: zeroed, controller fills it in once Address Device
+    ; succeeds. Sized for the worst case (64-byte contexts * 32 entries).
+    lea rdi, [rel xhci_dev_ctx]
+    mov ecx, 2048
+    xor eax, eax
+    cld
+    rep stosb
+
+    lea rax, [rel xhci_dev_ctx]
+    lea rdx, [rel xhci_dcbaa]
+    mov rcx, r8
+    shl rcx, 3                           ; slot ID * 8 bytes/pointer
+    mov [rdx+rcx], rax                   ; DCBAA[slot_id] = Device Context
+
+    ; Input Context: zeroed, then Input Control + Slot + EP0 contexts
+    ; filled in.
+    lea rdi, [rel xhci_input_ctx]
+    mov ecx, 2112
+    xor eax, eax
+    cld
+    rep stosb
+
+    mov ecx, [rel xhci_context_size]
+
+    ; Input Control Context (index 0): A0 (Slot) and A1 (EP0) Add
+    ; Context flags -- this Address Device command initializes both.
+    lea rdi, [rel xhci_input_ctx]
+    mov dword [rdi+4], 0x00000003
+
+    ; Slot Context (index 1): Route String=0 (direct root-port attach),
+    ; Speed=this port's negotiated speed, Context Entries=1 (only EP0
+    ; is being initialized), Root Hub Port Number = port index + 1
+    ; (PORTSC ports are 1-based in the Slot Context, 0-based in our own
+    ; xhci_port_connected/xhci_port_speed arrays).
+    lea rdi, [rel xhci_input_ctx]
+    add rdi, rcx                         ; rdi -> Slot Context
+
+    lea rax, [rel xhci_port_speed]
+    movzx eax, byte [rax+r9]
+    and eax, 0x0F
+    shl eax, 20
+    or eax, (1 << 27)                    ; Context Entries = 1
+    mov [rdi+0], eax
+
+    mov eax, r9d
+    inc eax                              ; Root Hub Port Number (1-based)
+    shl eax, 16
+    mov [rdi+4], eax
+
+    ; EP0 Context (index 2): Control endpoint, CErr=3 (max retry count),
+    ; Max Packet Size per negotiated speed (the real value gets refined
+    ; once the device descriptor is read; this is the safe default per
+    ; spec), TR Dequeue Pointer = EP0 ring base with DCS=1, Average TRB
+    ; Length=8 (a reasonable default for control transfers).
+    lea rdi, [rel xhci_input_ctx]
+    mov rax, rcx
+    shl rax, 1
+    add rdi, rax                         ; rdi -> EP0 Context
+
+    call .ep0_max_packet_size            ; eax = max packet size for r9's port speed
+
+    mov ebx, eax
+    shl ebx, 16                          ; Max Packet Size (bits 16-31)
+    or ebx, (XHCI_EP_TYPE_CONTROL << 3)  ; EP Type (bits 3-5)
+    or ebx, (3 << 1)                     ; CErr (bits 1-2)
+    mov [rdi+4], ebx
+
+    lea rax, [rel xhci_ep0_ring]
+    or al, 1                             ; DCS = 1 (initial cycle state)
+    mov [rdi+16], rax                    ; TR Dequeue Pointer (64-bit)
+
+    mov dword [rdi+20], (8 << 0)         ; Average TRB Length
+
+    mov eax, 1
+    jmp .out
+
+.ep0_max_packet_size:
+    ; r9d = port index (0-based). Looks up that port's negotiated speed
+    ; and returns the spec-default EP0 max packet size for it in EAX.
+    push rdx
+    lea rdx, [rel xhci_port_speed]
+    movzx eax, byte [rdx+r9]
+    cmp eax, 4                          ; SuperSpeed and above: 512
+    jae .mps_512
+    cmp eax, 3                          ; High Speed: 64
+    je .mps_64
+    mov eax, 8                          ; Full/Low Speed: 8
+    jmp .mps_out
+.mps_64:
+    mov eax, 64
+    jmp .mps_out
+.mps_512:
+    mov eax, 512
+.mps_out:
+    pop rdx
+    ret
+
+.fail:
+    xor eax, eax
+.out:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================
@@ -734,3 +898,13 @@ align 4096
 xhci_evtring: times 4096 db 0
 align 64
 xhci_erst:    times 16 db 0
+
+xhci_ep0_ring_cycle:   dq 0
+xhci_ep0_ring_enqueue: dq 0
+
+align 4096
+xhci_ep0_ring: times 4096 db 0
+align 64
+xhci_dev_ctx:   times 2048 db 0         ; 32 contexts * 64 bytes (worst case)
+align 64
+xhci_input_ctx: times 2112 db 0         ; 33 contexts * 64 bytes (worst case)
