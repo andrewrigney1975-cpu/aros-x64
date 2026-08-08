@@ -1579,6 +1579,246 @@ xhci_get_config_descriptor:
     pop rbx
     ret
 
+; -------------------------------------------------------------------------
+; xhci_set_configuration: issues SET_CONFIGURATION(xhci_config_value)
+; -- a no-data-stage control transfer -- so the device actually enters
+; the configured state xhci_get_config_descriptor's interface/endpoint
+; info describes.
+;
+; Input:  ECX = Slot ID.
+; Output: EAX = 1/0.
+; -------------------------------------------------------------------------
+xhci_set_configuration:
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    push r9
+
+    mov r8d, ecx                        ; preserve Slot ID across the
+                                         ; setup-packet writes below
+                                         ; (they don't touch it, but
+                                         ; keeping the habit consistent
+                                         ; with this file's other
+                                         ; multi-step routines)
+
+    lea rdi, [rel xhci_setup_packet]
+    mov byte [rdi+0], 0x00              ; bmRequestType: host-to-device,
+                                         ; standard, device
+    mov byte [rdi+1], 0x09              ; bRequest = SET_CONFIGURATION
+    mov eax, [rel xhci_config_value]
+    mov byte [rdi+2], al                ; wValue low = bConfigurationValue
+    mov byte [rdi+3], 0
+    mov word [rdi+4], 0                 ; wIndex = 0
+    mov word [rdi+6], 0                 ; wLength = 0 (no data stage)
+
+    mov ecx, r8d
+    lea rsi, [rel xhci_setup_packet]
+    xor edi, edi                        ; no data buffer
+    xor r8d, r8d                        ; no data length
+    xor r9d, r9d
+    call xhci_control_transfer
+
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_configure_endpoints: builds an Input Context adding the two
+; Bulk endpoints xhci_get_config_descriptor found (fresh transfer
+; rings, correct DCIs/max packet sizes/EP Type), copies forward the
+; Slot Context Address Device already established (from the Device
+; Context, since Configure Endpoint requires a complete Slot Context
+; whenever A0 is set, not just the fields being changed) with Context
+; Entries bumped to cover the highest DCI now configured, and submits
+; a Configure Endpoint Command.
+;
+; Input:  ECX = Slot ID.
+; Output: EAX = 1/0.
+; -------------------------------------------------------------------------
+XHCI_TRB_TYPE_CONFIGURE_ENDPOINT equ 12
+XHCI_EP_TYPE_BULK_OUT equ 2
+XHCI_EP_TYPE_BULK_IN  equ 6
+
+xhci_configure_endpoints:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r12
+    push r13
+    push r14
+
+    mov r8d, ecx                        ; r8d = Slot ID
+
+    ; Fresh Bulk IN / Bulk OUT transfer rings -- same discipline as
+    ; every other ring in this file: zeroed, Link TRB at the last of
+    ; 256 slots, cycle state starts 1.
+    lea rdi, [rel xhci_bulk_in_ring]
+    mov ecx, 4096
+    xor eax, eax
+    cld
+    rep stosb
+    lea rsi, [rel xhci_bulk_in_ring]
+    lea rdi, [rel xhci_bulk_in_ring]
+    add rdi, 4096 - 16
+    mov [rdi+0], rsi
+    mov dword [rdi+8], 0
+    mov dword [rdi+12], (6 << 10) | 0x02 | 0x01
+    mov qword [rel xhci_bulk_in_ring_cycle], 1
+    mov qword [rel xhci_bulk_in_ring_enqueue], 0
+
+    lea rdi, [rel xhci_bulk_out_ring]
+    mov ecx, 4096
+    xor eax, eax
+    cld
+    rep stosb
+    lea rsi, [rel xhci_bulk_out_ring]
+    lea rdi, [rel xhci_bulk_out_ring]
+    add rdi, 4096 - 16
+    mov [rdi+0], rsi
+    mov dword [rdi+8], 0
+    mov dword [rdi+12], (6 << 10) | 0x02 | 0x01
+    mov qword [rel xhci_bulk_out_ring_cycle], 1
+    mov qword [rel xhci_bulk_out_ring_enqueue], 0
+
+    ; Input Context: zeroed, then Input Control + Slot (copied forward
+    ; from the Device Context, Context Entries updated) + the two Bulk
+    ; endpoint contexts filled in.
+    lea rdi, [rel xhci_input_ctx]
+    mov ecx, 2112
+    xor eax, eax
+    cld
+    rep stosb
+
+    mov ecx, [rel xhci_context_size]
+
+    ; Input Control Context: A0 (Slot) plus one Add bit per Bulk
+    ; endpoint's own DCI.
+    mov eax, 1
+    mov ecx, [rel xhci_bulk_in_ep_index]
+    shl eax, cl
+    mov ebx, eax                        ; ebx = 1 << bulk_in DCI
+    mov eax, 1
+    mov ecx, [rel xhci_bulk_out_ep_index]
+    shl eax, cl
+    or ebx, eax                         ; + 1 << bulk_out DCI
+    or ebx, 1                           ; + A0 (Slot)
+    lea rdi, [rel xhci_input_ctx]
+    mov [rdi+4], ebx
+
+    mov ecx, [rel xhci_context_size]    ; restore ecx (clobbered above)
+
+    ; Slot Context: copy the context_size bytes Address Device already
+    ; established in the Device Context (Route String/Speed/Root Hub
+    ; Port Number all still correct), then overwrite Context Entries
+    ; with the highest DCI now configured.
+    lea rsi, [rel xhci_dev_ctx]
+    lea rdi, [rel xhci_input_ctx]
+    add rdi, rcx
+    push rcx
+    mov ecx, [rel xhci_context_size]
+    cld
+    rep movsb
+    pop rcx
+
+    mov eax, [rel xhci_bulk_in_ep_index]
+    mov edx, [rel xhci_bulk_out_ep_index]
+    cmp eax, edx
+    jae .max_dci_ok
+    mov eax, edx
+.max_dci_ok:
+    shl eax, 27                         ; Context Entries (bits 27-31)
+    lea rdi, [rel xhci_input_ctx]
+    add rdi, rcx                        ; rdi -> Slot Context
+    mov edx, [rdi+0]
+    and edx, 0x07FFFFFF                 ; clear the old Context Entries
+    or edx, eax
+    mov [rdi+0], edx
+
+    ; Bulk IN Endpoint Context.
+    mov eax, [rel xhci_bulk_in_ep_index]
+    inc eax                             ; Input Context entry index = DCI+1
+    mov edx, [rel xhci_context_size]
+    imul edx, eax
+    lea rdi, [rel xhci_input_ctx]
+    add rdi, rdx                        ; rdi -> Bulk IN Context
+
+    mov eax, [rel xhci_bulk_in_max_packet]
+    shl eax, 16
+    or eax, (XHCI_EP_TYPE_BULK_IN << 3)
+    or eax, (3 << 1)                    ; CErr = 3
+    mov [rdi+4], eax
+
+    lea rax, [rel xhci_bulk_in_ring]
+    or al, 1                            ; DCS = 1
+    mov [rdi+8], rax                    ; TR Dequeue Pointer
+
+    mov eax, [rel xhci_bulk_in_max_packet]
+    mov dword [rdi+16], eax             ; Average TRB Length
+
+    ; Bulk OUT Endpoint Context.
+    mov eax, [rel xhci_bulk_out_ep_index]
+    inc eax
+    mov edx, [rel xhci_context_size]
+    imul edx, eax
+    lea rdi, [rel xhci_input_ctx]
+    add rdi, rdx                        ; rdi -> Bulk OUT Context
+
+    mov eax, [rel xhci_bulk_out_max_packet]
+    shl eax, 16
+    or eax, (XHCI_EP_TYPE_BULK_OUT << 3)
+    or eax, (3 << 1)
+    mov [rdi+4], eax
+
+    lea rax, [rel xhci_bulk_out_ring]
+    or al, 1
+    mov [rdi+8], rax
+
+    mov eax, [rel xhci_bulk_out_max_packet]
+    mov dword [rdi+16], eax
+
+    ; Submit Configure Endpoint Command.
+    lea rdi, [rel xhci_input_ctx]
+    xor esi, esi
+    mov ecx, XHCI_TRB_TYPE_CONFIGURE_ENDPOINT
+    mov r10d, r8d
+    shl r10d, 24                        ; Slot ID at bits 24-31
+    call xhci_submit_command
+    test eax, eax
+    jz .fail
+
+    mov ebx, r13d
+    shr ebx, 24
+    and ebx, 0xFF
+    cmp ebx, XHCI_COMPLETION_SUCCESS
+    jne .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================
@@ -1644,3 +1884,13 @@ xhci_bulk_in_ep_index:     dd 0
 xhci_bulk_out_ep_index:    dd 0
 xhci_bulk_in_max_packet:   dd 0
 xhci_bulk_out_max_packet:  dd 0
+
+xhci_bulk_in_ring_cycle:    dq 0
+xhci_bulk_in_ring_enqueue:  dq 0
+xhci_bulk_out_ring_cycle:   dq 0
+xhci_bulk_out_ring_enqueue: dq 0
+
+align 4096
+xhci_bulk_in_ring:  times 4096 db 0
+align 4096
+xhci_bulk_out_ring: times 4096 db 0

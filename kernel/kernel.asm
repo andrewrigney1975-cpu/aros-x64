@@ -1680,9 +1680,17 @@ xhci_probe_and_report:
     call dbg_hex64
 
     pop rcx                             ; slot ID
+    push rcx                            ; ...and re-save it, needed again
+                                         ; below after serial_puts clobbers
+                                         ; ecx
     call xhci_get_config_descriptor
     test eax, eax
-    jz .get_config_failed
+    jnz .get_config_ok
+    add rsp, 8                          ; drop the re-pushed slot ID
+    lea rcx, [rel msg_xhci_config_fail]
+    call serial_puts
+    jmp .out
+.get_config_ok:
     lea rcx, [rel msg_xhci_config_ok]
     call serial_puts
     mov eax, [rel xhci_bulk_in_ep_index]
@@ -1693,9 +1701,29 @@ xhci_probe_and_report:
     call dbg_hex64
     mov eax, [rel xhci_bulk_out_max_packet]
     call dbg_hex64
+
+    pop rcx                             ; slot ID
+    push rcx
+    call xhci_set_configuration
+    test eax, eax
+    jnz .set_config_ok
+    add rsp, 8
+    lea rcx, [rel msg_xhci_setcfg_fail]
+    call serial_puts
     jmp .out
-.get_config_failed:
-    lea rcx, [rel msg_xhci_config_fail]
+.set_config_ok:
+    lea rcx, [rel msg_xhci_setcfg_ok]
+    call serial_puts
+
+    pop rcx                             ; slot ID
+    call xhci_configure_endpoints
+    test eax, eax
+    jz .configure_ep_failed
+    lea rcx, [rel msg_xhci_configep_ok]
+    call serial_puts
+    jmp .out
+.configure_ep_failed:
+    lea rcx, [rel msg_xhci_configep_fail]
     call serial_puts
     jmp .out
 .address_device_failed:
@@ -3440,6 +3468,10 @@ msg_xhci_desc_ok:     db 'xHCI: GET_DESCRIPTOR(Device) OK, idVendor/idProduct:',
 msg_xhci_desc_fail:   db 'xHCI: GET_DESCRIPTOR(Device) FAILED', 13, 10, 0
 msg_xhci_config_ok:   db 'xHCI: GET_DESCRIPTOR(Config) OK, bulk in/out EP index, in/out max packet:', 13, 10, 0
 msg_xhci_config_fail: db 'xHCI: GET_DESCRIPTOR(Config) FAILED (no BOT mass-storage interface found)', 13, 10, 0
+msg_xhci_setcfg_ok:   db 'xHCI: SET_CONFIGURATION OK', 13, 10, 0
+msg_xhci_setcfg_fail: db 'xHCI: SET_CONFIGURATION FAILED', 13, 10, 0
+msg_xhci_configep_ok:   db 'xHCI: Configure Endpoint (Bulk IN/OUT) OK', 13, 10, 0
+msg_xhci_configep_fail: db 'xHCI: Configure Endpoint (Bulk IN/OUT) FAILED', 13, 10, 0
 
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.
