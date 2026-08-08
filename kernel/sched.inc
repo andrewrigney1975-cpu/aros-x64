@@ -64,7 +64,15 @@ TCB_CR3         equ 16  ; physical address of this task's private PML4, or
                          ; sched_switch_cr3)
 TCB_STATE       equ 24  ; TCB_STATE_ALIVE / TCB_STATE_TERMINATED
 TCB_STACK_PAGES equ 32  ; number of private stack pages to free on reap
-TCB_SIZE        equ 40
+TCB_FPU         equ 40  ; pointer to this task's 512-byte, 16-byte-aligned
+                         ; FXSAVE area (irq0_stub saves/restores SSE/x87
+                         ; state across a switch here -- the GPR save this
+                         ; file's header describes doesn't cover XMM/FPU
+                         ; registers at all, which BASIX64's float pipeline
+                         ; lives in almost entirely; without this a task
+                         ; preempted mid float computation could resume
+                         ; with another task's XMM state)
+TCB_SIZE        equ 48
 
 TCB_STATE_ALIVE      equ 0
 TCB_STATE_TERMINATED equ 1
@@ -220,6 +228,18 @@ task_create:
     mov [rbx+TCB_RSP], rax
     mov qword [rbx+TCB_NEXT], 0
     mov dword [rbx+TCB_STATE], TCB_STATE_ALIVE
+
+    ; This task's own FXSAVE area (see TCB_FPU) -- captured from the
+    ; CURRENT cpu's FPU/SSE state (kmalloc's 16-byte alignment satisfies
+    ; FXSAVE/FXRSTOR's requirement) purely to seed a well-formed default;
+    ; this task hasn't executed any FP instructions yet, so whose state
+    ; it starts from doesn't matter, only that it's valid.
+    mov rcx, 512
+    call kmalloc
+    test rax, rax
+    jz .fail_free_stack
+    fxsave [rax]
+    mov [rbx+TCB_FPU], rax
 
     mov rax, rbx
     jmp .out

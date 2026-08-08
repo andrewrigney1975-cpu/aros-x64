@@ -1553,7 +1553,24 @@ basix_parse_term:
 .op:
     call basix_lex_next
     call basix_emit_push_operand
+    push r10                             ; preserve left's type -- parsing
+                                          ; the right operand may reference
+                                          ; a variable, which recurses
+                                          ; through basix_parse_primary's
+                                          ; .ident and unconditionally
+                                          ; clobbers r10d with that
+                                          ; variable's own index as its own
+                                          ; scratch (real bug caught here:
+                                          ; "float / int-variable" silently
+                                          ; became integer division
+                                          ; whenever the variable happened
+                                          ; to be the very first one
+                                          ; declared, since combine_operands
+                                          ; only checks r10d zero-vs-nonzero
+                                          ; and a corrupted-to-zero value
+                                          ; reads as "left is int")
     call basix_parse_unary               ; r11d = right's type
+    pop r10
     call basix_combine_operands          ; eax = combined type
     mov r10d, eax
 
@@ -1611,7 +1628,12 @@ basix_parse_arith:
 .op:
     call basix_lex_next
     call basix_emit_push_operand
+    push r10                             ; preserve left's type across the
+                                          ; right operand's own parse --
+                                          ; see the matching comment in
+                                          ; basix_parse_term
     call basix_parse_term                ; r11d = right's type
+    pop r10
     call basix_combine_operands          ; eax = combined type
     mov r10d, eax
 
@@ -1670,7 +1692,12 @@ basix_parse_comparison:
 .relop_ok:
     call basix_emit_push_operand
     call basix_lex_next
+    push r10                             ; preserve left's type across the
+                                          ; right operand's own parse --
+                                          ; see the matching comment in
+                                          ; basix_parse_term
     call basix_parse_arith               ; r11d = right's type
+    pop r10
     call basix_combine_operands          ; eax = combined type
 
     cmp eax, 0

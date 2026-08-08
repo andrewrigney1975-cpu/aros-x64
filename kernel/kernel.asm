@@ -933,6 +933,13 @@ entry:
     mov qword [r15+TCB_STACK_PAGES], 0
     mov dword [r15+TCB_STATE], TCB_STATE_ALIVE
 
+    mov rcx, 512
+    call kmalloc                        ; kmalloc never touches r15
+    test rax, rax
+    jz .sched_bad
+    fxsave [rax]
+    mov [r15+TCB_FPU], rax
+
     mov rcx, test_task_a
     xor edx, edx
     mov r8, 16384
