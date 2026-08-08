@@ -43,6 +43,7 @@ entry:
     call kbd_install
     sti
     call paging_init
+    call lapic_init
 
     mov rcx, rbx                        ; boot_info
     call pmm_init
@@ -56,6 +57,7 @@ entry:
     call fb_draw_string
 
     call storage_init_and_test
+    call msi_test
     call nvme_init_and_test
 
     call exfat_mount
@@ -1243,6 +1245,7 @@ storage_init_and_test:
     jc .no_controller
 
     mov esi, ecx                        ; esi = device's config-space base
+    mov [rel ahci_pci_addr], esi        ; kept for later MSI setup
 
     mov ecx, esi
     add ecx, 0x04                       ; PCI command register
@@ -1326,6 +1329,113 @@ storage_init_and_test:
     pop rsi
     pop rdx
     pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; msi_test: proof-of-concept for MSI interrupt delivery -- arms MSI on
+; the AHCI controller storage_init_and_test already found, enables its
+; port-level completion interrupt, issues a benign re-read of LBA 0 (the
+; same one storage_init_and_test already proved works via polling), and
+; confirms an interrupt actually arrived at msi_test_isr. Skipped
+; entirely if no AHCI controller was found. Global AHCI interrupt enable
+; is turned back off afterward regardless of outcome -- every other AHCI
+; access in this kernel is polling-based and was never meant to field
+; interrupts.
+; -------------------------------------------------------------------------
+msi_test:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r8
+
+    cmp dword [rel storage_active_driver], STORAGE_AHCI
+    jne .skip
+
+    mov rcx, MSI_TEST_VECTOR
+    lea rdx, [rel msi_test_isr]
+    call idt_set_gate
+
+    mov rbx, [rel ahci_abar]
+
+    ; Clear any interrupt status already pending from earlier polling-
+    ; based activity before arming anything.
+    mov eax, 0xFFFFFFFF
+    mov [rbx+0x08], eax                 ; IS (global)
+    mov eax, [rel ahci_port]
+    shl eax, 7
+    add eax, 0x100                      ; eax = this port's register base
+    mov r8d, eax
+    mov eax, 0xFFFFFFFF
+    mov [rbx+r8+0x10], eax              ; PxIS
+
+    mov eax, 0x00000001                 ; DHRS: Device-to-Host Register
+    mov [rbx+r8+0x14], eax              ; FIS Interrupt -- fires on
+                                         ; ordinary (non-NCQ) command
+                                         ; completion, which is all this
+                                         ; driver ever issues
+
+    mov eax, [rbx+0x04]                 ; GHC
+    or eax, 0x00000002                  ; IE (Interrupt Enable)
+    mov [rbx+0x04], eax
+
+    mov ecx, [rel ahci_pci_addr]
+    mov dl, MSI_TEST_VECTOR
+    call pci_enable_msi
+    test eax, eax
+    jz .no_msi_cap
+
+    mov qword [rel msi_test_counter], 0
+
+    xor ecx, ecx                        ; LBA 0 again -- same read
+    mov edx, 1                          ; storage_init_and_test already
+    lea r8, [rel ahci_databuf]          ; proved works via polling
+    call ahci_read_sectors
+
+    mov rcx, 30000000
+.wait:
+    cmp qword [rel msi_test_counter], 0
+    jne .teardown
+    dec rcx
+    jnz .wait
+
+.teardown:
+    ; Recompute rather than trust r8/rbx survived the calls above --
+    ; cheap, and avoids relying on preservation this file doesn't
+    ; document for every callee.
+    mov rbx, [rel ahci_abar]
+    mov eax, [rbx+0x04]
+    and eax, ~0x00000002
+    mov [rbx+0x04], eax
+    mov eax, [rel ahci_port]
+    shl eax, 7
+    add eax, 0x100
+    mov r8d, eax
+    mov dword [rbx+r8+0x14], 0
+
+    cmp qword [rel msi_test_counter], 0
+    jz .fail
+
+    lea rcx, [rel msg_msi_ok]
+    call serial_puts
+    jmp .done2
+.no_msi_cap:
+    lea rcx, [rel msg_msi_no_cap]
+    call serial_puts
+    jmp .done2
+.fail:
+    lea rcx, [rel msg_msi_bad]
+    call serial_puts
+    jmp .done2
+.skip:
+    lea rcx, [rel msg_msi_skip]
+    call serial_puts
+.done2:
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
     pop rax
     ret
 
@@ -3126,6 +3236,9 @@ basixtest_src: db 'LET x = 5', 10, 'PRINT x * 3 + 2', 10, 'GOSUB sub1', 10, 'END
 msg_basixtest_ran:      db 'basixtest: compiled and ran OK', 13, 10, 0
 msg_basixtest_bad:      db 'basixtest: COMPILE FAILED', 13, 10, 0
 
+ahci_pci_addr:        dd 0    ; PCI config address of the AHCI controller
+                              ; storage_init_and_test found, kept around
+                              ; for the MSI proof-of-concept test
 msg_hello:            db 'Hello, kernal!', 13, 10, 0
 msg_ahci_not_found:   db 'AHCI: no controller found', 13, 10, 0
 msg_ahci_no_port:     db 'AHCI: no active SATA port', 13, 10, 0
@@ -3133,6 +3246,10 @@ msg_ahci_read_fail:   db 'AHCI: LBA0 read failed/timed out', 13, 10, 0
 msg_ahci_ok:          db 'AHCI: LBA0 read OK', 13, 10, 0
 msg_sig_ok:           db 'boot signature 0xAA55 OK', 13, 10, 0
 msg_sig_bad:          db 'boot signature mismatch', 13, 10, 0
+msg_msi_ok:           db 'MSI: interrupt delivered via local APIC OK', 13, 10, 0
+msg_msi_bad:          db 'MSI: armed but no interrupt arrived (FAILED)', 13, 10, 0
+msg_msi_no_cap:       db 'MSI: device has no MSI capability, skipped', 13, 10, 0
+msg_msi_skip:         db 'MSI: no AHCI controller active, skipped', 13, 10, 0
 
 msg_nvme_not_found:   db 'NVMe: no controller found', 13, 10, 0
 msg_nvme_init_fail:   db 'NVMe: controller/queue init failed', 13, 10, 0
@@ -3171,6 +3288,7 @@ gdt_descriptor:
 %include "sched.inc"
 %include "pic.inc"
 %include "paging.inc"
+%include "apic.inc"
 %include "pmm.inc"
 %include "vmm.inc"
 %include "kheap.inc"

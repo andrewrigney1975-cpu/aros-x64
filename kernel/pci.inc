@@ -158,3 +158,170 @@ pci_find_class:
     pop rbx
     pop rax
     ret
+
+; -------------------------------------------------------------------------
+; pci_find_capability: walks a device's PCI capability list looking for a
+; given capability ID (e.g. 0x05 = MSI, 0x11 = MSI-X). Needed before this
+; file's own MSI/MSI-X setup can find where in a device's config space to
+; program the message address/data registers.
+;
+; Input:  ECX = device's config address (offset 0, as returned by
+;         pci_find_class), DL = capability ID to find.
+; Output: CF=0 and EAX=that capability's own config address (its ID byte,
+;         ready to pass straight to pci_read32/pci_write32 with further
+;         offsets added), if found; CF=1 if the device has no capability
+;         list, or none of its entries match.
+; -------------------------------------------------------------------------
+pci_find_capability:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+
+    mov esi, ecx                        ; esi = device's config base
+    movzx r8d, dl                       ; r8b = wanted capability ID
+
+    mov ecx, esi
+    add ecx, 0x04                       ; Command(lo)/Status(hi)
+    call pci_read32
+    shr eax, 16                         ; eax = Status register
+    test eax, 0x0010                    ; Capabilities List supported?
+    jz .not_found
+
+    mov ecx, esi
+    add ecx, 0x34                       ; Capabilities Pointer (byte 0)
+    call pci_read32
+    movzx ebx, al                       ; ebx = next capability offset
+
+    mov edx, 48                         ; defensive loop bound -- config
+                                         ; space is 256 bytes, >=4 per
+                                         ; entry, so the list can never
+                                         ; legitimately need more hops
+.walk:
+    test ebx, ebx
+    jz .not_found
+    test edx, edx
+    jz .not_found
+    dec edx
+
+    mov ecx, esi
+    add ecx, ebx
+    call pci_read32                     ; byte0=cap ID, byte1=next pointer
+    movzx r9d, al
+    cmp r9b, r8b
+    je .found
+
+    mov ebx, eax
+    shr ebx, 8
+    and ebx, 0xFF
+    jmp .walk
+
+.found:
+    mov eax, esi
+    add eax, ebx
+    clc
+    jmp .out
+.not_found:
+    stc
+.out:
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+PCI_CAP_MSI equ 0x05
+
+; -------------------------------------------------------------------------
+; pci_enable_msi: RCX = device's config address (offset 0), DL = target
+; interrupt vector (0-255). Finds the device's MSI capability (the plain
+; one, ID 0x05 -- not MSI-X, ID 0x11, which has a different per-vector
+; table layout and is a separate routine if a device ever needs it) and
+; programs it to fire that vector at this CPU's local APIC, single
+; message, edge-triggered fixed delivery: Message Address encodes the
+; destination local APIC (lapic_id), Message Data is just the vector
+; with delivery/trigger mode bits left at their edge/fixed defaults.
+; Handles both the 32-bit and 64-bit-capable Message Address layouts
+; (the capability's own Message Control register says which one a given
+; device implements). Returns EAX=1/0 -- 0 if the device has no plain
+; MSI capability at all.
+; -------------------------------------------------------------------------
+pci_enable_msi:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r9
+
+    mov esi, ecx                        ; esi = device's config base
+    movzx r8d, dl                       ; r8b = target vector
+
+    mov dl, PCI_CAP_MSI
+    call pci_find_capability
+    jc .fail
+    mov ebx, eax                        ; ebx = MSI capability's config addr
+
+    mov ecx, ebx
+    call pci_read32                     ; eax = CapID|Next|Control dword
+    mov r9d, eax                        ; r9d = saved for the enable-bit write-back
+    test eax, 0x00800000                ; Control bit7 (dword bit 23) =
+                                         ; 64-bit Address Capable
+    jnz .cap64
+
+    ; 32-bit layout: Message Address at +4, Message Data at +8
+    call lapic_id
+    shl eax, 12
+    or eax, 0xFEE00000
+    mov ecx, ebx
+    add ecx, 4
+    call pci_write32
+
+    mov eax, r8d                        ; Message Data = vector (fixed,
+                                         ; edge -- all other bits 0)
+    mov ecx, ebx
+    add ecx, 8
+    call pci_write32
+    jmp .enable
+
+.cap64:
+    ; 64-bit-capable layout: Message Address at +4, Address-Upper at +8,
+    ; Message Data at +12
+    call lapic_id
+    shl eax, 12
+    or eax, 0xFEE00000
+    mov ecx, ebx
+    add ecx, 4
+    call pci_write32
+
+    xor eax, eax
+    mov ecx, ebx
+    add ecx, 8
+    call pci_write32
+
+    mov eax, r8d
+    mov ecx, ebx
+    add ecx, 12
+    call pci_write32
+
+.enable:
+    mov eax, r9d
+    or eax, 0x00010000                  ; Control bit0 (dword bit 16) =
+                                         ; MSI Enable
+    mov ecx, ebx
+    call pci_write32
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r9
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret

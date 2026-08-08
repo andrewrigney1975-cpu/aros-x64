@@ -199,6 +199,26 @@ isr_common:
     jmp .hang
 
 ; -------------------------------------------------------------------------
+; msi_test_isr: a plain, minimal ISR for MSI_TEST_VECTOR -- proves an MSI
+; message from a real device actually reaches the CPU and is dispatched
+; through the IDT like any other interrupt. Deliberately NOT routed
+; through isr_common/irq0_stub's scheduler-switching machinery: this
+; vector exists only for kernel.asm's boot-time MSI self-test, wired up
+; and torn back down around that one test rather than being a permanent
+; part of the interrupt table. Acknowledges via the local APIC (lapic_eoi)
+; instead of the 8259 PIC -- MSI delivery never goes through the PIC at
+; all, so there is no legacy EOI to send.
+; -------------------------------------------------------------------------
+MSI_TEST_VECTOR equ 0x50
+
+msi_test_isr:
+    push rax
+    inc qword [rel msi_test_counter]
+    call lapic_eoi
+    pop rax
+    iretq
+
+; -------------------------------------------------------------------------
 ; exception_dump: RCX = pointer to isr_common's saved-register block.
 ; -------------------------------------------------------------------------
 exception_dump:
@@ -281,6 +301,8 @@ msg_exc_v:      db 'EXCEPTION vector=', 0
 msg_exc_err:    db 'errcode=', 0
 msg_exc_rip:    db 'rip=', 0
 msg_exc_cr2:    db 'cr2=', 0
+
+msi_test_counter: dq 0
 
 align 16
 idt_table: times (256*16) db 0
