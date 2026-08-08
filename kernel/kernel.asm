@@ -1744,6 +1744,7 @@ xhci_probe_and_report:
     call dbg_hex64
 
     pop rcx                             ; slot ID
+    mov [rel xhci_msd_slot_id], ecx
     call xhci_msd_read_capacity
     test eax, eax
     jz .read_capacity_failed
@@ -1753,6 +1754,30 @@ xhci_probe_and_report:
     call dbg_hex64
     mov eax, [rel xhci_msd_sector_size]
     call dbg_hex64
+
+    ; USB is only the active storage backend as a fallback of last
+    ; resort -- if AHCI or NVMe already claimed a working device
+    ; earlier in boot, leave that alone (this project's exFAT tests
+    ; run against whichever backend storage_active_driver names, and
+    ; the QEMU test disk image behind this USB device isn't formatted
+    ; exFAT).
+    cmp dword [rel storage_active_driver], STORAGE_NONE
+    jne .skip_active_driver
+    mov dword [rel storage_active_driver], STORAGE_USB
+.skip_active_driver:
+
+    xor ecx, ecx                        ; LBA 0
+    mov edx, 1                          ; 1 sector
+    lea r8, [rel xhci_msd_test_sector]
+    call usb_msd_read_sectors
+    test eax, eax
+    jz .msd_read_failed
+    lea rcx, [rel msg_xhci_msdread_ok]
+    call serial_puts
+    jmp .out
+.msd_read_failed:
+    lea rcx, [rel msg_xhci_msdread_fail]
+    call serial_puts
     jmp .out
 .read_capacity_failed:
     lea rcx, [rel msg_xhci_readcap_fail]
@@ -3508,6 +3533,8 @@ msg_xhci_inquiry_ok:    db 'xHCI: USB MSD SCSI INQUIRY OK, vendor ID byte0:', 13
 msg_xhci_inquiry_fail:  db 'xHCI: USB MSD SCSI INQUIRY FAILED', 13, 10, 0
 msg_xhci_readcap_ok:    db 'xHCI: USB MSD READ CAPACITY(10) OK, last LBA/sector size:', 13, 10, 0
 msg_xhci_readcap_fail:  db 'xHCI: USB MSD READ CAPACITY(10) FAILED', 13, 10, 0
+msg_xhci_msdread_ok:    db 'xHCI: USB MSD READ(10) sector 0 OK', 13, 10, 0
+msg_xhci_msdread_fail:  db 'xHCI: USB MSD READ(10) sector 0 FAILED', 13, 10, 0
 
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.

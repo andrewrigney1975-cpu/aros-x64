@@ -2221,6 +2221,109 @@ xhci_msd_read_capacity:
     pop rcx
     ret
 
+; -------------------------------------------------------------------------
+; usb_msd_read_sectors / usb_msd_write_sectors: SCSI READ(10)/WRITE(10)
+; over the BOT protocol, wired up to match storage.inc's dispatcher
+; calling convention exactly (RCX=LBA, RDX=sector count, R8=buffer,
+; EAX=1/0) so they can be called directly as a STORAGE_USB backend.
+; Use xhci_msd_slot_id (the slot the boot sequence's enumeration left
+; addressed and configured) rather than taking a Slot ID parameter --
+; this driver only ever talks to the one USB mass-storage device it
+; found at boot, and storage.inc's dispatcher has no slot ID to give
+; it anyway (AHCI/NVMe don't have the concept).
+; -------------------------------------------------------------------------
+usb_msd_read_sectors:
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    mov r10, rcx                        ; r10 = LBA
+    mov r11, r8                         ; r11 = buffer
+
+    lea rdi, [rel xhci_msd_cdb]
+    xor eax, eax
+    mov ecx, 16
+    cld
+    rep stosb
+    mov byte [rel xhci_msd_cdb+0], 0x28  ; READ(10)
+    mov eax, r10d
+    bswap eax
+    mov [rel xhci_msd_cdb+2], eax        ; LBA, big-endian
+    mov ax, dx
+    xchg al, ah
+    mov [rel xhci_msd_cdb+7], ax         ; Transfer Length, big-endian
+
+    mov ecx, [rel xhci_msd_slot_id]
+    lea rsi, [rel xhci_msd_cdb]
+    mov r8b, 10
+    mov rdi, r11                         ; data buffer
+    mov eax, edx
+    imul eax, [rel xhci_msd_sector_size]
+    mov r10d, eax                        ; data length in bytes
+    mov r11b, 1                          ; IN
+    call xhci_msd_command
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    ret
+
+usb_msd_write_sectors:
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    mov r10, rcx                        ; r10 = LBA
+    mov r11, r8                         ; r11 = buffer
+
+    lea rdi, [rel xhci_msd_cdb]
+    xor eax, eax
+    mov ecx, 16
+    cld
+    rep stosb
+    mov byte [rel xhci_msd_cdb+0], 0x2A  ; WRITE(10)
+    mov eax, r10d
+    bswap eax
+    mov [rel xhci_msd_cdb+2], eax
+    mov ax, dx
+    xchg al, ah
+    mov [rel xhci_msd_cdb+7], ax
+
+    mov ecx, [rel xhci_msd_slot_id]
+    lea rsi, [rel xhci_msd_cdb]
+    mov r8b, 10
+    mov rdi, r11
+    mov eax, edx
+    imul eax, [rel xhci_msd_sector_size]
+    mov r10d, eax
+    xor r11d, r11d                       ; OUT
+    call xhci_msd_command
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================
@@ -2311,3 +2414,11 @@ align 16
 xhci_msd_read_capacity_data: times 8 db 0
 xhci_msd_sector_count: dd 0             ; highest valid LBA (not a count)
 xhci_msd_sector_size:  dd 0
+xhci_msd_slot_id:      dd 0             ; Slot ID of the one USB mass-
+                                         ; storage device this driver
+                                         ; enumerated at boot
+
+align 16
+xhci_msd_test_sector: times 512 db 0    ; boot self-test scratch buffer
+                                         ; for a raw usb_msd_read_sectors
+                                         ; round-trip
