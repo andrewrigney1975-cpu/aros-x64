@@ -10,6 +10,7 @@ QEMU="/c/Program Files/qemu/qemu-system-x86_64.exe"
 OVMF="/c/Program Files/qemu/share/edk2-x86_64-code.fd"
 DISK="$(cygpath -w "$ROOT/disk")"
 EXFAT_VHD="$(cygpath -w "$ROOT/testdata/exfat_test.vhd")"
+USB_IMG="$(cygpath -w "$ROOT/testdata/usb_test.img")"
 
 ARGS=(
   -machine q35
@@ -20,6 +21,9 @@ ARGS=(
   -drive file=fat:rw:"$DISK",format=raw,if=ide
   -drive if=none,id=nvmedisk,file="$EXFAT_VHD",format=vpc
   -device nvme,drive=nvmedisk,serial=deadbeef01
+  -device qemu-xhci,id=xhci0
+  -drive if=none,id=usbdisk,file="$USB_IMG",format=raw
+  -device usb-storage,bus=xhci0.0,drive=usbdisk
   -net none
 )
 

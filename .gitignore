@@ -5,3 +5,4 @@ disk/AROS/KERNEL.BIN
 debug.log
 disk/NvVars
 testdata/*.vhd
+testdata/*.img
