@@ -1630,13 +1630,30 @@ xhci_probe_and_report:
     inc edx
     jmp .find_port
 .port_found:
+    push rcx                            ; slot ID -- xhci_setup_device_slot
+                                         ; preserves ecx itself, but the
+                                         ; Address Device call below needs
+                                         ; it back in ecx after RDI is set
     call xhci_setup_device_slot
     test eax, eax
     jz .setup_slot_failed
     lea rcx, [rel msg_xhci_setup_ok]
     call serial_puts
+
+    pop rcx                             ; slot ID
+    lea rdi, [rel xhci_input_ctx]
+    call xhci_address_device
+    test eax, eax
+    jz .address_device_failed
+    lea rcx, [rel msg_xhci_addr_ok]
+    call serial_puts
+    jmp .out
+.address_device_failed:
+    lea rcx, [rel msg_xhci_addr_fail]
+    call serial_puts
     jmp .out
 .setup_slot_failed:
+    add rsp, 8                          ; drop the pushed slot ID
     lea rcx, [rel msg_xhci_setup_fail]
     call serial_puts
     jmp .out
@@ -3367,6 +3384,8 @@ msg_xhci_slot_ok:     db 'xHCI: Enable Slot OK, slot ID:', 13, 10, 0
 msg_xhci_slot_fail:   db 'xHCI: Enable Slot FAILED', 13, 10, 0
 msg_xhci_setup_ok:    db 'xHCI: device slot context/EP0 ring setup OK', 13, 10, 0
 msg_xhci_setup_fail:  db 'xHCI: device slot context/EP0 ring setup FAILED', 13, 10, 0
+msg_xhci_addr_ok:     db 'xHCI: Address Device OK', 13, 10, 0
+msg_xhci_addr_fail:   db 'xHCI: Address Device FAILED', 13, 10, 0
 
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.

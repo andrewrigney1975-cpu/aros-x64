@@ -529,7 +529,10 @@ xhci_noop_test:
 ;         Context pointer for Address Device; 0 for Enable Slot),
 ;         ESI = TRB Status (32-bit, command-specific; 0 for both of the
 ;         above), ECX = TRB Type (6-bit value, e.g. 9=Enable Slot,
-;         11=Address Device -- NOT pre-shifted).
+;         11=Address Device -- NOT pre-shifted), R10D = extra Control
+;         bits already positioned at their final bit offsets (e.g. a
+;         Slot ID at bits 24-31, or the BSR bit for Address Device; 0
+;         for commands like Enable Slot that need none of this).
 ; Output: EAX = 1 if a Command Completion Event was seen before the
 ;         poll bound, 0 on timeout. On EAX=1: R12 = completion event's
 ;         Parameter (bits 0-31 hold the Input/Device Context pointer
@@ -546,11 +549,14 @@ xhci_submit_command:
     push rdi
     push r8
     push r9
+    push r10
 
     mov r8, rdi                         ; r8 = TRB Parameter (survives the
                                          ; ring-address math below)
     mov r9d, esi                        ; r9d = TRB Status
     mov edx, ecx                        ; edx = TRB Type
+                                         ; r10d = extra Control bits (as
+                                         ; passed by the caller, untouched)
 
     mov rax, [rel xhci_cmdring_enqueue]
     lea rdi, [rel xhci_cmdring]
@@ -562,6 +568,7 @@ xhci_submit_command:
     mov [rdi+8], r9d                    ; Status
     mov eax, edx
     shl eax, 10
+    or eax, r10d                        ; extra Control bits
     mov rbx, [rel xhci_cmdring_cycle]
     or eax, ebx                         ; Cycle bit
     mov [rdi+12], eax
@@ -650,6 +657,7 @@ xhci_submit_command:
     mov [rdx+0x18], rax                 ; ERDP
 
     mov eax, ebx
+    pop r10
     pop r9
     pop r8
     pop rdi
@@ -678,6 +686,7 @@ xhci_enable_slot:
     xor edi, edi                        ; Parameter = 0
     xor esi, esi                        ; Status = 0
     mov ecx, XHCI_TRB_TYPE_ENABLE_SLOT
+    xor r10d, r10d                      ; no extra Control bits
     call xhci_submit_command
     test eax, eax
     jz .fail
@@ -698,6 +707,59 @@ xhci_enable_slot:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_address_device: submits an Address Device Command against a
+; slot's already-built Input Context (from xhci_setup_device_slot),
+; assigning the device a real USB address and moving its Slot State to
+; Addressed. BSR (Block Set Address Request) is left at 0 -- we want
+; the controller to issue the actual SET_ADDRESS request, not just
+; latch the context.
+;
+; Input:  ECX = Slot ID, RDI = Input Context pointer (from
+;         xhci_setup_device_slot's xhci_input_ctx).
+; Output: EAX = 1 on a Success completion, 0 on timeout or any other
+;         completion code (e.g. a real device that NAKs SET_ADDRESS).
+; -------------------------------------------------------------------------
+XHCI_TRB_TYPE_ADDRESS_DEVICE equ 11
+
+xhci_address_device:
+    push rbx
+    push rcx
+    push r12
+    push r13
+    push r14
+
+    mov ebx, ecx                        ; ebx = Slot ID (survives the
+                                         ; RDI/ESI/ECX shuffle below)
+
+    ; RDI already holds the Input Context pointer (this routine's own
+    ; input register matches xhci_submit_command's Parameter input).
+    xor esi, esi                        ; Status = 0
+    mov ecx, XHCI_TRB_TYPE_ADDRESS_DEVICE
+    mov r10d, ebx
+    shl r10d, 24                        ; Slot ID at bits 24-31, BSR=0
+    call xhci_submit_command
+    test eax, eax
+    jz .fail
+
+    mov eax, r13d
+    shr eax, 24
+    and eax, 0xFF                       ; Completion Code
+    cmp eax, XHCI_COMPLETION_SUCCESS
+    jne .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop rcx
     pop rbx
     ret
 
