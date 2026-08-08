@@ -86,6 +86,14 @@ TOK_MVMUL   equ 74
 TOK_PSET    equ 75
 TOK_LINE    equ 76
 
+; Trig functions (expression-level, IDENT-like: TOK_x LPAREN expr RPAREN)
+TOK_SIN     equ 77
+TOK_COS     equ 78
+TOK_TAN     equ 79
+TOK_ASIN    equ 80
+TOK_ACOS    equ 81
+TOK_ATAN    equ 82
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -153,10 +161,132 @@ basix_is_ident_char:
     ret
 
 ; -------------------------------------------------------------------------
-; basix_lex_init: RCX = pointer to a NUL-terminated source buffer.
+; basix_lex_init: RCX = pointer to a NUL-terminated source buffer
+; already fully resident in memory (the non-streaming path -- e.g. the
+; boot-time BASIX64 smoke test compiling a fixed string literal).
+; Explicitly clears basix_lex_streaming so state from an earlier
+; streaming compile (see basix_lex_init_stream) can't leak in.
 ; -------------------------------------------------------------------------
 basix_lex_init:
+    mov dword [rel basix_lex_streaming], 0
     mov [rel basix_cursor], rcx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_lex_init_stream: ECX = first cluster, RDX = file length (bytes),
+; R8D = NoFatChain flag. Sets up streaming mode and performs the
+; initial window fill (up to BASIX_LEX_WINDOW_CHUNK bytes) via
+; exfat_read_file_at -- used by RUN to compile straight from disk
+; without first loading the whole program into one buffer (see
+; basix_lex_next's refill check for the other half of this).
+; -------------------------------------------------------------------------
+basix_lex_init_stream:
+    push rax
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+
+    mov dword [rel basix_lex_streaming], 1
+    mov [rel basix_lex_file_first_cluster], ecx
+    mov [rel basix_lex_file_nofatchain], r8d
+    mov [rel basix_lex_file_length], rdx
+    mov qword [rel basix_lex_file_pos], 0
+    mov dword [rel basix_lex_window_len], 0
+
+    mov rax, rdx
+    cmp rax, BASIX_LEX_WINDOW_CHUNK
+    jbe .chunk_ok
+    mov rax, BASIX_LEX_WINDOW_CHUNK
+.chunk_ok:
+    test rax, rax
+    jz .place_nul                        ; zero-length source
+
+    push rax                             ; chunk size
+    mov ecx, [rel basix_lex_file_first_cluster]
+    xor edx, edx
+    mov r8, rax
+    lea r9, [rel basix_lex_window]
+    mov r10d, [rel basix_lex_file_nofatchain]
+    call exfat_read_file_at
+    pop rcx                              ; rcx = chunk size
+    test eax, eax
+    jz .fail
+
+    mov [rel basix_lex_window_len], ecx
+    mov [rel basix_lex_file_pos], rcx
+
+.place_nul:
+    mov rax, [rel basix_lex_file_pos]
+    cmp rax, [rel basix_lex_file_length]
+    jb .not_eof_yet
+    mov ecx, [rel basix_lex_window_len]
+    lea rdx, [rel basix_lex_window]
+    mov byte [rdx+rcx], 0
+.not_eof_yet:
+    lea rax, [rel basix_lex_window]
+    mov [rel basix_cursor], rax
+    jmp .out
+
+.fail:
+    mov dword [rel basix_compile_ok], 0
+    mov dword [rel basix_lex_window_len], 0
+    lea rax, [rel basix_lex_window]
+    mov byte [rax], 0
+    mov [rel basix_cursor], rax
+
+.out:
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_lex_copy_tok_text: RCX = ptr to token text (identifier or
+; string-literal content), EDX = length. Copies into the fixed
+; basix_tok_text_buf scratch buffer (clamped to
+; BASIX_TOK_TEXT_BUF_SIZE-1 bytes -- identifiers are matched against
+; keywords/created as variables using at most 31 chars elsewhere in
+; this compiler anyway, per basix_name_eq's own cap, so this only
+; bites unusually long string literals) and points basix_tok_text/
+; basix_tok_len at the copy. See the comment on basix_tok_text_buf for
+; why this indirection exists.
+; -------------------------------------------------------------------------
+basix_lex_copy_tok_text:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    mov edx, edx                        ; zero-extend (EDX write already
+                                         ; clears the upper 32 bits of RDX)
+    cmp edx, BASIX_TOK_TEXT_BUF_SIZE - 1
+    jbe .len_ok
+    mov edx, BASIX_TOK_TEXT_BUF_SIZE - 1
+.len_ok:
+    mov rsi, rcx
+    lea rdi, [rel basix_tok_text_buf]
+    mov ecx, edx
+    cld
+    rep movsb
+    mov byte [rdi], 0                   ; harmless extra NUL past the
+                                         ; copied bytes; tok_len is what
+                                         ; every caller actually uses
+
+    lea rax, [rel basix_tok_text_buf]
+    mov [rel basix_tok_text], rax
+    mov [rel basix_tok_len], edx
+
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     ret
 
 ; -------------------------------------------------------------------------
@@ -233,6 +363,81 @@ basix_lex_next:
     push r9
 
     mov rsi, [rel basix_cursor]
+
+    ; Streaming refill: if compiling straight from disk (see
+    ; basix_lex_init_stream) and fewer than BASIX_LEX_REFILL_THRESHOLD
+    ; bytes remain ahead of the cursor in the window, pull the next
+    ; chunk from exFAT before tokenizing. The threshold is comfortably
+    ; larger than any realistic single token (identifiers are capped
+    ; at 31 chars) plus the 1-2 byte lookahead a couple of two-char
+    ; operators need -- a single token/string literal longer than the
+    ; threshold is the one case this doesn't handle, a deliberate
+    ; scope limit rather than full arbitrary-length mid-token
+    ; streaming, which would need touching every scan loop in this
+    ; function instead of just this one entry-point check.
+    cmp dword [rel basix_lex_streaming], 0
+    je .no_refill
+
+    lea rdi, [rel basix_lex_window]
+    mov rax, rsi
+    sub rax, rdi                         ; cursor offset within window
+    mov ecx, [rel basix_lex_window_len]
+    sub ecx, eax                         ; bytes remaining ahead of cursor
+    cmp ecx, BASIX_LEX_REFILL_THRESHOLD
+    jae .no_refill
+
+    mov rdx, [rel basix_lex_file_pos]
+    cmp rdx, [rel basix_lex_file_length]
+    jae .no_refill                       ; nothing left on disk to fetch
+
+    ; Retain the unconsumed tail: memmove [rsi..rsi+ecx) down to the
+    ; window's base (rdi). Safe as a forward rep movsb since dest<=src.
+    push rcx                             ; tail length
+    mov r8d, ecx
+    push rsi
+    push rdi
+    mov rcx, r8
+    cld
+    rep movsb
+    pop rdi
+    pop rsi
+    pop rcx                              ; rcx = tail length again
+
+    mov rax, [rel basix_lex_file_length]
+    sub rax, [rel basix_lex_file_pos]
+    cmp rax, BASIX_LEX_WINDOW_CHUNK
+    jbe .chunk_ok
+    mov rax, BASIX_LEX_WINDOW_CHUNK
+.chunk_ok:
+    push rcx                             ; tail length
+    push rax                             ; chunk size
+    mov r9, rdi
+    add r9, rcx                          ; append right after the tail
+    mov ecx, [rel basix_lex_file_first_cluster]
+    mov rdx, [rel basix_lex_file_pos]
+    mov r8, rax
+    mov r10d, [rel basix_lex_file_nofatchain]
+    call exfat_read_file_at
+    test eax, eax
+    jnz .refill_read_ok
+    mov dword [rel basix_compile_ok], 0
+.refill_read_ok:
+    pop rax                              ; chunk size
+    pop rcx                              ; tail length
+
+    add [rel basix_lex_file_pos], rax
+    add ecx, eax                         ; new window length
+    mov [rel basix_lex_window_len], ecx
+
+    mov rdx, [rel basix_lex_file_pos]
+    cmp rdx, [rel basix_lex_file_length]
+    jb .no_nul_yet
+    lea rdi, [rel basix_lex_window]
+    mov byte [rdi+rcx], 0                ; true EOF: NUL right after data
+.no_nul_yet:
+
+    lea rsi, [rel basix_lex_window]      ; rebase cursor to window start
+.no_refill:
 
 .top:
 .skip_ws:
@@ -429,7 +634,8 @@ basix_lex_next:
 
 .string_lit:
     inc rsi
-    mov [rel basix_tok_text], rsi
+    mov rbx, rsi                        ; rbx = start of string content,
+                                         ; survives the scan loop below
     xor edx, edx
 .str_loop:
     movzx eax, byte [rsi+rdx]
@@ -440,8 +646,17 @@ basix_lex_next:
     inc edx
     jmp .str_loop
 .str_done:
-    mov [rel basix_tok_len], edx
     mov dword [rel basix_tok_type], TOK_STRING
+    push rcx
+    push rdx
+    mov rcx, rbx
+    call basix_lex_copy_tok_text        ; sets tok_text/tok_len (copies
+                                         ; into a fixed scratch buffer
+                                         ; rather than pointing straight
+                                         ; into the window -- see the
+                                         ; comment on basix_tok_text_buf)
+    pop rdx
+    pop rcx
     add rsi, rdx
     cmp byte [rsi], '"'
     jne .str_noquote
@@ -577,7 +792,8 @@ basix_lex_next:
     jmp .out
 
 .ident_or_kw:
-    mov [rel basix_tok_text], rsi
+    mov rbx, rsi                        ; rbx = start of identifier text,
+                                         ; survives the scan loop below
     xor edx, edx
 .id_loop:
     movzx eax, byte [rsi+rdx]
@@ -587,7 +803,13 @@ basix_lex_next:
     inc edx
     jmp .id_loop
 .id_done:
-    mov [rel basix_tok_len], edx
+    push rcx
+    push rdx
+    mov rcx, rbx
+    call basix_lex_copy_tok_text        ; sets tok_text/tok_len (see the
+                                         ; comment on basix_tok_text_buf)
+    pop rdx
+    pop rcx
     add rsi, rdx
     mov [rel basix_cursor], rsi
 
@@ -620,6 +842,43 @@ basix_tok_len:  dd 0
 align 8
 basix_const_10: dq 10.0
 basix_const_1:  dq 1.0
+
+; -------------------------------------------------------------------------
+; Streaming-compile state (see basix_lex_init_stream / basix_lex_next's
+; refill check). basix_lex_streaming=0 means basix_cursor points
+; directly into a fully-resident caller buffer (the original, still-
+; supported non-streaming path) -- everything below is only touched
+; when it's 1.
+; -------------------------------------------------------------------------
+BASIX_LEX_WINDOW_CHUNK     equ 4096
+BASIX_LEX_REFILL_THRESHOLD equ 1024
+BASIX_LEX_WINDOW_SIZE      equ 5376      ; chunk + threshold + NUL margin
+
+basix_lex_streaming:           dd 0
+basix_lex_file_first_cluster:  dd 0
+basix_lex_file_nofatchain:     dd 0
+align 8
+basix_lex_file_length:         dq 0
+basix_lex_file_pos:            dq 0
+basix_lex_window_len:          dd 0
+align 16
+basix_lex_window: times BASIX_LEX_WINDOW_SIZE db 0
+
+; basix_tok_text points directly into basix_lex_window for identifiers/
+; strings by default -- fine for the non-streaming path (the window IS
+; the whole fixed caller buffer there, never moves), but a streaming
+; refill's memmove can relocate/overwrite bytes a previously-lexed
+; token's basix_tok_text still points at if a parser call site holds
+; that pointer across a later basix_lex_next call (basix_parse_dim and
+; basix_parse_assignment both do, saving an identifier's tok_text
+; across the lex_next that consumes it). basix_lex_copy_tok_text (used
+; by the identifier and string-literal paths below) copies into this
+; fixed scratch buffer instead, so tok_text stays valid regardless of
+; any later window movement -- decouples every such parser call site
+; from needing to know or care about the lexer's internal buffering
+; strategy, present or future.
+BASIX_TOK_TEXT_BUF_SIZE equ 256
+basix_tok_text_buf: times BASIX_TOK_TEXT_BUF_SIZE db 0
 
 ; Keyword table: each entry is {length: db, token_type: dd, text: 16 bytes
 ; uppercase, NUL-padded}. Terminated by a zero length byte.
@@ -792,5 +1051,29 @@ basix_keywords:
     db 4
     dd TOK_LINE
     db 'LINE', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 3
+    dd TOK_SIN
+    db 'SIN', 0,0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 3
+    dd TOK_COS
+    db 'COS', 0,0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 3
+    dd TOK_TAN
+    db 'TAN', 0,0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_ASIN
+    db 'ASIN', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_ACOS
+    db 'ACOS', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_ATAN
+    db 'ATAN', 0,0,0,0,0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table

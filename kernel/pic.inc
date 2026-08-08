@@ -110,6 +110,14 @@ irq0_stub:
     mov dword [rel sched_quantum_counter], 0
 
     mov [rax+TCB_RSP], rsp              ; save the outgoing task's context
+    mov r8, [rax+TCB_FPU]               ; the GPR push list above covers no
+    fxsave [r8]                         ; XMM/x87 state at all, and BASIX64
+                                         ; float programs live almost
+                                         ; entirely in XMM -- without this,
+                                         ; a task preempted mid float
+                                         ; computation resumes with
+                                         ; whichever XMM state the next
+                                         ; task(s) happened to leave behind
     call sched_pick_next                ; rax=outgoing (unchanged); rcx=next
     mov [rel current_task], rcx
 
@@ -125,6 +133,9 @@ irq0_stub:
     lea rdx, [rel pml4]
 .use_task_cr3:
     mov cr3, rdx
+
+    mov r8, [rcx+TCB_FPU]
+    fxrstor [r8]
 
     mov rsp, [rcx+TCB_RSP]              ; switch to the incoming task's stack
 

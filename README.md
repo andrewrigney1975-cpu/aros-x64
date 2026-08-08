@@ -384,8 +384,25 @@ diskpart scripts there let Windows mount them read/write for inspection
 without ever re-running the destructive `make_*` (format) scripts against
 an already-populated volume.
 
-Real hardware / USB-image creation (GPT + FAT32 ESP) is a later-phase
-concern once more of the kernel exists.
+`scripts/build.sh` also produces `build/aros.img`: a real GPT-partitioned
+disk image with a FAT32 EFI System Partition (built from scratch in
+`scripts/make_image.py`, pure Python stdlib -- no mtools/dd/diskpart, since
+GPT partitioning tools need admin/root privileges even against a plain
+file, which building the byte layout directly against the GPT/FAT32 specs
+sidesteps entirely). It's validated by booting it directly in QEMU
+(`-drive file=build/aros.img,format=raw`, bypassing the `fat:rw:`
+passthrough) and confirming an identical self-test pass. For a physical
+USB stick: `dd if=build/aros.img of=/dev/sdX bs=4M status=progress`, or on
+Windows, Rufus in "DD Image" mode (not its default ISO mode) so the raw
+GPT bytes are written 1:1.
+
+Real-hardware boot is a work in progress: a Dell laptop's UEFI firmware
+correctly recognizes the image's GPT/ESP as a bootable UEFI entry
+(confirming the image format itself is sound), but selecting it goes
+black and drops into the vendor's diagnostics rather than reaching the
+bootloader's own serial output -- something the hand-built PE32+ header
+or a fixed-address assumption in `boot/bootloader.asm` tolerates under
+OVMF but not real firmware. Root cause not yet found.
 
 ## Known limitations (tracked, not forgotten)
 

@@ -12,6 +12,22 @@ BASIX_MAX_LABELS  equ 32
 BASIX_MAX_FIXUPS  equ 64
 BASIX_MAX_FOR_DEPTH equ 8
 
+; var_type encoding continued (0=INT,1=SFLOAT,2=DFLOAT,3=VECTOR2,
+; 4=VECTOR3,5=VECTOR4,6=MATRIX4 -- see basix_parser.inc's DIM parsing):
+; 1D arrays are 7/8. Both SFLOAT and DFLOAT array elements use
+; BASIX_VARTYPE_ARRAY_FLOAT (8-byte double storage per element either
+; way) -- unlike scalar SFLOAT, arrays don't get the 4-byte-per-element
+; packing, a deliberate simplification since nothing here needs the
+; memory savings and it avoids array code needing to track a second,
+; smaller element size.
+BASIX_VARTYPE_ARRAY_INT   equ 7
+BASIX_VARTYPE_ARRAY_FLOAT equ 8
+
+BASIX_ARRAY_ARENA_SIZE equ 262144        ; 256KB, bump-allocated by DIM's
+                                          ; array path; ~32K doubles total
+                                          ; across however many arrays a
+                                          ; program declares
+
 ; -------------------------------------------------------------------------
 ; basix_name_eq: RCX = candidate ptr, EDX = candidate len, R8 = stored
 ; name field (32 bytes, NUL-padded, already upper-case). Returns EAX=1/0,
@@ -94,6 +110,38 @@ basix_name_copy_upper:
     jmp .loop
 .done:
     pop r9
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_save_ident: RCX = name ptr, EDX = len. Copies (clamped to 31
+; bytes) into basix_saved_ident_buf/basix_saved_ident_len -- see the
+; comment there for why this exists.
+; -------------------------------------------------------------------------
+basix_save_ident:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    mov eax, edx
+    cmp eax, 31
+    jbe .len_ok
+    mov eax, 31
+.len_ok:
+    mov [rel basix_saved_ident_len], eax
+
+    mov rsi, rcx                        ; source pointer
+    lea rdi, [rel basix_saved_ident_buf]
+    mov ecx, eax                        ; copy count
+    cld
+    rep movsb
+
     pop rdi
     pop rsi
     pop rdx
@@ -419,6 +467,11 @@ basix_var_slots: times BASIX_MAX_VARS dq 0
 align 8
 basix_var_wide_slots: times (BASIX_MAX_VARS * 128) db 0
 
+basix_var_arr_len: times BASIX_MAX_VARS dd 0   ; element count, arrays only
+basix_array_arena_pos: dd 0
+align 8
+basix_array_arena: times BASIX_ARRAY_ARENA_SIZE db 0
+
 align 8
 basix_vec_scalar_temp: dq 0              ; accumulator for dot/length/matmul
 basix_mat_scratch:     times 16 dq 0     ; MMUL result staging (alias safety)
@@ -439,3 +492,15 @@ basix_for_depth: dd 0
 align 8
 basix_for_end_temps:  times BASIX_MAX_FOR_DEPTH dq 0
 basix_for_step_temps: times BASIX_MAX_FOR_DEPTH dq 0
+
+; Shared scratch for any parser call site that needs an identifier's
+; text to survive a later basix_lex_next call (basix_parse_dim's own
+; name across the "AS"/type-keyword tokens; GOTO/GOSUB's target name
+; across the lookahead lex_next that follows it) -- copied immediately
+; via basix_save_ident rather than trusting the lexer's shared
+; tok_text_buf to survive whatever gets lexed next, which silently
+; overwrites it if that next token is itself an identifier/keyword.
+; Never used by two call sites at once (DIM/GOTO/GOSUB parsing never
+; nests), so one shared buffer is enough.
+basix_saved_ident_buf: times 32 db 0
+basix_saved_ident_len: dd 0

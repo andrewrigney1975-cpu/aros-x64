@@ -18,9 +18,15 @@ basix_emit_u8:
     push rbx
     push rcx
     mov ecx, [rel basix_code_pos]
+    cmp ecx, BASIX_CODE_BUF_SIZE
+    jae .overflow
     lea rbx, [rel basix_code_buf]
     mov [rbx+rcx], al
     inc dword [rel basix_code_pos]
+    jmp .out
+.overflow:
+    mov dword [rel basix_compile_ok], 0
+.out:
     pop rcx
     pop rbx
     ret
@@ -34,9 +40,15 @@ basix_emit_u32:
     push rdx
     mov edx, eax
     mov ecx, [rel basix_code_pos]
+    cmp ecx, BASIX_CODE_BUF_SIZE - 4
+    ja .overflow
     lea rbx, [rel basix_code_buf]
     mov [rbx+rcx], edx
     add dword [rel basix_code_pos], 4
+    jmp .out
+.overflow:
+    mov dword [rel basix_compile_ok], 0
+.out:
     pop rdx
     pop rcx
     pop rbx
@@ -51,9 +63,15 @@ basix_emit_u64:
     push rdx
     mov rdx, rax
     mov ecx, [rel basix_code_pos]
+    cmp ecx, BASIX_CODE_BUF_SIZE - 8
+    ja .overflow
     lea rbx, [rel basix_code_buf]
     mov [rbx+rcx], rdx
     add dword [rel basix_code_pos], 8
+    jmp .out
+.overflow:
+    mov dword [rel basix_compile_ok], 0
+.out:
     pop rdx
     pop rcx
     pop rbx
@@ -269,6 +287,20 @@ basix_i_cmp_rax_rcx: db 0x48,0x39,0xC8
 basix_i_neg_rax:     db 0x48,0xF7,0xD8
 basix_i_ret:         db 0xC3
 
+; Array addressing -- RDX-based variants of imul/add/cmp exist purely so
+; an indexed INT array store can keep its value in RCX (untouched by
+; any of these) while the index-in-RAX becomes an address using RDX as
+; the scratch operand instead. Float array stores don't need these
+; (the value lives in XMM0, never in a GP register the address math
+; would otherwise fight over), but the array-read paths use them too
+; for consistency -- one address-computation shape for every array
+; access rather than two.
+basix_i_imul_rax_rdx: db 0x48,0x0F,0xAF,0xC2
+basix_i_add_rax_rdx:  db 0x48,0x01,0xD0
+basix_i_cmp_rax_rdx:  db 0x48,0x39,0xD0
+basix_i_mov_rax_memrax: db 0x48,0x8B,0x00       ; mov rax,[rax]
+basix_i_mov_memrax_rcx: db 0x48,0x89,0x08       ; mov [rax],rcx
+
 ; =========================================================================
 ; Thin wrappers around basix_emit_bytes for each fixed pattern above --
 ; tail-called (jmp, not call) since they have nothing left to do after.
@@ -340,6 +372,26 @@ basix_emit_neg_rax:
 basix_emit_ret_instr:
     lea rcx, [rel basix_i_ret]
     mov edx, 1
+    jmp basix_emit_bytes
+basix_emit_imul_rax_rdx:
+    lea rcx, [rel basix_i_imul_rax_rdx]
+    mov edx, 4
+    jmp basix_emit_bytes
+basix_emit_add_rax_rdx:
+    lea rcx, [rel basix_i_add_rax_rdx]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_cmp_rax_rdx:
+    lea rcx, [rel basix_i_cmp_rax_rdx]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_mov_rax_memrax:
+    lea rcx, [rel basix_i_mov_rax_memrax]
+    mov edx, 3
+    jmp basix_emit_bytes
+basix_emit_mov_memrax_rcx:
+    lea rcx, [rel basix_i_mov_memrax_rcx]
+    mov edx, 3
     jmp basix_emit_bytes
 
 ; =========================================================================
