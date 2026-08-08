@@ -9,7 +9,7 @@ BASIX64: a mixed-case-keyword BASIC-inspired language with `sfloat`,
 `dfloat`, matrices, and 3D/GUI-oriented math, compiled directly to native
 machine code by a compiler running inside the kernel itself.
 
-## Status: Phase 11 — extended keyboard, exFAT write-path completion, per-task paging
+## Status: Phase 13 — USB device enumeration and Mass Storage (Bulk-Only Transport)
 
 This is an as-built log: each phase below is implemented, tested (either via
 the boot-time regression suite or interactively through QEMU), and merged.
@@ -256,12 +256,101 @@ kernel are read back correctly by Windows' own exFAT driver.
   `-d int` CPU-level interrupt trace after a couple of misleading serial-
   print debugging detours.
 
+### Phase 12 — local APIC, MSI interrupts, xHCI controller bring-up
+- **Local APIC bring-up** (`apic.inc`) — `lapic_init` reads/sets the
+  `IA32_APIC_BASE` MSR's global enable bit, stores the LAPIC's MMIO base,
+  and sets the Spurious-Interrupt-Vector-Register's software-enable bit
+  (bit 8) — without that second bit the LAPIC silently drops every
+  interrupt even though it looks "on". `lapic_eoi` is required reading for
+  any MSI-delivered ISR, since MSI bypasses the legacy 8259 PIC entirely
+  (`out 0x20, al` does nothing for it).
+- **PCI MSI support** (`pci.inc`) — `pci_find_capability` walks a device's
+  PCI capability list (Status register bit 4 → Capabilities Pointer →
+  linked list of ID+Next+data entries); `pci_enable_msi` programs a
+  device's MSI capability (handling both the 32-bit and 64-bit-capable
+  Message Address layouts) to fire a chosen vector at this CPU's local
+  APIC. Proven via a dedicated AHCI-based test (`msi_test`): arm MSI on a
+  real AHCI controller, reissue a read, confirm the interrupt actually
+  arrives instead of just trusting the programming looks right.
+- **xHCI controller bring-up** (`xhci.inc`) — PCI detection (class
+  0x0C/subclass 0x03/prog-if 0x30), 64-bit MMIO BAR mapping, Capability
+  Register reads (CAPLENGTH/HCIVERSION/HCSPARAMS1/HCCPARAMS1, including
+  the Context Size bit that later determines 32- vs 64-byte contexts),
+  full controller reset (stop → HCRST → wait CNR clear), Device Context
+  Base Address Array + Command Ring + Event Ring (with an Event Ring
+  Segment Table) bring-up, a No-Op Command round-trip proof (submit →
+  doorbell → poll the event ring for the Command Completion Event) before
+  any of that ring/doorbell/poll mechanism gets reused for real commands,
+  and port status scanning (connect status + negotiated speed per port).
+  Every wait loop is bounded rather than open-ended, so a controller that
+  never clears a status bit degrades to "USB isn't working" instead of
+  "the kernel doesn't boot at all".
+
+### Phase 13 — USB device enumeration and Mass Storage (Bulk-Only Transport)
+- **Device enumeration** (`xhci.inc`) — Port Reset (required before a
+  port's negotiated Speed is valid or the device is addressable at all —
+  initially missed, see bugs below), Enable Slot Command (assigns a Slot
+  ID), Device/Input Context + a dedicated EP0 Transfer Ring allocation
+  (Slot Context Route String/Speed/Context Entries, EP0 Context CErr/Type/
+  Max Packet Size/ring dequeue pointer), Address Device Command, and a
+  generic `xhci_control_transfer` (Setup/optional-Data/Status TRBs, IDT —
+  Immediate Data — used for the Setup stage so the 8-byte setup packet
+  needs no separate buffer) used to fetch the real Device Descriptor and
+  the full Configuration descriptor (parsed by each entry's own `bLength`
+  to find the Mass-Storage/SCSI/Bulk-Only interface and its two Bulk
+  endpoints).
+- **USB Mass Storage** (`xhci.inc`, `storage.inc`) — `SET_CONFIGURATION`,
+  a Configure Endpoint Command building fresh Bulk IN/OUT transfer rings
+  and endpoint contexts, and the Bulk-Only Transport protocol itself
+  (`xhci_msd_command`: a 31-byte Command Block Wrapper on Bulk OUT, an
+  optional data phase, a 13-byte Command Status Wrapper read back on Bulk
+  IN with signature/tag/status checked). SCSI INQUIRY and READ CAPACITY(10)
+  prove the whole pipeline; READ(10)/WRITE(10) are wired into `storage.inc`
+  as a new `STORAGE_USB` backend, selected only when neither AHCI nor NVMe
+  found a device at boot (the fallback of last resort, matching the
+  eventual goal of booting from a bare USB drive with no other storage
+  present) — in the QEMU test rig NVMe always wins first, so the exFAT
+  test suite keeps exercising NVMe unaffected while a direct
+  `usb_msd_read_sectors` call in the boot self-test still proves the USB
+  path itself works.
+- A shared `xhci_ring_enqueue_trb` helper (write a TRB at a ring's current
+  enqueue slot, advance past its own Link TRB, toggle cycle state) backs
+  every transfer ring in this driver (EP0, Bulk IN, Bulk OUT) — introduced
+  after a copy-pasted version of exactly this logic produced one of the
+  bugs below; one implementation is one place left to get it wrong.
+- Three real bugs found and fixed while bringing this phase up, each
+  root-caused via targeted register/memory dumps against the running QEMU
+  instance rather than guessed at: the EP0 Context's TR Dequeue Pointer
+  and Average TRB Length fields were at the wrong byte offsets (off by one
+  dword each) in `xhci_setup_device_slot`; `xhci_scan_ports` never issued
+  a Port Reset after detecting connect, so the negotiated Speed field was
+  stale/zero and the device was never truly addressable even though
+  Enable Slot/Address Device could still nominally "succeed" against it;
+  and the boot self-test in `kernel.asm` clobbered the Slot ID register
+  with a message-string pointer (`serial_puts`'s own argument register)
+  between Address Device and the first `GET_DESCRIPTOR` call, so the
+  descriptor transfer silently rang the wrong device's doorbell — every
+  TRB and context field involved was correct, which is what made this one
+  take the longest to isolate.
+- xHCI is the only USB host-controller interface targeted (every 8th-gen-
+  or-later Intel platform this project targets exposes USB exclusively
+  through it); legacy UHCI/OHCI/EHCI aren't implemented. Only one USB
+  mass-storage device is supported at a time (no hot-plug, no multiple
+  concurrent slots, no LUN enumeration beyond LUN 0, no USB hub/multi-tier
+  topology) — enough to prove the driver stack end to end and serve as
+  the eventual physical-hardware boot path, not a general-purpose USB
+  subsystem.
+
 Current boot sequence (verified via serial log and QEMU screendumps):
 GDT/IDT/PIC/timer → paging → PMM/VMM/heap self-tests (including
-split/coalesce) → AHCI + NVMe device bring-up and LBA0 read → exFAT mount
-(GPT or MBR), file lookup, read-back, write-path self-tests (bitmap/FAT-
-chain/directory/file write, long filenames, delete/rename/truncate/append)
-→ scheduler bring-up, preemption proof, process-termination/canary-guard
+split/coalesce) → local APIC bring-up → AHCI + NVMe device bring-up and
+LBA0 read, MSI interrupt proof on AHCI → exFAT mount (GPT or MBR), file
+lookup, read-back, write-path self-tests (bitmap/FAT-chain/directory/file
+write, long filenames, delete/rename/truncate/append) → xHCI controller
+reset/ring bring-up, port scan, full USB device enumeration (Enable
+Slot/Address Device/descriptor reads) and USB Mass Storage bring-up
+(Configure Endpoint, SCSI INQUIRY/READ CAPACITY/READ(10) round-trip) →
+scheduler bring-up, preemption proof, process-termination/canary-guard
 verification (now exercising per-task page tables) → BASIX64 compile-and-
 run smoke test → drops into the interactive shell.
 
@@ -316,6 +405,13 @@ concern once more of the kernel exists.
   suspected. Files created by the kernel itself are unaffected and found
   reliably every time; only pre-seeded, externally-written files are hit.
   Root cause unconfirmed.
+- USB: only xHCI is supported (no UHCI/OHCI/EHCI), only one USB mass-
+  storage device at a time (no hot-plug, no hubs, only LUN 0), and the
+  UEFI bootloader itself still boots via UEFI's own file-system protocol
+  — the kernel's own USB/xHCI driver isn't yet in that path, so "boot from
+  a bare USB drive on physical hardware" (the eventual goal) still needs
+  the bootloader stage to either rely on firmware USB boot support or gain
+  its own pre-ExitBootServices USB driver, neither done yet.
 - BASIX64: `FOR` loop control values are always truncated to int, names
   limited to 15 ASCII characters, no nested-FOR beyond 8 levels deep, no
   float literal scientific-notation *display* (only accepted on input), no
