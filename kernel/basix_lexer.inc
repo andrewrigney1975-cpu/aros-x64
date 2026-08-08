@@ -82,6 +82,10 @@ TOK_MIDENT  equ 72
 TOK_MMUL    equ 73
 TOK_MVMUL   equ 74
 
+; Graphics statements
+TOK_PSET    equ 75
+TOK_LINE    equ 76
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -780,5 +784,13 @@ basix_keywords:
     db 5
     dd TOK_MVMUL
     db 'MVMUL', 0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_PSET
+    db 'PSET', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_LINE
+    db 'LINE', 0,0,0,0,0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table
