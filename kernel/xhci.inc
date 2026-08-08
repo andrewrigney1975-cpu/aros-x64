@@ -73,6 +73,16 @@ xhci_find_and_probe:
     mov [rel xhci_hciversion], ax
     mov eax, [rbx+0x04]                 ; HCSPARAMS1
     mov [rel xhci_hcsparams1], eax
+    mov eax, [rbx+0x10]                 ; HCCPARAMS1
+    mov [rel xhci_hccparams1], eax
+    and eax, 0x00000004                 ; CSZ (bit 2): 0 = 32-byte contexts,
+                                         ; 1 = 64-byte contexts
+    jz .csz32
+    mov dword [rel xhci_context_size], 64
+    jmp .csz_done
+.csz32:
+    mov dword [rel xhci_context_size], 32
+.csz_done:
 
     movzx ecx, byte [rel xhci_caplength]
     mov rax, rbx
@@ -299,11 +309,16 @@ xhci_reset_and_start:
 ; xhci_scan_ports: reads PORTSC for every port the controller reports
 ; (HCSPARAMS1's MaxPorts field) and records which ones currently have a
 ; device connected (CCS, bit0) along with that port's negotiated speed
-; (bits 10-13) -- read-only, no state changes to the controller. Device
-; enumeration (the next phase) needs to know which port to actually
-; address; this is that lookup. Returns EAX = number of ports with a
-; device connected (0 is a valid, non-error result -- an idle QEMU
-; xhci0 with nothing attached to it looks exactly like this).
+; (bits 10-13). Any connected port also gets a Port Reset issued and
+; waited out here -- required before Speed is valid and before the
+; device is ready to be addressed at all -- so this is no longer
+; read-only against the controller for ports with something plugged
+; in. Device enumeration (the next phase) needs to know which port to
+; actually address, and the negotiated speed value goes straight into
+; that device's Slot Context; this is that lookup. Returns EAX =
+; number of ports with a device connected (0 is a valid, non-error
+; result -- an idle QEMU xhci0 with nothing attached to it looks
+; exactly like this).
 ; -------------------------------------------------------------------------
 xhci_scan_ports:
     push rax
@@ -312,6 +327,7 @@ xhci_scan_ports:
     push rdx
     push rsi
     push rdi
+    push r8
 
     mov eax, [rel xhci_hcsparams1]
     shr eax, 24
@@ -320,6 +336,11 @@ xhci_scan_ports:
 
     lea rdi, [rel xhci_port_connected]
     mov ecx, eax
+    xor eax, eax
+    cld
+    rep stosb
+    lea rdi, [rel xhci_port_speed]
+    mov ecx, [rel xhci_max_ports]
     xor eax, eax
     cld
     rep stosb
@@ -340,6 +361,42 @@ xhci_scan_ports:
     mov byte [rdx+rcx], 1
     inc esi
 
+    ; Port Reset: required before Speed is valid and the device is
+    ; addressable at all -- USB2 link training completes here (a
+    ; SuperSpeed port typically finishes its own equivalent near-
+    ; instantly, but resetting unconditionally is harmless and keeps
+    ; this one code path correct for every speed). Skipping this
+    ; leaves the Speed field stale/zero and the device unresponsive to
+    ; every later command -- Enable Slot/Address Device can still
+    ; "succeed" against a bogus Speed=0 slot context, but no transfer
+    ; ever completes. RW1C status bits (CSC/PEC/WRC/OCC/PRC/PLC/CEC,
+    ; bits17-23) are masked off on every read-modify-write here so a
+    ; write only clears the one status bit actually intended.
+    mov eax, [rbx]                      ; re-read PORTSC
+    and eax, ~0x00FE0000
+    or eax, 0x00000010                  ; PR (Port Reset)
+    mov [rbx], eax
+
+    mov r8d, 5000000
+.wait_reset_port:
+    mov eax, [rbx]
+    test eax, 0x00000010                ; PR self-clears when done
+    jz .reset_port_done
+    dec r8d
+    jnz .wait_reset_port
+.reset_port_done:
+    mov eax, [rbx]
+    and eax, ~0x00FE0000
+    or eax, 0x00200000                  ; PRC (write-1-clear)
+    mov [rbx], eax
+
+    mov eax, [rbx]                      ; fresh PORTSC, post-reset
+    mov edx, eax
+    shr edx, 10
+    and edx, 0x0F                       ; Port Speed (bits 10-13)
+    lea rax, [rel xhci_port_speed]
+    mov [rax+rcx], dl
+
 .next_port:
     add rbx, 0x10                       ; each Port Register Set is 4
                                          ; dwords (PORTSC/PORTPMSC/PORTLI/
@@ -348,6 +405,7 @@ xhci_scan_ports:
     jmp .port_loop
 .done:
     mov eax, esi
+    pop r8
     pop rdi
     pop rsi
     pop rdx
@@ -495,6 +553,1777 @@ xhci_noop_test:
     pop rbx
     ret
 
+; -------------------------------------------------------------------------
+; xhci_submit_command: generic command-ring submission, used by every
+; xHCI command from here on (Enable Slot, Address Device, Configure
+; Endpoint, ...) instead of duplicating xhci_noop_test's ring/doorbell/
+; poll dance at each call site. Writes a TRB at the current enqueue
+; slot, rings the command doorbell, and polls the event ring (bounded)
+; for the matching Command Completion Event.
+;
+; Input:  RDI = TRB Parameter (64-bit, command-specific -- e.g. an Input
+;         Context pointer for Address Device; 0 for Enable Slot),
+;         ESI = TRB Status (32-bit, command-specific; 0 for both of the
+;         above), ECX = TRB Type (6-bit value, e.g. 9=Enable Slot,
+;         11=Address Device -- NOT pre-shifted), R10D = extra Control
+;         bits already positioned at their final bit offsets (e.g. a
+;         Slot ID at bits 24-31, or the BSR bit for Address Device; 0
+;         for commands like Enable Slot that need none of this).
+; Output: EAX = 1 if a Command Completion Event was seen before the
+;         poll bound, 0 on timeout. On EAX=1: R12 = completion event's
+;         Parameter (bits 0-31 hold the Input/Device Context pointer
+;         low bits for some commands; unused for Enable Slot), R13D =
+;         completion event's Status (bits 24-31 = Completion Code, 1 =
+;         Success), R14D = completion event's Control (bits 24-31 =
+;         Slot ID assigned/addressed).
+; -------------------------------------------------------------------------
+xhci_submit_command:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    mov r8, rdi                         ; r8 = TRB Parameter (survives the
+                                         ; ring-address math below)
+    mov r9d, esi                        ; r9d = TRB Status
+    mov edx, ecx                        ; edx = TRB Type
+                                         ; r10d = extra Control bits (as
+                                         ; passed by the caller, untouched)
+
+    mov rax, [rel xhci_cmdring_enqueue]
+    lea rdi, [rel xhci_cmdring]
+    mov rcx, rax
+    shl rcx, 4                          ; * 16 bytes/TRB
+    add rdi, rcx
+
+    mov [rdi+0], r8                     ; Parameter
+    mov [rdi+8], r9d                    ; Status
+    mov eax, edx
+    shl eax, 10
+    or eax, r10d                        ; extra Control bits
+    mov rbx, [rel xhci_cmdring_cycle]
+    or eax, ebx                         ; Cycle bit
+    mov [rdi+12], eax
+
+    ; Advance the enqueue pointer, following the Link TRB (slot 255)
+    ; and toggling cycle state exactly as the controller will.
+    mov rax, [rel xhci_cmdring_enqueue]
+    inc rax
+    cmp rax, 255
+    jl .no_enq_wrap
+    xor rax, rax
+    mov rbx, [rel xhci_cmdring_cycle]
+    xor rbx, 1
+    mov [rel xhci_cmdring_cycle], rbx
+.no_enq_wrap:
+    mov [rel xhci_cmdring_enqueue], rax
+
+    mov rbx, [rel xhci_db_base]
+    mov dword [rbx+0], 0                ; ring doorbell 0 (command ring)
+
+    mov r9d, 20000000
+.poll:
+    mov rax, [rel xhci_evtring_dequeue]
+    lea rsi, [rel xhci_evtring]
+    mov rcx, rax
+    shl rcx, 4
+    add rsi, rcx                        ; rsi -> next event TRB slot
+
+    mov eax, [rsi+12]                   ; Control
+    mov ebx, eax
+    and ebx, 1                          ; this TRB's cycle bit
+    mov rdx, [rel xhci_evtring_cycle]
+    cmp ebx, edx
+    jne .not_yet
+
+    mov ecx, eax
+    shr ecx, 10
+    and ecx, 0x3F                       ; TRB Type
+    cmp ecx, XHCI_TRB_TYPE_CMD_COMPLETION
+    jne .advance_dequeue
+
+    mov r12, [rsi+0]                    ; completion Parameter
+    mov r13d, [rsi+8]                   ; completion Status
+    mov r14d, [rsi+12]                  ; completion Control
+    mov ebx, 1                          ; result, parked past the pops below
+    call .advance_dequeue_once
+    jmp .writeback
+
+.advance_dequeue:
+    call .advance_dequeue_once
+    jmp .poll
+
+.not_yet:
+    dec r9d
+    jnz .poll
+    xor ebx, ebx
+    jmp .writeback
+
+.advance_dequeue_once:
+    push rax
+    push rdx
+    mov rax, [rel xhci_evtring_dequeue]
+    inc rax
+    cmp rax, 256
+    jl .adv_no_wrap
+    xor rax, rax
+    mov rdx, [rel xhci_evtring_cycle]
+    xor rdx, 1
+    mov [rel xhci_evtring_cycle], rdx
+.adv_no_wrap:
+    mov [rel xhci_evtring_dequeue], rax
+    pop rdx
+    pop rax
+    ret
+
+.writeback:
+    mov rax, [rel xhci_rt_base]
+    add rax, 0x20
+    push rax
+    mov rax, [rel xhci_evtring_dequeue]
+    shl rax, 4
+    lea rdx, [rel xhci_evtring]
+    add rax, rdx
+    or al, 8                            ; EHB (write-1-clear)
+    pop rdx
+    mov [rdx+0x18], rax                 ; ERDP
+
+    mov eax, ebx
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_enable_slot: submits an Enable Slot Command and returns the Slot
+; ID the controller assigned. First real device-management command --
+; every later step (Address Device, Configure Endpoint, transfers) is
+; addressed by this Slot ID. Returns EAX = Slot ID (1-255) on success,
+; 0 on failure (no completion event, or a non-Success completion code).
+; -------------------------------------------------------------------------
+XHCI_TRB_TYPE_ENABLE_SLOT equ 9
+XHCI_COMPLETION_SUCCESS equ 1
+
+xhci_enable_slot:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    xor edi, edi                        ; Parameter = 0
+    xor esi, esi                        ; Status = 0
+    mov ecx, XHCI_TRB_TYPE_ENABLE_SLOT
+    xor r10d, r10d                      ; no extra Control bits
+    call xhci_submit_command
+    test eax, eax
+    jz .fail
+
+    mov ebx, r13d
+    shr ebx, 24
+    and ebx, 0xFF                       ; Completion Code
+    cmp ebx, XHCI_COMPLETION_SUCCESS
+    jne .fail
+
+    mov eax, r14d
+    shr eax, 24
+    and eax, 0xFF                       ; Slot ID
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_address_device: submits an Address Device Command against a
+; slot's already-built Input Context (from xhci_setup_device_slot),
+; assigning the device a real USB address and moving its Slot State to
+; Addressed. BSR (Block Set Address Request) is left at 0 -- we want
+; the controller to issue the actual SET_ADDRESS request, not just
+; latch the context.
+;
+; Input:  ECX = Slot ID, RDI = Input Context pointer (from
+;         xhci_setup_device_slot's xhci_input_ctx).
+; Output: EAX = 1 on a Success completion, 0 on timeout or any other
+;         completion code (e.g. a real device that NAKs SET_ADDRESS).
+; -------------------------------------------------------------------------
+XHCI_TRB_TYPE_ADDRESS_DEVICE equ 11
+
+xhci_address_device:
+    push rbx
+    push rcx
+    push r12
+    push r13
+    push r14
+
+    mov ebx, ecx                        ; ebx = Slot ID (survives the
+                                         ; RDI/ESI/ECX shuffle below)
+
+    ; RDI already holds the Input Context pointer (this routine's own
+    ; input register matches xhci_submit_command's Parameter input).
+    xor esi, esi                        ; Status = 0
+    mov ecx, XHCI_TRB_TYPE_ADDRESS_DEVICE
+    mov r10d, ebx
+    shl r10d, 24                        ; Slot ID at bits 24-31, BSR=0
+    call xhci_submit_command
+    test eax, eax
+    jz .fail
+
+    mov eax, r13d
+    shr eax, 24
+    and eax, 0xFF                       ; Completion Code
+    cmp eax, XHCI_COMPLETION_SUCCESS
+    jne .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_setup_device_slot: builds the Input Context (Input Control + Slot
+; + EP0 contexts) and EP0 Transfer Ring for a device that has just been
+; given a Slot ID via xhci_enable_slot, and points DCBAA[slot_id] at a
+; freshly zeroed Device Context (the controller fills this in once
+; Address Device succeeds -- we only need to allocate and zero it here).
+; Does not touch the controller itself; xhci_address_device (next step)
+; is what actually submits the Input Context to hardware.
+;
+; This phase only ever has one device attached (the QEMU usb-storage
+; test device), so a single static set of buffers is enough -- a real
+; multi-device driver would index these per slot ID, but that's beyond
+; what this phase needs to prove.
+;
+; Input:  ECX = Slot ID (from xhci_enable_slot), EDX = port index
+;         (0-based, into xhci_port_connected/xhci_port_speed -- the
+;         port this device was found on by xhci_scan_ports).
+; Output: EAX = 1/0. Only fails if the Slot ID is out of DCBAA's range.
+; -------------------------------------------------------------------------
+XHCI_EP_TYPE_CONTROL equ 4
+
+xhci_setup_device_slot:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+
+    mov r8d, ecx                        ; r8d = Slot ID
+    mov r9d, edx                        ; r9d = port index
+
+    cmp r8d, 0
+    jz .fail
+    cmp r8d, XHCI_MAX_SLOTS
+    ja .fail
+
+    ; EP0 Transfer Ring: same ring discipline as the command/event rings
+    ; -- zeroed, Link TRB at the last of 256 slots, cycle state starts 1.
+    lea rdi, [rel xhci_ep0_ring]
+    mov ecx, 4096
+    xor eax, eax
+    cld
+    rep stosb
+
+    lea rsi, [rel xhci_ep0_ring]
+    lea rdi, [rel xhci_ep0_ring]
+    add rdi, 4096 - 16
+    mov [rdi+0], rsi
+    mov dword [rdi+8], 0
+    mov dword [rdi+12], (6 << 10) | 0x02 | 0x01   ; Type=Link, TC=1, Cycle=1
+    mov qword [rel xhci_ep0_ring_cycle], 1
+    mov qword [rel xhci_ep0_ring_enqueue], 0
+
+    ; Device Context: zeroed, controller fills it in once Address Device
+    ; succeeds. Sized for the worst case (64-byte contexts * 32 entries).
+    lea rdi, [rel xhci_dev_ctx]
+    mov ecx, 2048
+    xor eax, eax
+    cld
+    rep stosb
+
+    lea rax, [rel xhci_dev_ctx]
+    lea rdx, [rel xhci_dcbaa]
+    mov rcx, r8
+    shl rcx, 3                           ; slot ID * 8 bytes/pointer
+    mov [rdx+rcx], rax                   ; DCBAA[slot_id] = Device Context
+
+    ; Input Context: zeroed, then Input Control + Slot + EP0 contexts
+    ; filled in.
+    lea rdi, [rel xhci_input_ctx]
+    mov ecx, 2112
+    xor eax, eax
+    cld
+    rep stosb
+
+    mov ecx, [rel xhci_context_size]
+
+    ; Input Control Context (index 0): A0 (Slot) and A1 (EP0) Add
+    ; Context flags -- this Address Device command initializes both.
+    lea rdi, [rel xhci_input_ctx]
+    mov dword [rdi+4], 0x00000003
+
+    ; Slot Context (index 1): Route String=0 (direct root-port attach),
+    ; Speed=this port's negotiated speed, Context Entries=1 (only EP0
+    ; is being initialized), Root Hub Port Number = port index + 1
+    ; (PORTSC ports are 1-based in the Slot Context, 0-based in our own
+    ; xhci_port_connected/xhci_port_speed arrays).
+    lea rdi, [rel xhci_input_ctx]
+    add rdi, rcx                         ; rdi -> Slot Context
+
+    lea rax, [rel xhci_port_speed]
+    movzx eax, byte [rax+r9]
+    and eax, 0x0F
+    shl eax, 20
+    or eax, (1 << 27)                    ; Context Entries = 1
+    mov [rdi+0], eax
+
+    mov eax, r9d
+    inc eax                              ; Root Hub Port Number (1-based)
+    shl eax, 16
+    mov [rdi+4], eax
+
+    ; EP0 Context (index 2): Control endpoint, CErr=3 (max retry count),
+    ; Max Packet Size per negotiated speed (the real value gets refined
+    ; once the device descriptor is read; this is the safe default per
+    ; spec), TR Dequeue Pointer = EP0 ring base with DCS=1, Average TRB
+    ; Length=8 (a reasonable default for control transfers).
+    lea rdi, [rel xhci_input_ctx]
+    mov rax, rcx
+    shl rax, 1
+    add rdi, rax                         ; rdi -> EP0 Context
+
+    call .ep0_max_packet_size            ; eax = max packet size for r9's port speed
+
+    mov ebx, eax
+    shl ebx, 16                          ; Max Packet Size (bits 16-31)
+    or ebx, (XHCI_EP_TYPE_CONTROL << 3)  ; EP Type (bits 3-5)
+    or ebx, (3 << 1)                     ; CErr (bits 1-2)
+    mov [rdi+4], ebx
+
+    lea rax, [rel xhci_ep0_ring]
+    or al, 1                             ; DCS = 1 (initial cycle state)
+    mov [rdi+8], rax                     ; TR Dequeue Pointer (64-bit)
+
+    mov dword [rdi+16], (8 << 0)         ; Average TRB Length
+
+    mov eax, 1
+    jmp .out
+
+.ep0_max_packet_size:
+    ; r9d = port index (0-based). Looks up that port's negotiated speed
+    ; and returns the spec-default EP0 max packet size for it in EAX.
+    push rdx
+    lea rdx, [rel xhci_port_speed]
+    movzx eax, byte [rdx+r9]
+    cmp eax, 4                          ; SuperSpeed and above: 512
+    jae .mps_512
+    cmp eax, 3                          ; High Speed: 64
+    je .mps_64
+    mov eax, 8                          ; Full/Low Speed: 8
+    jmp .mps_out
+.mps_64:
+    mov eax, 64
+    jmp .mps_out
+.mps_512:
+    mov eax, 512
+.mps_out:
+    pop rdx
+    ret
+
+.fail:
+    xor eax, eax
+.out:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_get_device_descriptor: issues a standard GET_DESCRIPTOR(Device)
+; control transfer against a slot's EP0 (Setup/Data/Status stage TRBs
+; on the EP0 ring built by xhci_setup_device_slot, addressed via
+; xhci_address_device), reading the full 18-byte Device Descriptor into
+; xhci_device_descriptor. This is the proof point for enumeration: a
+; real device descriptor back from real hardware/emulation means the
+; whole ring/context/addressing chain built by this phase actually
+; works, not just that commands complete.
+;
+; The Setup Stage TRB's Parameter field IS the 8-byte Setup Data itself
+; (IDT -- Immediate Data -- is mandatory for Setup TRBs, so there's no
+; separate buffer to build; the 8 setup-packet bytes are folded
+; directly into one 64-bit immediate: bmRequestType=0x80 (device-to-
+; host/standard/device), bRequest=0x06 (GET_DESCRIPTOR), wValue=0x0100
+; (type=Device, index=0), wIndex=0, wLength=18).
+;
+; Input:  ECX = Slot ID.
+; Output: EAX = 1 on Success/Short-Packet completion, 0 on timeout or
+;         any other completion code.
+; -------------------------------------------------------------------------
+XHCI_TRB_TYPE_SETUP_STAGE  equ 2
+XHCI_TRB_TYPE_DATA_STAGE   equ 3
+XHCI_TRB_TYPE_STATUS_STAGE equ 4
+XHCI_TRB_TYPE_TRANSFER_EVENT equ 32
+XHCI_SETUP_GET_DEVICE_DESCRIPTOR equ 0x0012000001000680
+XHCI_COMPLETION_SHORT_PACKET equ 13
+
+xhci_get_device_descriptor:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+
+    mov r8d, ecx                        ; r8d = Slot ID (survives the
+                                         ; TRB-building calls below)
+
+    ; Setup Stage TRB: IDT=1 (bit6), TRT=3 (IN Data Stage, bits16-17),
+    ; TRB Transfer Length=8 (the setup packet's own length).
+    mov rdi, XHCI_SETUP_GET_DEVICE_DESCRIPTOR
+    mov esi, 8
+    mov edx, (XHCI_TRB_TYPE_SETUP_STAGE << 10) | (3 << 16) | (1 << 6)
+    call .write_ep0_trb
+
+    ; Data Stage TRB: DIR=1 (bit16, IN), TRB Transfer Length=18 (the
+    ; full Device Descriptor).
+    lea rdi, [rel xhci_device_descriptor]
+    mov esi, 18
+    mov edx, (XHCI_TRB_TYPE_DATA_STAGE << 10) | (1 << 16)
+    call .write_ep0_trb
+
+    ; Status Stage TRB: DIR=0 (OUT -- opposite of the IN data stage),
+    ; IOC=1 (bit5) so exactly one Transfer Event comes back for this
+    ; whole three-TRB control transfer.
+    xor edi, edi
+    xor esi, esi
+    mov edx, (XHCI_TRB_TYPE_STATUS_STAGE << 10) | (1 << 5)
+    call .write_ep0_trb
+
+    ; Ring this device's doorbell, Target=1 (EP0, Device Context Index
+    ; 1 -- the only endpoint xhci_setup_device_slot initialized).
+    mov rbx, [rel xhci_db_base]
+    mov rcx, r8
+    shl rcx, 2                           ; slot ID * 4 bytes/doorbell
+    mov dword [rbx+rcx], 1
+
+    mov r9d, 20000000
+.poll:
+    mov rax, [rel xhci_evtring_dequeue]
+    lea rsi, [rel xhci_evtring]
+    mov rcx, rax
+    shl rcx, 4
+    add rsi, rcx
+
+    mov eax, [rsi+12]                   ; Control
+    mov ebx, eax
+    and ebx, 1
+    mov rdx, [rel xhci_evtring_cycle]
+    cmp ebx, edx
+    jne .not_yet
+
+    mov ecx, eax
+    shr ecx, 10
+    and ecx, 0x3F                       ; TRB Type
+    cmp ecx, XHCI_TRB_TYPE_TRANSFER_EVENT
+    jne .advance_dequeue
+
+    mov eax, [rsi+8]                    ; completion Status
+    shr eax, 24
+    and eax, 0xFF                       ; Completion Code
+    mov ebx, 0
+    cmp eax, XHCI_COMPLETION_SUCCESS
+    je .mark_ok
+    cmp eax, XHCI_COMPLETION_SHORT_PACKET
+    jne .not_ok
+.mark_ok:
+    mov ebx, 1
+.not_ok:
+    call .advance_dequeue_once
+    jmp .writeback
+
+.advance_dequeue:
+    call .advance_dequeue_once
+    jmp .poll
+
+.not_yet:
+    dec r9d
+    jnz .poll
+    xor ebx, ebx
+    jmp .writeback
+
+.write_ep0_trb:
+    ; RDI = Parameter, ESI = Status, EDX = Control bits (Type + any
+    ; flags, NOT including Cycle). Writes at the current EP0 ring
+    ; enqueue slot, advances the enqueue pointer, following the Link
+    ; TRB (slot 255) and toggling cycle state exactly as the
+    ; controller will.
+    push rax
+    push rcx
+
+    mov rax, [rel xhci_ep0_ring_enqueue]
+    lea rcx, [rel xhci_ep0_ring]
+    push rdx
+    mov rdx, rax
+    shl rdx, 4
+    add rcx, rdx
+    pop rdx
+
+    mov [rcx+0], rdi
+    mov [rcx+8], esi
+    mov eax, edx
+    mov rbx, [rel xhci_ep0_ring_cycle]
+    or eax, ebx
+    mov [rcx+12], eax
+
+    mov rax, [rel xhci_ep0_ring_enqueue]
+    inc rax
+    cmp rax, 255
+    jl .ep0_no_wrap
+    xor rax, rax
+    mov rbx, [rel xhci_ep0_ring_cycle]
+    xor rbx, 1
+    mov [rel xhci_ep0_ring_cycle], rbx
+.ep0_no_wrap:
+    mov [rel xhci_ep0_ring_enqueue], rax
+
+    pop rcx
+    pop rax
+    ret
+
+.advance_dequeue_once:
+    push rax
+    push rdx
+    mov rax, [rel xhci_evtring_dequeue]
+    inc rax
+    cmp rax, 256
+    jl .adv_no_wrap
+    xor rax, rax
+    mov rdx, [rel xhci_evtring_cycle]
+    xor rdx, 1
+    mov [rel xhci_evtring_cycle], rdx
+.adv_no_wrap:
+    mov [rel xhci_evtring_dequeue], rax
+    pop rdx
+    pop rax
+    ret
+
+.writeback:
+    mov rax, [rel xhci_rt_base]
+    add rax, 0x20
+    push rax
+    mov rax, [rel xhci_evtring_dequeue]
+    shl rax, 4
+    lea rdx, [rel xhci_evtring]
+    add rax, rdx
+    or al, 8                            ; EHB (write-1-clear)
+    pop rdx
+    mov [rdx+0x18], rax                 ; ERDP
+
+    mov eax, ebx
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_ring_enqueue_trb: writes a TRB at a transfer ring's current
+; enqueue slot and advances the enqueue pointer (following that ring's
+; own Link TRB at slot 255 and toggling its cycle state exactly as the
+; controller will) -- the same "write TRB, advance, handle wrap" logic
+; every transfer ring needs (EP0's control-transfer ring, and Phase D's
+; Bulk IN/OUT rings), factored out once rather than copy-pasted again.
+; A copy-pasted version of exactly this logic already produced a real
+; offset bug once this phase (the EP0 Context's TR Dequeue Pointer
+; field) -- one implementation is one place left to get it right.
+;
+; Input:  R10 = ring base address (a 4096-byte, 256-TRB-slot buffer,
+;         already carrying its own Link TRB at slot 255), R11 =
+;         pointer to that ring's cycle-state qword, R12 = pointer to
+;         that ring's enqueue-index qword, RDI = TRB Parameter (64-
+;         bit), ESI = TRB Status (32-bit), EDX = TRB Control bits
+;         (Type + any flags, NOT including Cycle -- this routine ORs
+;         the ring's current cycle bit in itself).
+; Output: none. R10/R11/R12 and the TRB fields are all consumed, not
+;         preserved -- same as every other internal helper in this
+;         file, callers that need them again reload from their own
+;         source of truth rather than relying on survival across the
+;         call.
+; -------------------------------------------------------------------------
+xhci_ring_enqueue_trb:
+    push rax
+    push rbx
+    push rcx
+
+    mov rax, [r12]
+    mov rbx, rax
+    shl rbx, 4
+    add rbx, r10                        ; rbx -> current TRB slot
+
+    mov [rbx+0], rdi
+    mov [rbx+8], esi
+    mov ecx, edx
+    mov rax, [r11]
+    or ecx, eax
+    mov [rbx+12], ecx
+
+    mov rax, [r12]
+    inc rax
+    cmp rax, 255
+    jl .no_wrap
+    xor rax, rax
+    mov rcx, [r11]
+    xor rcx, 1
+    mov [r11], rcx
+.no_wrap:
+    mov [r12], rax
+
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_control_transfer: generic three-stage (Setup/optional-Data/
+; Status) EP0 control transfer, for every request beyond the
+; hardcoded GET_DESCRIPTOR(Device) that xhci_get_device_descriptor
+; already proved the ring/context/addressing chain with. Handles both
+; with-data and no-data requests (SET_CONFIGURATION has no data
+; stage), deriving TRT and the Status stage's direction the same way
+; a real driver does: no data stage -> TRT=0, Status=IN always; a data
+; stage -> TRT/Data-stage DIR matches the caller's requested direction,
+; Status direction is the opposite of it.
+;
+; Input:  ECX = Slot ID, RSI = pointer to an 8-byte Setup Packet
+;         (caller-built -- bmRequestType/bRequest/wValue/wIndex/
+;         wLength, standard USB layout), RDI = data buffer pointer (0
+;         if this request has no data stage), R8D = data length in
+;         bytes (0 if none), R9B = data direction (1=IN, 0=OUT; only
+;         meaningful when R8D != 0).
+; Output: EAX = 1 on a Success/Short-Packet completion, 0 on timeout
+;         or any other completion code.
+; -------------------------------------------------------------------------
+xhci_control_transfer:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r13d, ecx                       ; r13d = Slot ID
+    mov r14, rdi                        ; r14 = data buffer pointer
+    mov r15d, r8d                       ; r15d = data length
+    mov bl, r9b                         ; bl = data direction (1=IN/0=OUT)
+
+    lea r10, [rel xhci_ep0_ring]
+    lea r11, [rel xhci_ep0_ring_cycle]
+    lea r12, [rel xhci_ep0_ring_enqueue]
+
+    ; Setup Stage TRB: IDT=1, TRB Transfer Length=8. TRT is 0 (No Data
+    ; Stage) unless the caller asked for a data stage, in which case
+    ; it matches the requested direction.
+    mov rdi, [rsi]                      ; the 8 raw setup-packet bytes
+                                         ; (must be read before RSI/ESI
+                                         ; get reused below)
+    mov esi, 8
+    mov eax, XHCI_TRB_TYPE_SETUP_STAGE
+    shl eax, 10
+    or eax, (1 << 6)                    ; IDT
+    mov edx, eax
+    test r15d, r15d
+    jz .no_data_trt
+    cmp bl, 1
+    je .trt_in
+    or edx, (2 << 16)                   ; TRT = OUT Data Stage
+    jmp .no_data_trt
+.trt_in:
+    or edx, (3 << 16)                   ; TRT = IN Data Stage
+.no_data_trt:
+    call xhci_ring_enqueue_trb
+
+    ; Data Stage TRB, only if the caller supplied one.
+    test r15d, r15d
+    jz .no_data_stage
+    mov rdi, r14
+    mov esi, r15d
+    mov eax, XHCI_TRB_TYPE_DATA_STAGE
+    shl eax, 10
+    mov edx, eax
+    cmp bl, 1
+    jne .data_dir_done
+    or edx, (1 << 16)                   ; DIR = IN
+.data_dir_done:
+    call xhci_ring_enqueue_trb
+.no_data_stage:
+
+    ; Status Stage TRB: IOC=1 so exactly one Transfer Event comes
+    ; back. DIR is IN unless a data stage happened and it was IN
+    ; (then Status is OUT, the opposite).
+    xor edi, edi
+    xor esi, esi
+    mov eax, XHCI_TRB_TYPE_STATUS_STAGE
+    shl eax, 10
+    or eax, (1 << 5)                    ; IOC
+    mov edx, eax
+    test r15d, r15d
+    jz .status_dir_in
+    cmp bl, 1
+    je .status_dir_done
+.status_dir_in:
+    or edx, (1 << 16)                   ; DIR = IN
+.status_dir_done:
+    call xhci_ring_enqueue_trb
+
+    ; Ring this device's doorbell, Target=1 (EP0).
+    mov rbx, [rel xhci_db_base]
+    mov rcx, r13
+    shl rcx, 2
+    mov dword [rbx+rcx], 1
+
+    mov r9d, 20000000
+.poll:
+    mov rax, [rel xhci_evtring_dequeue]
+    lea rsi, [rel xhci_evtring]
+    mov rcx, rax
+    shl rcx, 4
+    add rsi, rcx
+
+    mov eax, [rsi+12]                   ; Control
+    mov ebx, eax
+    and ebx, 1
+    mov rdx, [rel xhci_evtring_cycle]
+    cmp ebx, edx
+    jne .not_yet
+
+    mov ecx, eax
+    shr ecx, 10
+    and ecx, 0x3F                       ; TRB Type
+    cmp ecx, XHCI_TRB_TYPE_TRANSFER_EVENT
+    jne .advance_dequeue
+
+    mov eax, [rsi+8]                    ; completion Status
+    shr eax, 24
+    and eax, 0xFF                       ; Completion Code
+    mov ebx, 0
+    cmp eax, XHCI_COMPLETION_SUCCESS
+    je .mark_ok
+    cmp eax, XHCI_COMPLETION_SHORT_PACKET
+    jne .not_ok
+.mark_ok:
+    mov ebx, 1
+.not_ok:
+    call .advance_dequeue_once
+    jmp .writeback
+
+.advance_dequeue:
+    call .advance_dequeue_once
+    jmp .poll
+
+.not_yet:
+    dec r9d
+    jnz .poll
+    xor ebx, ebx
+    jmp .writeback
+
+.advance_dequeue_once:
+    push rax
+    push rdx
+    mov rax, [rel xhci_evtring_dequeue]
+    inc rax
+    cmp rax, 256
+    jl .adv_no_wrap
+    xor rax, rax
+    mov rdx, [rel xhci_evtring_cycle]
+    xor rdx, 1
+    mov [rel xhci_evtring_cycle], rdx
+.adv_no_wrap:
+    mov [rel xhci_evtring_dequeue], rax
+    pop rdx
+    pop rax
+    ret
+
+.writeback:
+    mov rax, [rel xhci_rt_base]
+    add rax, 0x20
+    push rax
+    mov rax, [rel xhci_evtring_dequeue]
+    shl rax, 4
+    lea rdx, [rel xhci_evtring]
+    add rax, rdx
+    or al, 8                            ; EHB (write-1-clear)
+    pop rdx
+    mov [rdx+0x18], rax                 ; ERDP
+
+    mov eax, ebx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_get_config_descriptor: fetches the Configuration Descriptor
+; (first a 9-byte header read to learn wTotalLength, then the full
+; descriptor -- Configuration + Interface + Endpoint descriptors, and
+; on a SuperSpeed device a SuperSpeed Endpoint Companion Descriptor
+; after each Endpoint one, though this only needs to skip those, not
+; parse them) into xhci_config_descriptor, then walks it by each
+; entry's own bLength to find the Interface descriptor (confirming
+; Mass Storage / SCSI transparent / Bulk-Only: class 0x08, subclass
+; 0x06, protocol 0x50) and the two Bulk endpoint descriptors.
+;
+; Input:  ECX = Slot ID.
+; Output: EAX = 1/0. On success: xhci_config_value (bConfigurationValue
+;         for SET_CONFIGURATION), xhci_bulk_in_ep_index/
+;         xhci_bulk_out_ep_index (Device Context Index for each Bulk
+;         endpoint) and xhci_bulk_in_max_packet/xhci_bulk_out_max_packet
+;         are all populated.
+; -------------------------------------------------------------------------
+XHCI_DESC_TYPE_INTERFACE equ 4
+XHCI_DESC_TYPE_ENDPOINT  equ 5
+XHCI_CONFIG_DESC_MAX_LEN equ 128
+
+xhci_get_config_descriptor:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r15
+
+    mov r15d, ecx                       ; r15d = Slot ID (survives the
+                                         ; two control transfers below --
+                                         ; R8D/R9B are xhci_control_
+                                         ; transfer's OWN input registers,
+                                         ; so the Slot ID can't live there
+                                         ; across the call)
+
+    ; Short read: just the 9-byte Configuration Descriptor header, to
+    ; learn wTotalLength.
+    lea rdi, [rel xhci_setup_packet]
+    mov byte [rdi+0], 0x80              ; bmRequestType: device-to-host,
+                                         ; standard, device
+    mov byte [rdi+1], 0x06              ; bRequest = GET_DESCRIPTOR
+    mov byte [rdi+2], 0x00              ; wValue low = index 0
+    mov byte [rdi+3], 0x02              ; wValue high = type Configuration
+    mov word [rdi+4], 0                 ; wIndex = 0
+    mov word [rdi+6], 9                 ; wLength = 9
+
+    mov ecx, r15d
+    lea rsi, [rel xhci_setup_packet]
+    lea rdi, [rel xhci_config_descriptor]
+    mov r8d, 9
+    mov r9b, 1                          ; IN
+    call xhci_control_transfer
+    test eax, eax
+    jz .fail
+
+    movzx eax, byte [rel xhci_config_descriptor+2]
+    movzx ecx, byte [rel xhci_config_descriptor+3]
+    shl ecx, 8
+    or eax, ecx                         ; eax = wTotalLength
+    cmp eax, XHCI_CONFIG_DESC_MAX_LEN
+    jbe .len_ok
+    mov eax, XHCI_CONFIG_DESC_MAX_LEN
+.len_ok:
+    mov [rel xhci_config_total_length], eax
+
+    ; Full read, now that wTotalLength is known.
+    lea rdi, [rel xhci_setup_packet]
+    mov eax, [rel xhci_config_total_length]
+    mov [rdi+6], ax                     ; wLength (word)
+
+    mov ecx, r15d
+    lea rsi, [rel xhci_setup_packet]
+    lea rdi, [rel xhci_config_descriptor]
+    mov eax, [rel xhci_config_total_length]
+    mov r8d, eax
+    mov r9b, 1                          ; IN
+    call xhci_control_transfer
+    test eax, eax
+    jz .fail
+
+    movzx eax, byte [rel xhci_config_descriptor+5]
+    mov [rel xhci_config_value], eax    ; bConfigurationValue
+
+    mov dword [rel xhci_bulk_in_ep_index], 0
+    mov dword [rel xhci_bulk_out_ep_index], 0
+    xor ebx, ebx                        ; ebx = 1 once the MSD/BOT
+                                         ; interface has been seen
+    mov ecx, 9                          ; ecx = walk offset, skip the
+                                         ; Configuration descriptor's
+                                         ; own 9 bytes
+.walk:
+    cmp ecx, [rel xhci_config_total_length]
+    jge .walk_done
+    lea rdx, [rel xhci_config_descriptor]
+    add rdx, rcx
+    movzx eax, byte [rdx+0]             ; bLength
+    test eax, eax
+    jz .walk_done                       ; malformed -- stop rather
+                                         ; than spin forever
+    movzx r9d, byte [rdx+1]             ; bDescriptorType
+
+    cmp r9d, XHCI_DESC_TYPE_INTERFACE
+    jne .not_iface
+    cmp eax, 9
+    jl .next_desc
+    cmp byte [rdx+5], 0x08              ; bInterfaceClass = Mass Storage
+    jne .next_desc
+    cmp byte [rdx+6], 0x06              ; bInterfaceSubClass = SCSI
+    jne .next_desc
+    cmp byte [rdx+7], 0x50              ; bInterfaceProtocol = Bulk-Only
+    jne .next_desc
+    mov ebx, 1
+    jmp .next_desc
+
+.not_iface:
+    cmp r9d, XHCI_DESC_TYPE_ENDPOINT
+    jne .next_desc
+    cmp eax, 7
+    jl .next_desc
+    movzx esi, byte [rdx+3]             ; bmAttributes
+    and esi, 0x03
+    cmp esi, 2                          ; Transfer Type = Bulk
+    jne .next_desc
+
+    movzx esi, byte [rdx+2]             ; bEndpointAddress
+    movzx edi, byte [rdx+2]
+    and edi, 0x0F
+    shl edi, 1
+    test esi, 0x80
+    jz .ep_out
+    inc edi                             ; DCI = epnum*2 + 1 (IN)
+    mov [rel xhci_bulk_in_ep_index], edi
+    movzx eax, word [rdx+4]             ; wMaxPacketSize
+    mov [rel xhci_bulk_in_max_packet], eax
+    jmp .next_desc
+.ep_out:
+    mov [rel xhci_bulk_out_ep_index], edi   ; DCI = epnum*2 (OUT)
+    movzx eax, word [rdx+4]
+    mov [rel xhci_bulk_out_max_packet], eax
+
+.next_desc:
+    movzx eax, byte [rdx+0]
+    add ecx, eax
+    jmp .walk
+.walk_done:
+
+    test ebx, ebx
+    jz .fail
+    cmp dword [rel xhci_bulk_in_ep_index], 0
+    je .fail
+    cmp dword [rel xhci_bulk_out_ep_index], 0
+    je .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r15
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_set_configuration: issues SET_CONFIGURATION(xhci_config_value)
+; -- a no-data-stage control transfer -- so the device actually enters
+; the configured state xhci_get_config_descriptor's interface/endpoint
+; info describes.
+;
+; Input:  ECX = Slot ID.
+; Output: EAX = 1/0.
+; -------------------------------------------------------------------------
+xhci_set_configuration:
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    push r9
+
+    mov r8d, ecx                        ; preserve Slot ID across the
+                                         ; setup-packet writes below
+                                         ; (they don't touch it, but
+                                         ; keeping the habit consistent
+                                         ; with this file's other
+                                         ; multi-step routines)
+
+    lea rdi, [rel xhci_setup_packet]
+    mov byte [rdi+0], 0x00              ; bmRequestType: host-to-device,
+                                         ; standard, device
+    mov byte [rdi+1], 0x09              ; bRequest = SET_CONFIGURATION
+    mov eax, [rel xhci_config_value]
+    mov byte [rdi+2], al                ; wValue low = bConfigurationValue
+    mov byte [rdi+3], 0
+    mov word [rdi+4], 0                 ; wIndex = 0
+    mov word [rdi+6], 0                 ; wLength = 0 (no data stage)
+
+    mov ecx, r8d
+    lea rsi, [rel xhci_setup_packet]
+    xor edi, edi                        ; no data buffer
+    xor r8d, r8d                        ; no data length
+    xor r9d, r9d
+    call xhci_control_transfer
+
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_configure_endpoints: builds an Input Context adding the two
+; Bulk endpoints xhci_get_config_descriptor found (fresh transfer
+; rings, correct DCIs/max packet sizes/EP Type), copies forward the
+; Slot Context Address Device already established (from the Device
+; Context, since Configure Endpoint requires a complete Slot Context
+; whenever A0 is set, not just the fields being changed) with Context
+; Entries bumped to cover the highest DCI now configured, and submits
+; a Configure Endpoint Command.
+;
+; Input:  ECX = Slot ID.
+; Output: EAX = 1/0.
+; -------------------------------------------------------------------------
+XHCI_TRB_TYPE_CONFIGURE_ENDPOINT equ 12
+XHCI_EP_TYPE_BULK_OUT equ 2
+XHCI_EP_TYPE_BULK_IN  equ 6
+
+xhci_configure_endpoints:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r12
+    push r13
+    push r14
+
+    mov r8d, ecx                        ; r8d = Slot ID
+
+    ; Fresh Bulk IN / Bulk OUT transfer rings -- same discipline as
+    ; every other ring in this file: zeroed, Link TRB at the last of
+    ; 256 slots, cycle state starts 1.
+    lea rdi, [rel xhci_bulk_in_ring]
+    mov ecx, 4096
+    xor eax, eax
+    cld
+    rep stosb
+    lea rsi, [rel xhci_bulk_in_ring]
+    lea rdi, [rel xhci_bulk_in_ring]
+    add rdi, 4096 - 16
+    mov [rdi+0], rsi
+    mov dword [rdi+8], 0
+    mov dword [rdi+12], (6 << 10) | 0x02 | 0x01
+    mov qword [rel xhci_bulk_in_ring_cycle], 1
+    mov qword [rel xhci_bulk_in_ring_enqueue], 0
+
+    lea rdi, [rel xhci_bulk_out_ring]
+    mov ecx, 4096
+    xor eax, eax
+    cld
+    rep stosb
+    lea rsi, [rel xhci_bulk_out_ring]
+    lea rdi, [rel xhci_bulk_out_ring]
+    add rdi, 4096 - 16
+    mov [rdi+0], rsi
+    mov dword [rdi+8], 0
+    mov dword [rdi+12], (6 << 10) | 0x02 | 0x01
+    mov qword [rel xhci_bulk_out_ring_cycle], 1
+    mov qword [rel xhci_bulk_out_ring_enqueue], 0
+
+    ; Input Context: zeroed, then Input Control + Slot (copied forward
+    ; from the Device Context, Context Entries updated) + the two Bulk
+    ; endpoint contexts filled in.
+    lea rdi, [rel xhci_input_ctx]
+    mov ecx, 2112
+    xor eax, eax
+    cld
+    rep stosb
+
+    mov ecx, [rel xhci_context_size]
+
+    ; Input Control Context: A0 (Slot) plus one Add bit per Bulk
+    ; endpoint's own DCI.
+    mov eax, 1
+    mov ecx, [rel xhci_bulk_in_ep_index]
+    shl eax, cl
+    mov ebx, eax                        ; ebx = 1 << bulk_in DCI
+    mov eax, 1
+    mov ecx, [rel xhci_bulk_out_ep_index]
+    shl eax, cl
+    or ebx, eax                         ; + 1 << bulk_out DCI
+    or ebx, 1                           ; + A0 (Slot)
+    lea rdi, [rel xhci_input_ctx]
+    mov [rdi+4], ebx
+
+    mov ecx, [rel xhci_context_size]    ; restore ecx (clobbered above)
+
+    ; Slot Context: copy the context_size bytes Address Device already
+    ; established in the Device Context (Route String/Speed/Root Hub
+    ; Port Number all still correct), then overwrite Context Entries
+    ; with the highest DCI now configured.
+    lea rsi, [rel xhci_dev_ctx]
+    lea rdi, [rel xhci_input_ctx]
+    add rdi, rcx
+    push rcx
+    mov ecx, [rel xhci_context_size]
+    cld
+    rep movsb
+    pop rcx
+
+    mov eax, [rel xhci_bulk_in_ep_index]
+    mov edx, [rel xhci_bulk_out_ep_index]
+    cmp eax, edx
+    jae .max_dci_ok
+    mov eax, edx
+.max_dci_ok:
+    shl eax, 27                         ; Context Entries (bits 27-31)
+    lea rdi, [rel xhci_input_ctx]
+    add rdi, rcx                        ; rdi -> Slot Context
+    mov edx, [rdi+0]
+    and edx, 0x07FFFFFF                 ; clear the old Context Entries
+    or edx, eax
+    mov [rdi+0], edx
+
+    ; Bulk IN Endpoint Context.
+    mov eax, [rel xhci_bulk_in_ep_index]
+    inc eax                             ; Input Context entry index = DCI+1
+    mov edx, [rel xhci_context_size]
+    imul edx, eax
+    lea rdi, [rel xhci_input_ctx]
+    add rdi, rdx                        ; rdi -> Bulk IN Context
+
+    mov eax, [rel xhci_bulk_in_max_packet]
+    shl eax, 16
+    or eax, (XHCI_EP_TYPE_BULK_IN << 3)
+    or eax, (3 << 1)                    ; CErr = 3
+    mov [rdi+4], eax
+
+    lea rax, [rel xhci_bulk_in_ring]
+    or al, 1                            ; DCS = 1
+    mov [rdi+8], rax                    ; TR Dequeue Pointer
+
+    mov eax, [rel xhci_bulk_in_max_packet]
+    mov dword [rdi+16], eax             ; Average TRB Length
+
+    ; Bulk OUT Endpoint Context.
+    mov eax, [rel xhci_bulk_out_ep_index]
+    inc eax
+    mov edx, [rel xhci_context_size]
+    imul edx, eax
+    lea rdi, [rel xhci_input_ctx]
+    add rdi, rdx                        ; rdi -> Bulk OUT Context
+
+    mov eax, [rel xhci_bulk_out_max_packet]
+    shl eax, 16
+    or eax, (XHCI_EP_TYPE_BULK_OUT << 3)
+    or eax, (3 << 1)
+    mov [rdi+4], eax
+
+    lea rax, [rel xhci_bulk_out_ring]
+    or al, 1
+    mov [rdi+8], rax
+
+    mov eax, [rel xhci_bulk_out_max_packet]
+    mov dword [rdi+16], eax
+
+    ; Submit Configure Endpoint Command.
+    lea rdi, [rel xhci_input_ctx]
+    xor esi, esi
+    mov ecx, XHCI_TRB_TYPE_CONFIGURE_ENDPOINT
+    mov r10d, r8d
+    shl r10d, 24                        ; Slot ID at bits 24-31
+    call xhci_submit_command
+    test eax, eax
+    jz .fail
+
+    mov ebx, r13d
+    shr ebx, 24
+    and ebx, 0xFF
+    cmp ebx, XHCI_COMPLETION_SUCCESS
+    jne .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_bulk_transfer: enqueues a single Normal TRB on the device's
+; Bulk IN or Bulk OUT ring (whichever the caller asks for -- direction
+; is implicit in which physical endpoint/ring is used, unlike control
+; transfers, so the TRB itself carries no DIR bit), rings that
+; endpoint's own doorbell (Target = its Device Context Index), and
+; polls for the resulting Transfer Event. This is the single building
+; block the BOT protocol's CBW/data-stage/CSW all reduce to. One TRB
+; is enough for every transfer this driver issues (CBW=31 bytes,
+; CSW=13 bytes, sector data well under a TRB's 64KB Transfer Length
+; limit at the block counts this driver deals with).
+;
+; Input:  ECX = Slot ID, RDI = buffer pointer, R8D = length in bytes,
+;         R9B = direction (1 = Bulk IN, 0 = Bulk OUT -- selects both
+;         the ring and the doorbell target).
+; Output: EAX = 1 on Success/Short-Packet completion, 0 on timeout or
+;         any other completion code.
+; -------------------------------------------------------------------------
+XHCI_TRB_TYPE_NORMAL equ 1
+
+xhci_bulk_transfer:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r14d, ecx                       ; r14d = Slot ID
+    mov bl, r9b                         ; bl = direction (rbx is pushed,
+                                         ; safe scratch for the rest of
+                                         ; this routine)
+
+    cmp bl, 1
+    je .pick_in
+    lea r10, [rel xhci_bulk_out_ring]
+    lea r11, [rel xhci_bulk_out_ring_cycle]
+    lea r12, [rel xhci_bulk_out_ring_enqueue]
+    mov r15d, [rel xhci_bulk_out_ep_index]
+    jmp .picked
+.pick_in:
+    lea r10, [rel xhci_bulk_in_ring]
+    lea r11, [rel xhci_bulk_in_ring_cycle]
+    lea r12, [rel xhci_bulk_in_ring_enqueue]
+    mov r15d, [rel xhci_bulk_in_ep_index]
+.picked:
+
+    ; RDI already holds the buffer pointer (this routine's own input
+    ; register matches xhci_ring_enqueue_trb's Parameter input).
+    mov esi, r8d                        ; Status = TRB Transfer Length
+    mov eax, XHCI_TRB_TYPE_NORMAL
+    shl eax, 10
+    or eax, (1 << 5)                    ; IOC
+    mov edx, eax
+    call xhci_ring_enqueue_trb
+
+    ; Ring this endpoint's own doorbell (Target = its DCI).
+    mov rbx, [rel xhci_db_base]
+    mov rcx, r14
+    shl rcx, 2
+    mov dword [rbx+rcx], r15d
+
+    mov r9d, 20000000
+.poll:
+    mov rax, [rel xhci_evtring_dequeue]
+    lea rsi, [rel xhci_evtring]
+    mov rcx, rax
+    shl rcx, 4
+    add rsi, rcx
+
+    mov eax, [rsi+12]                   ; Control
+    mov ebx, eax
+    and ebx, 1
+    mov rdx, [rel xhci_evtring_cycle]
+    cmp ebx, edx
+    jne .not_yet
+
+    mov ecx, eax
+    shr ecx, 10
+    and ecx, 0x3F                       ; TRB Type
+    cmp ecx, XHCI_TRB_TYPE_TRANSFER_EVENT
+    jne .advance_dequeue
+
+    mov eax, [rsi+8]                    ; completion Status
+    shr eax, 24
+    and eax, 0xFF                       ; Completion Code
+    mov ebx, 0
+    cmp eax, XHCI_COMPLETION_SUCCESS
+    je .mark_ok
+    cmp eax, XHCI_COMPLETION_SHORT_PACKET
+    jne .not_ok
+.mark_ok:
+    mov ebx, 1
+.not_ok:
+    call .advance_dequeue_once
+    jmp .writeback
+
+.advance_dequeue:
+    call .advance_dequeue_once
+    jmp .poll
+
+.not_yet:
+    dec r9d
+    jnz .poll
+    xor ebx, ebx
+    jmp .writeback
+
+.advance_dequeue_once:
+    push rax
+    push rdx
+    mov rax, [rel xhci_evtring_dequeue]
+    inc rax
+    cmp rax, 256
+    jl .adv_no_wrap
+    xor rax, rax
+    mov rdx, [rel xhci_evtring_cycle]
+    xor rdx, 1
+    mov [rel xhci_evtring_cycle], rdx
+.adv_no_wrap:
+    mov [rel xhci_evtring_dequeue], rax
+    pop rdx
+    pop rax
+    ret
+
+.writeback:
+    mov rax, [rel xhci_rt_base]
+    add rax, 0x20
+    push rax
+    mov rax, [rel xhci_evtring_dequeue]
+    shl rax, 4
+    lea rdx, [rel xhci_evtring]
+    add rax, rdx
+    or al, 8                            ; EHB (write-1-clear)
+    pop rdx
+    mov [rdx+0x18], rax                 ; ERDP
+
+    mov eax, ebx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_msd_command: the USB Mass Storage Bulk-Only Transport protocol,
+; built on xhci_bulk_transfer -- send a 31-byte Command Block Wrapper
+; on Bulk OUT carrying the caller's SCSI CDB, transfer the data phase
+; (if any) in the direction the caller asks, then read back the
+; 13-byte Command Status Wrapper on Bulk IN and check its signature/
+; tag/status. This is the one routine every SCSI command (INQUIRY,
+; READ CAPACITY, READ(10), WRITE(10)) funnels through.
+;
+; Input:  ECX = Slot ID, RSI = pointer to the SCSI CDB bytes (up to 16),
+;         R8B = CDB length, RDI = data buffer pointer (0 if this
+;         command has no data phase), R10D = data length in bytes (0
+;         if none), R11B = data direction (1 = IN, 0 = OUT; only
+;         meaningful when R10D != 0).
+; Output: EAX = 1 on a clean CBW send + data phase (if any) + a CSW
+;         reporting bCSWStatus=0 (Good) with a matching signature and
+;         tag; 0 on any failure along the way.
+; -------------------------------------------------------------------------
+XHCI_CBW_SIGNATURE equ 0x43425355
+XHCI_CSW_SIGNATURE equ 0x53425355
+
+xhci_msd_command:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+
+    mov r12d, ecx                       ; r12d = Slot ID
+    mov r13, rdi                        ; r13 = data buffer pointer
+    mov r14d, r10d                      ; r14d = data length
+    mov bl, r11b                        ; bl = data direction
+
+    ; Build the CBW.
+    lea rdi, [rel xhci_cbw_buffer]
+    mov dword [rdi+0], XHCI_CBW_SIGNATURE
+    mov eax, [rel xhci_msd_tag]
+    inc eax
+    mov [rel xhci_msd_tag], eax
+    mov [rdi+4], eax                    ; dCBWTag
+    mov [rdi+8], r14d                   ; dCBWDataTransferLength
+    mov byte [rdi+12], 0
+    cmp bl, 1
+    jne .cbw_flags_out
+    mov byte [rdi+12], 0x80             ; bmCBWFlags: data-in
+.cbw_flags_out:
+    mov byte [rdi+13], 0                ; bCBWLUN
+    mov byte [rdi+14], r8b              ; bCBWCBLength
+
+    lea rdi, [rel xhci_cbw_buffer]
+    add rdi, 15                         ; -> CBWCB[16]
+    xor eax, eax
+    mov ecx, 16
+    cld
+    rep stosb                           ; zero-pad the full 16 bytes...
+    lea rdi, [rel xhci_cbw_buffer]
+    add rdi, 15
+    movzx ecx, r8b
+    cld
+    rep movsb                           ; ...then copy the real CDB over it
+
+    ; Send the CBW (always Bulk OUT, always exactly 31 bytes).
+    mov ecx, r12d
+    lea rdi, [rel xhci_cbw_buffer]
+    mov r8d, 31
+    xor r9d, r9d                        ; OUT
+    call xhci_bulk_transfer
+    test eax, eax
+    jz .fail
+
+    ; Data phase, if the caller has one.
+    test r14d, r14d
+    jz .no_data_phase
+    mov ecx, r12d
+    mov rdi, r13
+    mov r8d, r14d
+    mov r9b, bl
+    call xhci_bulk_transfer
+    test eax, eax
+    jz .fail
+.no_data_phase:
+
+    ; Read the CSW.
+    mov ecx, r12d
+    lea rdi, [rel xhci_csw_buffer]
+    mov r8d, 13
+    mov r9d, 1                          ; IN
+    call xhci_bulk_transfer
+    test eax, eax
+    jz .fail
+
+    lea rdi, [rel xhci_csw_buffer]
+    cmp dword [rdi+0], XHCI_CSW_SIGNATURE
+    jne .fail
+    mov eax, [rel xhci_msd_tag]
+    cmp [rdi+4], eax
+    jne .fail
+    cmp byte [rdi+12], 0                ; bCSWStatus = Good
+    jne .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_msd_inquiry: issues SCSI INQUIRY (allocation length 36) via
+; xhci_msd_command, filling xhci_msd_inquiry_data. Mainly a proof
+; point that the whole CBW/data/CSW pipeline works end to end before
+; trusting it for READ CAPACITY / READ(10) / WRITE(10).
+;
+; Input:  ECX = Slot ID.
+; Output: EAX = 1/0.
+; -------------------------------------------------------------------------
+xhci_msd_inquiry:
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    push r10
+    push r11
+
+    mov r8d, ecx
+
+    lea rdi, [rel xhci_msd_cdb]
+    xor eax, eax
+    mov ecx, 16
+    cld
+    rep stosb
+    mov byte [rel xhci_msd_cdb+0], 0x12     ; INQUIRY
+    mov byte [rel xhci_msd_cdb+4], 36       ; allocation length
+
+    mov ecx, r8d
+    lea rsi, [rel xhci_msd_cdb]
+    mov r8b, 6                          ; CDB length
+    lea rdi, [rel xhci_msd_inquiry_data]
+    mov r10d, 36
+    mov r11b, 1                         ; IN
+    call xhci_msd_command
+
+    pop r11
+    pop r10
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; xhci_msd_read_capacity: issues SCSI READ CAPACITY(10) via
+; xhci_msd_command, converting the big-endian response fields into
+; xhci_msd_sector_count (the highest valid LBA, not a count -- callers
+; needing a count add 1) and xhci_msd_sector_size.
+;
+; Input:  ECX = Slot ID.
+; Output: EAX = 1/0.
+; -------------------------------------------------------------------------
+xhci_msd_read_capacity:
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    push r10
+    push r11
+
+    mov r8d, ecx
+
+    lea rdi, [rel xhci_msd_cdb]
+    xor eax, eax
+    mov ecx, 16
+    cld
+    rep stosb
+    mov byte [rel xhci_msd_cdb+0], 0x25     ; READ CAPACITY(10)
+
+    mov ecx, r8d
+    lea rsi, [rel xhci_msd_cdb]
+    mov r8b, 10
+    lea rdi, [rel xhci_msd_read_capacity_data]
+    mov r10d, 8
+    mov r11b, 1                         ; IN
+    call xhci_msd_command
+    test eax, eax
+    jz .fail
+
+    lea rsi, [rel xhci_msd_read_capacity_data]
+    movzx eax, byte [rsi+0]
+    shl eax, 24
+    movzx ecx, byte [rsi+1]
+    shl ecx, 16
+    or eax, ecx
+    movzx ecx, byte [rsi+2]
+    shl ecx, 8
+    or eax, ecx
+    movzx ecx, byte [rsi+3]
+    or eax, ecx
+    mov [rel xhci_msd_sector_count], eax     ; highest valid LBA
+
+    movzx eax, byte [rsi+4]
+    shl eax, 24
+    movzx ecx, byte [rsi+5]
+    shl ecx, 16
+    or eax, ecx
+    movzx ecx, byte [rsi+6]
+    shl ecx, 8
+    or eax, ecx
+    movzx ecx, byte [rsi+7]
+    or eax, ecx
+    mov [rel xhci_msd_sector_size], eax
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r11
+    pop r10
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; usb_msd_read_sectors / usb_msd_write_sectors: SCSI READ(10)/WRITE(10)
+; over the BOT protocol, wired up to match storage.inc's dispatcher
+; calling convention exactly (RCX=LBA, RDX=sector count, R8=buffer,
+; EAX=1/0) so they can be called directly as a STORAGE_USB backend.
+; Use xhci_msd_slot_id (the slot the boot sequence's enumeration left
+; addressed and configured) rather than taking a Slot ID parameter --
+; this driver only ever talks to the one USB mass-storage device it
+; found at boot, and storage.inc's dispatcher has no slot ID to give
+; it anyway (AHCI/NVMe don't have the concept).
+; -------------------------------------------------------------------------
+usb_msd_read_sectors:
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    mov r10, rcx                        ; r10 = LBA
+    mov r11, r8                         ; r11 = buffer
+
+    lea rdi, [rel xhci_msd_cdb]
+    xor eax, eax
+    mov ecx, 16
+    cld
+    rep stosb
+    mov byte [rel xhci_msd_cdb+0], 0x28  ; READ(10)
+    mov eax, r10d
+    bswap eax
+    mov [rel xhci_msd_cdb+2], eax        ; LBA, big-endian
+    mov ax, dx
+    xchg al, ah
+    mov [rel xhci_msd_cdb+7], ax         ; Transfer Length, big-endian
+
+    mov ecx, [rel xhci_msd_slot_id]
+    lea rsi, [rel xhci_msd_cdb]
+    mov r8b, 10
+    mov rdi, r11                         ; data buffer
+    mov eax, edx
+    imul eax, [rel xhci_msd_sector_size]
+    mov r10d, eax                        ; data length in bytes
+    mov r11b, 1                          ; IN
+    call xhci_msd_command
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    ret
+
+usb_msd_write_sectors:
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    mov r10, rcx                        ; r10 = LBA
+    mov r11, r8                         ; r11 = buffer
+
+    lea rdi, [rel xhci_msd_cdb]
+    xor eax, eax
+    mov ecx, 16
+    cld
+    rep stosb
+    mov byte [rel xhci_msd_cdb+0], 0x2A  ; WRITE(10)
+    mov eax, r10d
+    bswap eax
+    mov [rel xhci_msd_cdb+2], eax
+    mov ax, dx
+    xchg al, ah
+    mov [rel xhci_msd_cdb+7], ax
+
+    mov ecx, [rel xhci_msd_slot_id]
+    lea rsi, [rel xhci_msd_cdb]
+    mov r8b, 10
+    mov rdi, r11
+    mov eax, edx
+    imul eax, [rel xhci_msd_sector_size]
+    mov r10d, eax
+    xor r11d, r11d                       ; OUT
+    call xhci_msd_command
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================
@@ -507,9 +2336,12 @@ xhci_max_ports:   dd 0
 xhci_port_connected: times 32 db 0      ; 1 byte per port index (0-based);
                                          ; MaxPorts is an 8-bit HCSPARAMS1
                                          ; field, so 32 is a generous cap
+xhci_port_speed:  times 32 db 0         ; PORTSC bits 10-13 per port index
 xhci_caplength:   db 0
 xhci_hciversion:  dw 0
 xhci_hcsparams1:  dd 0
+xhci_hccparams1:  dd 0
+xhci_context_size: dd 32                ; 32 or 64 bytes/context, per CSZ
 xhci_slots_enabled: dd 0
 
 xhci_cmdring_cycle:    dq 0
@@ -525,3 +2357,68 @@ align 4096
 xhci_evtring: times 4096 db 0
 align 64
 xhci_erst:    times 16 db 0
+
+xhci_ep0_ring_cycle:   dq 0
+xhci_ep0_ring_enqueue: dq 0
+
+align 4096
+xhci_ep0_ring: times 4096 db 0
+align 64
+xhci_dev_ctx:   times 2048 db 0         ; 32 contexts * 64 bytes (worst case)
+align 64
+xhci_input_ctx: times 2112 db 0         ; 33 contexts * 64 bytes (worst case)
+
+align 16
+xhci_device_descriptor: times 18 db 0   ; standard USB Device Descriptor
+
+align 16
+xhci_setup_packet: times 8 db 0         ; scratch 8-byte Setup Packet,
+                                         ; built fresh by each caller of
+                                         ; xhci_control_transfer/
+                                         ; xhci_get_config_descriptor
+                                         ; before use -- fine as a single
+                                         ; shared buffer since this is a
+                                         ; synchronous, one-request-at-a-
+                                         ; time driver
+
+align 16
+xhci_config_descriptor: times XHCI_CONFIG_DESC_MAX_LEN db 0
+xhci_config_total_length: dd 0
+xhci_config_value:        dd 0
+xhci_bulk_in_ep_index:     dd 0
+xhci_bulk_out_ep_index:    dd 0
+xhci_bulk_in_max_packet:   dd 0
+xhci_bulk_out_max_packet:  dd 0
+
+xhci_bulk_in_ring_cycle:    dq 0
+xhci_bulk_in_ring_enqueue:  dq 0
+xhci_bulk_out_ring_cycle:   dq 0
+xhci_bulk_out_ring_enqueue: dq 0
+
+align 4096
+xhci_bulk_in_ring:  times 4096 db 0
+align 4096
+xhci_bulk_out_ring: times 4096 db 0
+
+xhci_msd_tag: dd 0
+
+align 16
+xhci_cbw_buffer: times 31 db 0
+align 16
+xhci_csw_buffer: times 13 db 0
+align 16
+xhci_msd_cdb: times 16 db 0
+align 16
+xhci_msd_inquiry_data: times 36 db 0
+align 16
+xhci_msd_read_capacity_data: times 8 db 0
+xhci_msd_sector_count: dd 0             ; highest valid LBA (not a count)
+xhci_msd_sector_size:  dd 0
+xhci_msd_slot_id:      dd 0             ; Slot ID of the one USB mass-
+                                         ; storage device this driver
+                                         ; enumerated at boot
+
+align 16
+xhci_msd_test_sector: times 512 db 0    ; boot self-test scratch buffer
+                                         ; for a raw usb_msd_read_sectors
+                                         ; round-trip

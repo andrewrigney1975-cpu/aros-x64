@@ -1601,6 +1601,200 @@ xhci_probe_and_report:
     call serial_puts
     pop rax
     call dbg_hex64
+
+    test eax, eax
+    jz .out
+
+    call xhci_enable_slot
+    test eax, eax
+    jz .enable_slot_failed
+    push rax                            ; slot ID
+    lea rcx, [rel msg_xhci_slot_ok]
+    call serial_puts
+    pop rax
+    push rax
+    call dbg_hex64
+    pop rax
+
+    ; Find the first connected port's index (xhci_scan_ports already
+    ; recorded which ones -- this is the port the just-enabled slot
+    ; will be addressed against).
+    mov ecx, eax                        ; ecx = slot ID
+    xor edx, edx                        ; edx = port index (0-based)
+.find_port:
+    cmp edx, [rel xhci_max_ports]
+    jge .out
+    lea rax, [rel xhci_port_connected]
+    cmp byte [rax+rdx], 0
+    jne .port_found
+    inc edx
+    jmp .find_port
+.port_found:
+    push rcx                            ; slot ID -- xhci_setup_device_slot
+                                         ; preserves ecx itself, but the
+                                         ; Address Device call below needs
+                                         ; it back in ecx after RDI is set
+    call xhci_setup_device_slot
+    test eax, eax
+    jz .setup_slot_failed
+    lea rcx, [rel msg_xhci_setup_ok]
+    call serial_puts
+
+    pop rcx                             ; slot ID
+    push rcx                            ; ...and re-save it -- serial_puts
+                                         ; clobbers ecx, and it's needed
+                                         ; again for xhci_get_device_descriptor
+    lea rdi, [rel xhci_input_ctx]
+    call xhci_address_device
+    test eax, eax
+    jnz .address_device_ok
+    add rsp, 8                          ; drop the re-pushed slot ID
+    jmp .address_device_failed
+.address_device_ok:
+    lea rcx, [rel msg_xhci_addr_ok]
+    call serial_puts
+
+    pop rcx                             ; slot ID
+    push rcx                            ; ...and re-save it, needed again
+                                         ; below after serial_puts clobbers
+                                         ; ecx
+    call xhci_get_device_descriptor
+    test eax, eax
+    jnz .get_desc_ok
+    add rsp, 8                          ; drop the re-pushed slot ID
+    lea rcx, [rel msg_xhci_desc_fail]
+    call serial_puts
+    jmp .out
+.get_desc_ok:
+    lea rcx, [rel msg_xhci_desc_ok]
+    call serial_puts
+    movzx eax, byte [rel xhci_device_descriptor+8]   ; idVendor low byte
+    movzx ecx, byte [rel xhci_device_descriptor+9]   ; idVendor high byte
+    shl ecx, 8
+    or eax, ecx
+    call dbg_hex64
+    movzx eax, byte [rel xhci_device_descriptor+10]  ; idProduct low byte
+    movzx ecx, byte [rel xhci_device_descriptor+11]  ; idProduct high byte
+    shl ecx, 8
+    or eax, ecx
+    call dbg_hex64
+
+    pop rcx                             ; slot ID
+    push rcx                            ; ...and re-save it, needed again
+                                         ; below after serial_puts clobbers
+                                         ; ecx
+    call xhci_get_config_descriptor
+    test eax, eax
+    jnz .get_config_ok
+    add rsp, 8                          ; drop the re-pushed slot ID
+    lea rcx, [rel msg_xhci_config_fail]
+    call serial_puts
+    jmp .out
+.get_config_ok:
+    lea rcx, [rel msg_xhci_config_ok]
+    call serial_puts
+    mov eax, [rel xhci_bulk_in_ep_index]
+    call dbg_hex64
+    mov eax, [rel xhci_bulk_out_ep_index]
+    call dbg_hex64
+    mov eax, [rel xhci_bulk_in_max_packet]
+    call dbg_hex64
+    mov eax, [rel xhci_bulk_out_max_packet]
+    call dbg_hex64
+
+    pop rcx                             ; slot ID
+    push rcx
+    call xhci_set_configuration
+    test eax, eax
+    jnz .set_config_ok
+    add rsp, 8
+    lea rcx, [rel msg_xhci_setcfg_fail]
+    call serial_puts
+    jmp .out
+.set_config_ok:
+    lea rcx, [rel msg_xhci_setcfg_ok]
+    call serial_puts
+
+    pop rcx                             ; slot ID
+    push rcx
+    call xhci_configure_endpoints
+    test eax, eax
+    jnz .configure_ep_ok
+    add rsp, 8
+    lea rcx, [rel msg_xhci_configep_fail]
+    call serial_puts
+    jmp .out
+.configure_ep_ok:
+    lea rcx, [rel msg_xhci_configep_ok]
+    call serial_puts
+
+    pop rcx                             ; slot ID
+    push rcx
+    call xhci_msd_inquiry
+    test eax, eax
+    jnz .inquiry_ok
+    add rsp, 8
+    lea rcx, [rel msg_xhci_inquiry_fail]
+    call serial_puts
+    jmp .out
+.inquiry_ok:
+    lea rcx, [rel msg_xhci_inquiry_ok]
+    call serial_puts
+    movzx eax, byte [rel xhci_msd_inquiry_data+8]    ; T10 Vendor ID, byte 0
+    call dbg_hex64
+
+    pop rcx                             ; slot ID
+    mov [rel xhci_msd_slot_id], ecx
+    call xhci_msd_read_capacity
+    test eax, eax
+    jz .read_capacity_failed
+    lea rcx, [rel msg_xhci_readcap_ok]
+    call serial_puts
+    mov eax, [rel xhci_msd_sector_count]
+    call dbg_hex64
+    mov eax, [rel xhci_msd_sector_size]
+    call dbg_hex64
+
+    ; USB is only the active storage backend as a fallback of last
+    ; resort -- if AHCI or NVMe already claimed a working device
+    ; earlier in boot, leave that alone (this project's exFAT tests
+    ; run against whichever backend storage_active_driver names, and
+    ; the QEMU test disk image behind this USB device isn't formatted
+    ; exFAT).
+    cmp dword [rel storage_active_driver], STORAGE_NONE
+    jne .skip_active_driver
+    mov dword [rel storage_active_driver], STORAGE_USB
+.skip_active_driver:
+
+    xor ecx, ecx                        ; LBA 0
+    mov edx, 1                          ; 1 sector
+    lea r8, [rel xhci_msd_test_sector]
+    call usb_msd_read_sectors
+    test eax, eax
+    jz .msd_read_failed
+    lea rcx, [rel msg_xhci_msdread_ok]
+    call serial_puts
+    jmp .out
+.msd_read_failed:
+    lea rcx, [rel msg_xhci_msdread_fail]
+    call serial_puts
+    jmp .out
+.read_capacity_failed:
+    lea rcx, [rel msg_xhci_readcap_fail]
+    call serial_puts
+    jmp .out
+.address_device_failed:
+    lea rcx, [rel msg_xhci_addr_fail]
+    call serial_puts
+    jmp .out
+.setup_slot_failed:
+    add rsp, 8                          ; drop the pushed slot ID
+    lea rcx, [rel msg_xhci_setup_fail]
+    call serial_puts
+    jmp .out
+.enable_slot_failed:
+    lea rcx, [rel msg_xhci_slot_fail]
+    call serial_puts
     jmp .out
 .noop_failed:
     lea rcx, [rel msg_xhci_noop_fail]
@@ -3321,6 +3515,26 @@ msg_xhci_reset_fail:  db 'xHCI: reset/bring-up FAILED (timed out)', 13, 10, 0
 msg_xhci_noop_ok:     db 'xHCI: No-Op command completion event received OK', 13, 10, 0
 msg_xhci_noop_fail:   db 'xHCI: No-Op command FAILED (no completion event)', 13, 10, 0
 msg_xhci_ports:       db 'xHCI: ports with a device connected:', 13, 10, 0
+msg_xhci_slot_ok:     db 'xHCI: Enable Slot OK, slot ID:', 13, 10, 0
+msg_xhci_slot_fail:   db 'xHCI: Enable Slot FAILED', 13, 10, 0
+msg_xhci_setup_ok:    db 'xHCI: device slot context/EP0 ring setup OK', 13, 10, 0
+msg_xhci_setup_fail:  db 'xHCI: device slot context/EP0 ring setup FAILED', 13, 10, 0
+msg_xhci_addr_ok:     db 'xHCI: Address Device OK', 13, 10, 0
+msg_xhci_addr_fail:   db 'xHCI: Address Device FAILED', 13, 10, 0
+msg_xhci_desc_ok:     db 'xHCI: GET_DESCRIPTOR(Device) OK, idVendor/idProduct:', 13, 10, 0
+msg_xhci_desc_fail:   db 'xHCI: GET_DESCRIPTOR(Device) FAILED', 13, 10, 0
+msg_xhci_config_ok:   db 'xHCI: GET_DESCRIPTOR(Config) OK, bulk in/out EP index, in/out max packet:', 13, 10, 0
+msg_xhci_config_fail: db 'xHCI: GET_DESCRIPTOR(Config) FAILED (no BOT mass-storage interface found)', 13, 10, 0
+msg_xhci_setcfg_ok:   db 'xHCI: SET_CONFIGURATION OK', 13, 10, 0
+msg_xhci_setcfg_fail: db 'xHCI: SET_CONFIGURATION FAILED', 13, 10, 0
+msg_xhci_configep_ok:   db 'xHCI: Configure Endpoint (Bulk IN/OUT) OK', 13, 10, 0
+msg_xhci_configep_fail: db 'xHCI: Configure Endpoint (Bulk IN/OUT) FAILED', 13, 10, 0
+msg_xhci_inquiry_ok:    db 'xHCI: USB MSD SCSI INQUIRY OK, vendor ID byte0:', 13, 10, 0
+msg_xhci_inquiry_fail:  db 'xHCI: USB MSD SCSI INQUIRY FAILED', 13, 10, 0
+msg_xhci_readcap_ok:    db 'xHCI: USB MSD READ CAPACITY(10) OK, last LBA/sector size:', 13, 10, 0
+msg_xhci_readcap_fail:  db 'xHCI: USB MSD READ CAPACITY(10) FAILED', 13, 10, 0
+msg_xhci_msdread_ok:    db 'xHCI: USB MSD READ(10) sector 0 OK', 13, 10, 0
+msg_xhci_msdread_fail:  db 'xHCI: USB MSD READ(10) sector 0 FAILED', 13, 10, 0
 
 ; -------------------------------------------------------------------------
 ; GDT: null, flat 64-bit code, flat 64-bit data.
