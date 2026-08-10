@@ -3,6 +3,10 @@
 ' count, per-frame angle step, and frame pacing are all derived from
 ' those two parameters (plus the PIT's known 100Hz tick rate) rather
 ' than hardcoded -- change either one and the animation retimes itself.
+'
+' Each frame is composed off-screen (CLS clears the back buffer, LINE
+' draws anti-aliased edges into it) and presented in one shot with
+' FLIP, so nothing ever appears mid-redraw.
 
 DIM DURATION_SEC AS INTEGER
 DIM TARGET_FPS AS INTEGER
@@ -91,16 +95,12 @@ LET eb[10] = 6
 LET ea[11] = 3
 LET eb[11] = 7
 
-' -- Per-frame projected screen position/depth, and the previous
-' -- frame's screen position (drawn in black first each frame to erase
-' -- it -- this kernel's LINE has no back buffer to flip).
+' -- Per-frame projected screen position/depth. No manual erase-the-
+' -- previous-frame bookkeeping needed here: CLS/LINE draw into the
+' -- back buffer and FLIP presents the finished frame in one shot.
 DIM px_arr(8) AS SFLOAT
 DIM py_arr(8) AS SFLOAT
 DIM pz_arr(8) AS SFLOAT
-DIM prevx(8) AS SFLOAT
-DIM prevy(8) AS SFLOAT
-DIM have_prev AS INTEGER
-LET have_prev = 0
 
 DIM lx AS SFLOAT
 DIM ly AS SFLOAT
@@ -151,13 +151,7 @@ FOR frame = 1 TO FRAME_COUNT
         LET pz_arr[i] = rz
     NEXT i
 
-    IF have_prev = 1 THEN
-        FOR j = 0 TO 11
-            LET va = ea[j]
-            LET vb = eb[j]
-            LINE prevx[va], prevy[va], prevx[vb], prevy[vb], 0
-        NEXT j
-    ENDIF
+    CLS 0
 
     FOR j = 0 TO 11
         LET va = ea[j]
@@ -167,11 +161,7 @@ FOR frame = 1 TO FRAME_COUNT
         LINE px_arr[va], py_arr[va], px_arr[vb], py_arr[vb], k
     NEXT j
 
-    FOR i = 0 TO 7
-        LET prevx[i] = px_arr[i]
-        LET prevy[i] = py_arr[i]
-    NEXT i
-    LET have_prev = 1
+    FLIP
 
     LET target_tick = start_tick + (TOTAL_TICKS * frame) / FRAME_COUNT
     LET wait_ticks = target_tick - TIMER

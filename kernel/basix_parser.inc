@@ -1197,32 +1197,86 @@ basix_parse_pset:
     ret
 
 ; -------------------------------------------------------------------------
-; basix_parse_line: "LINE x1, y1, x2, y2, color" -- draws a line via the
-; runtime's Bresenham implementation. Same push-then-pop-in-reverse
-; argument marshaling as PSET, extended to five registers (RCX=x1,
-; RDX=y1, R8=x2, R9=y2, R10=color).
+; basix_parse_float_arg_store: RAX = a fixed (compile-time-constant)
+; scratch address. Parses one arithmetic expression, coercing an int
+; result to float, then emits code storing that float (XMM0) to the
+; given address. Unlike basix_parse_int_arg_push, the value isn't
+; pushed to the compiled program's runtime stack -- it's written
+; straight to a named global -- since LINE's runtime routine
+; (basix_rt_line_aa) needs sub-pixel-precision float endpoints for
+; anti-aliasing, and there are more of them (four) than there are
+; argument registers worth plumbing through push/pop.
+;
+; The scratch address is carried across the basix_parse_arith call on
+; OUR OWN native return stack (push/pop), not in a register -- parsing
+; the expression can recurse arbitrarily (nested calls, array index
+; expressions, etc.) and may clobber any register, but a value pushed
+; here is safe regardless of what runs in between.
+; -------------------------------------------------------------------------
+basix_parse_float_arg_store:
+    push rax
+    call basix_parse_arith                ; r11d = expr type (0=int)
+    test r11d, r11d
+    jnz .already_float
+    call basix_emit_cvtsi2sd_x0_rax
+.already_float:
+    pop rax
+    call basix_emit_mov_rax_imm64
+    jmp basix_emit_movsd_store_rax        ; tail call -- returns to our
+                                           ; own caller directly
+
+; -------------------------------------------------------------------------
+; basix_parse_line: "LINE x1, y1, x2, y2, color" -- draws an
+; anti-aliased line (Wu's algorithm, basix_rt_line_aa) into the back
+; buffer. Endpoints keep full float precision (stored to fixed globals
+; basix_line_x1f/y1f/x2f/y2f -- see basix_parse_float_arg_store) rather
+; than truncating to whole pixels the way PSET's integer coordinates
+; do; only the trailing color argument is a plain int, passed in RCX
+; like PSET/CLS.
 ; -------------------------------------------------------------------------
 basix_parse_line:
-    call basix_parse_int_arg_push        ; x1
+    lea rax, [rel basix_line_x1f]
+    call basix_parse_float_arg_store
     mov eax, TOK_COMMA
     call basix_expect
-    call basix_parse_int_arg_push        ; y1
+    lea rax, [rel basix_line_y1f]
+    call basix_parse_float_arg_store
     mov eax, TOK_COMMA
     call basix_expect
-    call basix_parse_int_arg_push        ; x2
+    lea rax, [rel basix_line_x2f]
+    call basix_parse_float_arg_store
     mov eax, TOK_COMMA
     call basix_expect
-    call basix_parse_int_arg_push        ; y2
+    lea rax, [rel basix_line_y2f]
+    call basix_parse_float_arg_store
     mov eax, TOK_COMMA
     call basix_expect
-    call basix_parse_int_arg_push        ; color
 
-    call basix_emit_pop_r10              ; color
-    call basix_emit_pop_r9               ; y2
-    call basix_emit_pop_r8               ; x2
-    call basix_emit_pop_rdx              ; y1
-    call basix_emit_pop_rcx              ; x1
-    lea rcx, [rel basix_rt_line]
+    call basix_parse_int_arg_push        ; color
+    call basix_emit_pop_rcx              ; color
+    lea rcx, [rel basix_rt_line_aa]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_cls: "CLS color" -- fills the entire back buffer with one
+; color. Single int argument, same plumbing as WAIT's.
+; -------------------------------------------------------------------------
+basix_parse_cls:
+    call basix_parse_int_arg_push        ; color
+    call basix_emit_pop_rcx              ; color
+    lea rcx, [rel basix_rt_cls]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_flip: "FLIP" -- no arguments. Blits the back buffer
+; (everything PSET/LINE/CLS have drawn since the last FLIP) onto the
+; real, visible framebuffer in one shot, so a whole frame appears at
+; once instead of being built up stroke-by-stroke on screen.
+; -------------------------------------------------------------------------
+basix_parse_flip:
+    lea rcx, [rel basix_rt_flip]
     call basix_emit_call_to
     ret
 
@@ -2593,6 +2647,10 @@ basix_parse_statement:
     je .do_line
     cmp r15d, TOK_WAIT
     je .do_wait
+    cmp r15d, TOK_CLS
+    je .do_cls
+    cmp r15d, TOK_FLIP
+    je .do_flip
     cmp r15d, TOK_IDENT
     je .do_ident_stmt
 
@@ -2660,6 +2718,14 @@ basix_parse_statement:
 .do_wait:
     call basix_lex_next
     call basix_parse_wait
+    jmp .out
+.do_cls:
+    call basix_lex_next
+    call basix_parse_cls
+    jmp .out
+.do_flip:
+    call basix_lex_next
+    call basix_parse_flip
     jmp .out
 
 .do_ident_stmt:

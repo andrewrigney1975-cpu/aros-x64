@@ -184,18 +184,68 @@ basix_rt_newline:
     ret
 
 ; -------------------------------------------------------------------------
-; basix_rt_pset: RCX = x, RDX = y, R8 = color (a packed 32-bit pixel
-; value written directly, channel order doesn't matter -- same as every
-; other framebuffer write in this kernel, e.g. fb_draw_char). Bounds-
-; checked against the real framebuffer dimensions (FB_WIDTH/FB_HEIGHT
-; in boot_info*, kept in RBX globally); out-of-range coordinates are
-; silently ignored rather than corrupting memory past the framebuffer,
-; since a compiled BASIX64 program's own arithmetic is the only thing
-; producing these coordinates and nothing here validates it in advance.
+; basix_rt_ensure_backbuf: lazily allocates (via kmalloc) and zeroes the
+; back buffer -- a private, tightly-packed (stride == width, no GOP
+; padding) copy of the frame that PSET/LINE/CLS draw into, sized off
+; the real framebuffer's own dimensions (FB_WIDTH/FB_HEIGHT in
+; boot_info*, kept in RBX globally -- see basix_rt_print_int's note on
+; never clobbering it). Idempotent: every caller below runs this first
+; and it's a single pointer check after the first successful call.
 ;
-; NOTE: must NEVER use RBX as scratch -- see basix_rt_print_int's note;
-; boot_info* lives there for the whole kernel, framebuffer fields read
-; here (FB_BASE/FB_WIDTH/FB_HEIGHT/FB_STRIDE) come straight off it.
+; Off-screen drawing is what actually fixes the flicker WAIT-paced
+; animation used to show: previously PSET/LINE wrote straight to the
+; real, currently-scanned-out framebuffer, so a viewer could catch a
+; frame mid-redraw (old lines erased, new ones not yet drawn). Now a
+; whole frame is composed here, invisibly, and FLIP (basix_rt_flip)
+; presents it in one blit.
+;
+; On kmalloc failure, basix_backbuf_ptr is left at 0 and every caller
+; below checks that and no-ops rather than dereferencing NULL -- a
+; compiled program with no graphics simply draws nothing rather than
+; crashing the kernel.
+; -------------------------------------------------------------------------
+basix_rt_ensure_backbuf:
+    push rax
+    push rcx
+    push rdx
+    push rdi
+
+    cmp qword [rel basix_backbuf_ptr], 0
+    jne .out
+
+    mov eax, [rbx+FB_WIDTH]
+    mov [rel basix_backbuf_w], eax
+    mov eax, [rbx+FB_HEIGHT]
+    mov [rel basix_backbuf_h], eax
+
+    mov eax, [rel basix_backbuf_w]
+    imul eax, [rel basix_backbuf_h]
+    shl rax, 2                          ; * 4 bytes/pixel
+    mov rcx, rax
+    call kmalloc
+    test rax, rax
+    jz .out
+    mov [rel basix_backbuf_ptr], rax
+
+    mov rdi, rax
+    mov eax, [rel basix_backbuf_w]
+    imul eax, [rel basix_backbuf_h]
+    mov ecx, eax
+    xor eax, eax
+    cld
+    rep stosd
+.out:
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_pset: RCX = x, RDX = y, R8 = color (packed 32-bit pixel,
+; channel order doesn't matter -- see basix_rt_blend_pixel). Writes
+; into the back buffer (not the visible framebuffer -- see FLIP), with
+; the same bounds-check-and-ignore behavior as before.
 ; -------------------------------------------------------------------------
 basix_rt_pset:
     push rax
@@ -204,20 +254,24 @@ basix_rt_pset:
     push rsi
     push rdi
 
+    call basix_rt_ensure_backbuf
+    cmp qword [rel basix_backbuf_ptr], 0
+    je .out
+
     cmp ecx, 0
     jl .out
     cmp edx, 0
     jl .out
-    cmp ecx, [rbx+FB_WIDTH]
+    cmp ecx, [rel basix_backbuf_w]
     jge .out
-    cmp edx, [rbx+FB_HEIGHT]
+    cmp edx, [rel basix_backbuf_h]
     jge .out
 
     mov eax, edx
-    imul eax, dword [rbx+FB_STRIDE]
-    add eax, ecx                        ; eax = y*stride + x (zero-extends rax)
+    imul eax, [rel basix_backbuf_w]
+    add eax, ecx                        ; eax = y*w + x (zero-extends rax)
     shl rax, 2                          ; * 4 bytes/pixel
-    mov rdi, [rbx+FB_BASE]
+    mov rdi, [rel basix_backbuf_ptr]
     add rdi, rax
     mov eax, r8d
     mov [rdi], eax
@@ -230,22 +284,219 @@ basix_rt_pset:
     ret
 
 ; -------------------------------------------------------------------------
-; basix_rt_line: RCX = x1, RDX = y1, R8 = x2, R9 = y2, R10 = color.
-; Draws a line via the standard integer Bresenham algorithm (all
-; octants), plotting each pixel through basix_rt_pset (so the same
-; bounds check applies per-pixel -- a line that runs off-screen just
-; gets clipped one pixel at a time rather than needing its own clip
-; test up front).
-;
-; Persistent loop state lives in r8/r9 (current x/y -- reusing the
-; same registers pset's own x/y arguments go in, since pset preserves
-; RCX/RDX across its own call but not R8/R9, see the restore below),
-; r10=dx, r11=dy (stored negative, i.e. -abs(y2-y1) -- the classic
-; formulation this algorithm uses), r12=sx, r13=sy, r14=err, r15=color.
-; The target (x2,y2) only needs to survive setup, so it's spilled to
-; the two scratch globals below rather than claiming a register.
+; basix_rt_cls: RCX = color. Fills the entire back buffer with it (a
+; plain 32-bit-per-pixel rep stosd -- no blending, this is a hard
+; clear).
 ; -------------------------------------------------------------------------
-basix_rt_line:
+basix_rt_cls:
+    push rax
+    push rcx
+    push rdi
+
+    call basix_rt_ensure_backbuf
+    cmp qword [rel basix_backbuf_ptr], 0
+    je .out
+
+    mov eax, ecx
+    mov rdi, [rel basix_backbuf_ptr]
+    mov ecx, [rel basix_backbuf_w]
+    imul ecx, [rel basix_backbuf_h]
+    cld
+    rep stosd
+.out:
+    pop rdi
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_flip: no arguments. Blits the back buffer onto the real,
+; visible framebuffer, one scanline at a time -- the two can't share a
+; single rep movsd over the whole thing since the back buffer is
+; tightly packed (stride == width) but the real framebuffer's stride
+; (FB_STRIDE) may exceed its width (GOP padding), so each row needs its
+; own copy with the two pointers re-synced afterward.
+; -------------------------------------------------------------------------
+basix_rt_flip:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+
+    call basix_rt_ensure_backbuf
+    cmp qword [rel basix_backbuf_ptr], 0
+    je .out
+
+    mov r8d, [rel basix_backbuf_h]
+    test r8d, r8d
+    jz .out
+    xor edx, edx                        ; row index
+    mov rsi, [rel basix_backbuf_ptr]
+    mov rdi, [rbx+FB_BASE]
+.rowloop:
+    cmp edx, r8d
+    jge .out
+    mov ecx, [rel basix_backbuf_w]
+    push rsi
+    push rdi
+    cld
+    rep movsd
+    pop rdi
+    pop rsi
+    mov eax, [rel basix_backbuf_w]
+    shl rax, 2
+    add rsi, rax
+    mov eax, [rbx+FB_STRIDE]
+    shl rax, 2
+    add rdi, rax
+    inc edx
+    jmp .rowloop
+.out:
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_dfloor: XMM0 = value. Returns EAX = floor(value) as int32;
+; XMM0 is left unchanged (clobbers XMM1 only) so a caller can still
+; compute fpart = value - floor afterward. cvttsd2si truncates toward
+; zero, which already equals floor() for value >= 0 and for exact
+; negative integers; the one case it gets wrong is a negative non-
+; integer, where truncating rounds up (toward zero) instead of down --
+; corrected here by decrementing when the truncated value overshoots.
+; -------------------------------------------------------------------------
+basix_rt_dfloor:
+    cvttsd2si eax, xmm0
+    cvtsi2sd xmm1, eax
+    comisd xmm1, xmm0
+    jbe .done
+    dec eax
+.done:
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_blend_pixel: ECX = x, EDX = y, R8D = packed 32-bit color,
+; XMM0 = coverage (0.0..1.0, clamped here). Alpha-blends color into the
+; back buffer at (x,y): new = bg + (fg-bg)*coverage, done independently
+; per byte (not per RGB channel with any assumed order) -- since a
+; linear blend of each byte is identical regardless of which byte is
+; red/green/blue/reserved, this needs no knowledge of the GOP's actual
+; pixel format, matching the "channel order doesn't matter" convention
+; basix_rt_pset already relies on. Bounds-checked the same as PSET.
+; -------------------------------------------------------------------------
+basix_rt_blend_pixel:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    cmp qword [rel basix_backbuf_ptr], 0
+    je .out
+    cmp ecx, 0
+    jl .out
+    cmp edx, 0
+    jl .out
+    cmp ecx, [rel basix_backbuf_w]
+    jge .out
+    cmp edx, [rel basix_backbuf_h]
+    jge .out
+
+    ; clamp coverage to [0,1]
+    xorpd xmm1, xmm1
+    comisd xmm0, xmm1
+    jae .cov_not_neg
+    xorpd xmm0, xmm0
+.cov_not_neg:
+    movsd xmm1, [rel basix_rt_trig_one]
+    comisd xmm0, xmm1
+    jbe .cov_not_over
+    movsd xmm0, xmm1
+.cov_not_over:
+
+    mov eax, edx
+    imul eax, [rel basix_backbuf_w]
+    add eax, ecx
+    mov rdi, [rel basix_backbuf_ptr]
+    lea rdi, [rdi + rax*4]
+
+    mov r10d, [rdi]                     ; bg dword
+    mov r11d, r8d                       ; fg dword (color)
+    xor ebx, ebx                        ; result accumulator
+    xor r9d, r9d                        ; channel index 0..3
+.chan_loop:
+    mov ecx, r9d
+    shl ecx, 3                          ; shift amount = channel*8
+
+    mov eax, r10d
+    shr eax, cl
+    and eax, 0xFF                       ; eax = bg byte
+    mov edx, r11d
+    shr edx, cl
+    and edx, 0xFF                       ; edx = fg byte
+
+    cvtsi2sd xmm2, eax
+    cvtsi2sd xmm3, edx
+    subsd xmm3, xmm2                    ; fg-bg
+    mulsd xmm3, xmm0                    ; (fg-bg)*coverage
+    addsd xmm3, xmm2                    ; bg + (fg-bg)*coverage
+    addsd xmm3, [rel basix_rt_half]     ; round to nearest on truncation
+    cvttsd2si eax, xmm3
+    cmp eax, 0
+    jge .no_clamp_low
+    xor eax, eax
+.no_clamp_low:
+    cmp eax, 255
+    jle .no_clamp_high
+    mov eax, 255
+.no_clamp_high:
+    shl eax, cl
+    or ebx, eax
+
+    inc r9d
+    cmp r9d, 4
+    jl .chan_loop
+
+    mov [rdi], ebx
+
+.out:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_line_aa: RCX = packed 32-bit color. Endpoints are read from
+; basix_line_x1f/y1f/x2f/y2f (doubles -- basix_parse_line stores them
+; there before this call, see basix_parse_float_arg_store). Draws an
+; anti-aliased line into the back buffer via Xiaolin Wu's algorithm:
+; every line is walked along its dominant axis (whichever of dx/dy is
+; larger -- the "steep" flag below swaps x/y roles so the walk is
+; always one pixel per step along that axis) and each step touches TWO
+; adjacent pixels, weighted by how far the true (sub-pixel) line
+; passes between them, rather than one hard pixel per Bresenham step.
+; That fractional weighting is exactly what basix_rt_blend_pixel's
+; coverage parameter is for.
+; -------------------------------------------------------------------------
+basix_rt_line_aa:
     push rax
     push rcx
     push rdx
@@ -255,85 +506,289 @@ basix_rt_line:
     push r9
     push r10
     push r11
-    push r12
-    push r13
-    push r14
-    push r15
 
-    mov [rel basix_rt_line_x2], r8d
-    mov [rel basix_rt_line_y2], r9d
-    mov r15d, r10d                      ; color
+    call basix_rt_ensure_backbuf
+    cmp qword [rel basix_backbuf_ptr], 0
+    je .ret_out
 
-    ; dx = abs(x2-x1), sx = x1<x2 ? 1 : -1
-    mov eax, r8d
-    sub eax, ecx
-    mov r10d, eax
-    test r10d, r10d
-    jns .dx_abs_done
-    neg r10d
-.dx_abs_done:
-    mov r12d, 1
-    cmp ecx, r8d
-    jl .sx_done
-    mov r12d, -1
-.sx_done:
+    mov [rel basix_wu_color], ecx
 
-    ; dy = -abs(y2-y1), sy = y1<y2 ? 1 : -1
-    mov eax, r9d
-    sub eax, edx
-    mov r11d, eax
-    test r11d, r11d
-    jns .dy_abs_done
-    neg r11d
-.dy_abs_done:
-    neg r11d                            ; r11d = -abs(y2-y1)
-    mov r13d, 1
-    cmp edx, r9d
-    jl .sy_done
-    mov r13d, -1
-.sy_done:
+    movsd xmm0, [rel basix_line_x1f]
+    movsd [rel basix_wu_x0], xmm0
+    movsd xmm0, [rel basix_line_y1f]
+    movsd [rel basix_wu_y0], xmm0
+    movsd xmm0, [rel basix_line_x2f]
+    movsd [rel basix_wu_x1], xmm0
+    movsd xmm0, [rel basix_line_y2f]
+    movsd [rel basix_wu_y1], xmm0
 
-    mov r14d, r10d
-    add r14d, r11d                      ; err = dx+dy
+    ; steep = |y1-y0| > |x1-x0|
+    movsd xmm0, [rel basix_wu_y1]
+    subsd xmm0, [rel basix_wu_y0]
+    xorpd xmm2, xmm2
+    comisd xmm0, xmm2
+    jae .absdy_ok
+    xorpd xmm3, xmm3
+    subsd xmm3, xmm0
+    movsd xmm0, xmm3
+.absdy_ok:
+    movsd [rel basix_wu_t], xmm0        ; |dy|
 
-    mov r8d, ecx                        ; cur_x = x1
-    mov r9d, edx                        ; cur_y = y1
+    movsd xmm0, [rel basix_wu_x1]
+    subsd xmm0, [rel basix_wu_x0]
+    xorpd xmm2, xmm2
+    comisd xmm0, xmm2
+    jae .absdx_ok
+    xorpd xmm3, xmm3
+    subsd xmm3, xmm0
+    movsd xmm0, xmm3
+.absdx_ok:
+    movsd xmm1, [rel basix_wu_t]        ; |dy|
+    comisd xmm1, xmm0                   ; |dy| vs |dx|
+    mov dword [rel basix_wu_steep], 0
+    jbe .not_steep
+    mov dword [rel basix_wu_steep], 1
+    movsd xmm0, [rel basix_wu_x0]
+    movsd xmm1, [rel basix_wu_y0]
+    movsd [rel basix_wu_x0], xmm1
+    movsd [rel basix_wu_y0], xmm0
+    movsd xmm0, [rel basix_wu_x1]
+    movsd xmm1, [rel basix_wu_y1]
+    movsd [rel basix_wu_x1], xmm1
+    movsd [rel basix_wu_y1], xmm0
+.not_steep:
 
-.loop:
-    mov ecx, r8d
+    ; if x0 > x1: swap endpoints so the walk always goes left to right
+    movsd xmm0, [rel basix_wu_x0]
+    movsd xmm1, [rel basix_wu_x1]
+    comisd xmm0, xmm1
+    jbe .no_endswap
+    movsd [rel basix_wu_x0], xmm1
+    movsd [rel basix_wu_x1], xmm0
+    movsd xmm0, [rel basix_wu_y0]
+    movsd xmm1, [rel basix_wu_y1]
+    movsd [rel basix_wu_y0], xmm1
+    movsd [rel basix_wu_y1], xmm0
+.no_endswap:
+
+    movsd xmm0, [rel basix_wu_x1]
+    subsd xmm0, [rel basix_wu_x0]
+    movsd [rel basix_wu_dx], xmm0
+    movsd xmm0, [rel basix_wu_y1]
+    subsd xmm0, [rel basix_wu_y0]
+    movsd [rel basix_wu_dy], xmm0
+
+    ; gradient = dx==0 ? 1.0 : dy/dx
+    movsd xmm0, [rel basix_wu_dx]
+    xorpd xmm1, xmm1
+    comisd xmm0, xmm1
+    jne .grad_divide
+    movsd xmm0, [rel basix_rt_trig_one]
+    movsd [rel basix_wu_gradient], xmm0
+    jmp .grad_done
+.grad_divide:
+    movsd xmm0, [rel basix_wu_dy]
+    divsd xmm0, [rel basix_wu_dx]
+    movsd [rel basix_wu_gradient], xmm0
+.grad_done:
+
+    ; ---- endpoint 1 ----
+    movsd xmm0, [rel basix_wu_x0]
+    addsd xmm0, [rel basix_rt_half]
+    call basix_rt_dfloor                ; eax = round(x0)
+    mov [rel basix_wu_xpxl1], eax
+    cvtsi2sd xmm1, eax
+    movsd [rel basix_wu_xend], xmm1
+
+    movsd xmm0, xmm1
+    subsd xmm0, [rel basix_wu_x0]
+    mulsd xmm0, [rel basix_wu_gradient]
+    addsd xmm0, [rel basix_wu_y0]
+    movsd [rel basix_wu_yend], xmm0
+
+    movsd xmm0, [rel basix_wu_x0]       ; xgap = 1 - fpart(x0+0.5)
+    addsd xmm0, [rel basix_rt_half]
+    subsd xmm0, [rel basix_wu_xend]
+    movsd xmm1, [rel basix_rt_trig_one]
+    subsd xmm1, xmm0
+    movsd [rel basix_wu_xgap], xmm1
+
+    movsd xmm0, [rel basix_wu_yend]
+    call basix_rt_dfloor
+    mov [rel basix_wu_ypxl1], eax
+    cvtsi2sd xmm1, eax
+    movsd xmm2, xmm0
+    subsd xmm2, xmm1                    ; fpart(yend)
+    movsd [rel basix_wu_t], xmm2
+    movsd xmm3, [rel basix_rt_trig_one]
+    subsd xmm3, xmm2                    ; rfpart(yend)
+    movsd [rel basix_wu_t2], xmm3
+
+    movsd xmm0, [rel basix_wu_t2]
+    mulsd xmm0, [rel basix_wu_xgap]
+    movsd [rel basix_wu_cov_a], xmm0
+    movsd xmm0, [rel basix_wu_t]
+    mulsd xmm0, [rel basix_wu_xgap]
+    movsd [rel basix_wu_cov_b], xmm0
+
+    mov eax, [rel basix_wu_steep]
+    test eax, eax
+    jz .ep1_notsteep
+    mov ecx, [rel basix_wu_ypxl1]
+    mov edx, [rel basix_wu_xpxl1]
+    mov r8d, [rel basix_wu_color]
+    movsd xmm0, [rel basix_wu_cov_a]
+    call basix_rt_blend_pixel
+    mov ecx, [rel basix_wu_ypxl1]
+    inc ecx
+    mov edx, [rel basix_wu_xpxl1]
+    mov r8d, [rel basix_wu_color]
+    movsd xmm0, [rel basix_wu_cov_b]
+    call basix_rt_blend_pixel
+    jmp .ep1_done
+.ep1_notsteep:
+    mov ecx, [rel basix_wu_xpxl1]
+    mov edx, [rel basix_wu_ypxl1]
+    mov r8d, [rel basix_wu_color]
+    movsd xmm0, [rel basix_wu_cov_a]
+    call basix_rt_blend_pixel
+    mov ecx, [rel basix_wu_xpxl1]
+    mov edx, [rel basix_wu_ypxl1]
+    inc edx
+    mov r8d, [rel basix_wu_color]
+    movsd xmm0, [rel basix_wu_cov_b]
+    call basix_rt_blend_pixel
+.ep1_done:
+
+    movsd xmm0, [rel basix_wu_yend]
+    addsd xmm0, [rel basix_wu_gradient]
+    movsd [rel basix_wu_intery], xmm0
+
+    ; ---- endpoint 2 ----
+    movsd xmm0, [rel basix_wu_x1]
+    addsd xmm0, [rel basix_rt_half]
+    call basix_rt_dfloor
+    mov [rel basix_wu_xpxl2], eax
+    cvtsi2sd xmm1, eax
+    movsd [rel basix_wu_xend], xmm1
+
+    movsd xmm0, xmm1
+    subsd xmm0, [rel basix_wu_x1]
+    mulsd xmm0, [rel basix_wu_gradient]
+    addsd xmm0, [rel basix_wu_y1]
+    movsd [rel basix_wu_yend], xmm0
+
+    movsd xmm0, [rel basix_wu_x1]       ; xgap = fpart(x1+0.5)
+    addsd xmm0, [rel basix_rt_half]
+    subsd xmm0, [rel basix_wu_xend]
+    movsd [rel basix_wu_xgap], xmm0
+
+    movsd xmm0, [rel basix_wu_yend]
+    call basix_rt_dfloor
+    mov [rel basix_wu_ypxl2], eax
+    cvtsi2sd xmm1, eax
+    movsd xmm2, xmm0
+    subsd xmm2, xmm1
+    movsd [rel basix_wu_t], xmm2
+    movsd xmm3, [rel basix_rt_trig_one]
+    subsd xmm3, xmm2
+    movsd [rel basix_wu_t2], xmm3
+
+    movsd xmm0, [rel basix_wu_t2]
+    mulsd xmm0, [rel basix_wu_xgap]
+    movsd [rel basix_wu_cov_a], xmm0
+    movsd xmm0, [rel basix_wu_t]
+    mulsd xmm0, [rel basix_wu_xgap]
+    movsd [rel basix_wu_cov_b], xmm0
+
+    mov eax, [rel basix_wu_steep]
+    test eax, eax
+    jz .ep2_notsteep
+    mov ecx, [rel basix_wu_ypxl2]
+    mov edx, [rel basix_wu_xpxl2]
+    mov r8d, [rel basix_wu_color]
+    movsd xmm0, [rel basix_wu_cov_a]
+    call basix_rt_blend_pixel
+    mov ecx, [rel basix_wu_ypxl2]
+    inc ecx
+    mov edx, [rel basix_wu_xpxl2]
+    mov r8d, [rel basix_wu_color]
+    movsd xmm0, [rel basix_wu_cov_b]
+    call basix_rt_blend_pixel
+    jmp .ep2_done
+.ep2_notsteep:
+    mov ecx, [rel basix_wu_xpxl2]
+    mov edx, [rel basix_wu_ypxl2]
+    mov r8d, [rel basix_wu_color]
+    movsd xmm0, [rel basix_wu_cov_a]
+    call basix_rt_blend_pixel
+    mov ecx, [rel basix_wu_xpxl2]
+    mov edx, [rel basix_wu_ypxl2]
+    inc edx
+    mov r8d, [rel basix_wu_color]
+    movsd xmm0, [rel basix_wu_cov_b]
+    call basix_rt_blend_pixel
+.ep2_done:
+
+    ; ---- main loop: x from xpxl1+1 to xpxl2-1 ----
+    mov eax, [rel basix_wu_xpxl1]
+    inc eax
+    mov [rel basix_wu_loopx], eax
+.mainloop:
+    mov eax, [rel basix_wu_loopx]
+    cmp eax, [rel basix_wu_xpxl2]
+    jge .mainloop_done
+
+    movsd xmm0, [rel basix_wu_intery]
+    call basix_rt_dfloor
+    mov r9d, eax                        ; ipart(intery)
+    cvtsi2sd xmm1, eax
+    movsd xmm2, xmm0
+    subsd xmm2, xmm1                    ; fpart(intery)
+    movsd [rel basix_wu_t], xmm2
+    movsd xmm3, [rel basix_rt_trig_one]
+    subsd xmm3, xmm2                    ; rfpart(intery)
+    movsd [rel basix_wu_t2], xmm3
+
+    mov eax, [rel basix_wu_steep]
+    test eax, eax
+    jz .ml_notsteep
+    mov ecx, r9d
+    mov edx, [rel basix_wu_loopx]
+    mov r8d, [rel basix_wu_color]
+    movsd xmm0, [rel basix_wu_t2]
+    call basix_rt_blend_pixel
+    mov ecx, r9d
+    inc ecx
+    mov edx, [rel basix_wu_loopx]
+    mov r8d, [rel basix_wu_color]
+    movsd xmm0, [rel basix_wu_t]
+    call basix_rt_blend_pixel
+    jmp .ml_stepnext
+.ml_notsteep:
+    mov ecx, [rel basix_wu_loopx]
     mov edx, r9d
-    mov r8d, r15d                       ; color (clobbers cur_x -- restored
-                                         ; below from ECX, which pset
-                                         ; preserves across its own call)
-    call basix_rt_pset
-    mov r8d, ecx                        ; restore cur_x
+    mov r8d, [rel basix_wu_color]
+    movsd xmm0, [rel basix_wu_t2]
+    call basix_rt_blend_pixel
+    mov ecx, [rel basix_wu_loopx]
+    mov edx, r9d
+    inc edx
+    mov r8d, [rel basix_wu_color]
+    movsd xmm0, [rel basix_wu_t]
+    call basix_rt_blend_pixel
+.ml_stepnext:
+    movsd xmm0, [rel basix_wu_intery]
+    addsd xmm0, [rel basix_wu_gradient]
+    movsd [rel basix_wu_intery], xmm0
 
-    cmp r8d, [rel basix_rt_line_x2]
-    jne .continue
-    cmp r9d, [rel basix_rt_line_y2]
-    jne .continue
-    jmp .done
+    mov eax, [rel basix_wu_loopx]
+    inc eax
+    mov [rel basix_wu_loopx], eax
+    jmp .mainloop
+.mainloop_done:
 
-.continue:
-    mov eax, r14d
-    add eax, eax                        ; e2 = 2*err
-    cmp eax, r11d
-    jl .no_x_step
-    add r14d, r11d                      ; err += dy
-    add r8d, r12d                       ; cur_x += sx
-.no_x_step:
-    cmp eax, r10d
-    jg .no_y_step
-    add r14d, r10d                      ; err += dx
-    add r9d, r13d                       ; cur_y += sy
-.no_y_step:
-    jmp .loop
-
-.done:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
+.ret_out:
     pop r11
     pop r10
     pop r9
@@ -503,10 +958,53 @@ basix_rt_digit_buf: times 20 db 0
 align 8
 basix_rt_ten: dq 10.0
 basix_rt_frac_buf: times 6 db 0
-basix_rt_line_x2: dd 0
-basix_rt_line_y2: dd 0
 
 align 8
 basix_rt_trig_a:   dq 0
 basix_rt_trig_b:   dq 0
 basix_rt_trig_one: dq 1.0
+basix_rt_half:     dq 0.5
+
+; Back buffer (basix_rt_ensure_backbuf/basix_rt_flip): a kmalloc'd,
+; tightly-packed copy of the frame PSET/LINE/CLS draw into. Zero
+; means "not yet allocated" -- every drawing routine lazily inits it
+; on first use.
+align 8
+basix_backbuf_ptr: dq 0
+basix_backbuf_w:   dd 0
+basix_backbuf_h:   dd 0
+
+; LINE's endpoints (basix_parse_line stores these via
+; basix_parse_float_arg_store; basix_rt_line_aa reads them).
+align 8
+basix_line_x1f: dq 0
+basix_line_y1f: dq 0
+basix_line_x2f: dq 0
+basix_line_y2f: dq 0
+
+; basix_rt_line_aa's (Wu's algorithm) working state -- not reentrant,
+; same caveat as the trig helpers above (fine: BASIX64 programs run
+; single-threaded and synchronously).
+align 8
+basix_wu_x0:       dq 0
+basix_wu_y0:       dq 0
+basix_wu_x1:       dq 0
+basix_wu_y1:       dq 0
+basix_wu_dx:       dq 0
+basix_wu_dy:       dq 0
+basix_wu_gradient: dq 0
+basix_wu_intery:   dq 0
+basix_wu_xend:     dq 0
+basix_wu_yend:     dq 0
+basix_wu_xgap:     dq 0
+basix_wu_t:        dq 0
+basix_wu_t2:       dq 0
+basix_wu_cov_a:    dq 0
+basix_wu_cov_b:    dq 0
+basix_wu_steep:    dd 0
+basix_wu_color:    dd 0
+basix_wu_xpxl1:    dd 0
+basix_wu_ypxl1:    dd 0
+basix_wu_xpxl2:    dd 0
+basix_wu_ypxl2:    dd 0
+basix_wu_loopx:    dd 0
