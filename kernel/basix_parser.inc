@@ -1259,6 +1259,44 @@ basix_parse_line:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_parse_trifill: "TRIFILL x0,y0, x1,y1, x2,y2, color" -- fills one
+; solid-color triangle into the back buffer (basix_rt_fill_tri). Same
+; float-endpoint marshaling as LINE (see basix_parse_float_arg_store),
+; just three points instead of two.
+; -------------------------------------------------------------------------
+basix_parse_trifill:
+    lea rax, [rel basix_tri_x0f]
+    call basix_parse_float_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+    lea rax, [rel basix_tri_y0f]
+    call basix_parse_float_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+    lea rax, [rel basix_tri_x1f]
+    call basix_parse_float_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+    lea rax, [rel basix_tri_y1f]
+    call basix_parse_float_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+    lea rax, [rel basix_tri_x2f]
+    call basix_parse_float_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+    lea rax, [rel basix_tri_y2f]
+    call basix_parse_float_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+
+    call basix_parse_int_arg_push        ; color
+    call basix_emit_pop_rcx              ; color
+    lea rcx, [rel basix_rt_fill_tri]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_parse_cls: "CLS color" -- fills the entire back buffer with one
 ; color. Single int argument, same plumbing as WAIT's.
 ; -------------------------------------------------------------------------
@@ -2782,6 +2820,8 @@ basix_parse_statement:
     je .do_cls
     cmp r15d, TOK_FLIP
     je .do_flip
+    cmp r15d, TOK_TRIFILL
+    je .do_trifill
     cmp r15d, TOK_IDENT
     je .do_ident_stmt
 
@@ -2857,6 +2897,10 @@ basix_parse_statement:
 .do_flip:
     call basix_lex_next
     call basix_parse_flip
+    jmp .out
+.do_trifill:
+    call basix_lex_next
+    call basix_parse_trifill
     jmp .out
 
 .do_ident_stmt:

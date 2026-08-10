@@ -381,6 +381,273 @@ basix_rt_dfloor:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_rt_fill_tri: RCX = packed 32-bit color. Vertices are read from
+; basix_tri_x0f/y0f/x1f/y1f/x2f/y2f (doubles -- basix_parse_trifill
+; stores them there, see basix_parse_float_arg_store). Fills a solid
+; triangle into the back buffer via the standard edge-function test:
+; for a point P, w0/w1/w2 are the signed areas of the sub-triangles
+; (v1,v2,P), (v2,v0,P), (v0,v1,P) -- P is inside iff all three carry
+; the same sign as the whole triangle's own signed area (computed once
+; up front, "area" below), which is what lets this work regardless of
+; the triangle's winding order without a branch to detect it (just
+; multiply each w by area and check the product is non-negative).
+;
+; This is a hard-edged fill (every covered pixel gets the flat color,
+; no coverage blending at the boundary) -- deliberately simpler than
+; basix_rt_line_aa's Wu's-algorithm approach, since a caller wanting
+; smooth silhouettes on a filled polygon is expected to additionally
+; stroke its boundary edges with LINE in the same color (which IS
+; anti-aliased) rather than this routine anti-aliasing its own edges.
+; -------------------------------------------------------------------------
+basix_rt_fill_tri:
+    push rax
+    push rcx
+    push rdx
+    push rdi
+
+    call basix_rt_ensure_backbuf
+    cmp qword [rel basix_backbuf_ptr], 0
+    je .out
+
+    mov [rel basix_tri_color], ecx
+
+    ; area = (x1-x0)*(y2-y0) - (y1-y0)*(x2-x0)
+    movsd xmm0, [rel basix_tri_x1f]
+    subsd xmm0, [rel basix_tri_x0f]
+    movsd xmm1, [rel basix_tri_y2f]
+    subsd xmm1, [rel basix_tri_y0f]
+    mulsd xmm0, xmm1
+    movsd xmm1, [rel basix_tri_y1f]
+    subsd xmm1, [rel basix_tri_y0f]
+    movsd xmm2, [rel basix_tri_x2f]
+    subsd xmm2, [rel basix_tri_x0f]
+    mulsd xmm1, xmm2
+    subsd xmm0, xmm1
+    movsd [rel basix_tri_area], xmm0
+
+    xorpd xmm1, xmm1
+    comisd xmm0, xmm1
+    je .out                              ; degenerate (zero-area) triangle
+
+    ; bounding box, clamped to the back buffer
+    movsd xmm0, [rel basix_tri_x0f]
+    movsd xmm1, [rel basix_tri_x1f]
+    minsd xmm0, xmm1
+    movsd xmm1, [rel basix_tri_x2f]
+    minsd xmm0, xmm1
+    call basix_rt_dfloor
+    cmp eax, 0
+    jge .minx_ok
+    xor eax, eax
+.minx_ok:
+    mov [rel basix_tri_minx], eax
+
+    movsd xmm0, [rel basix_tri_x0f]
+    movsd xmm1, [rel basix_tri_x1f]
+    maxsd xmm0, xmm1
+    movsd xmm1, [rel basix_tri_x2f]
+    maxsd xmm0, xmm1
+    call basix_rt_dfloor
+    inc eax
+    mov ecx, [rel basix_backbuf_w]
+    dec ecx
+    cmp eax, ecx
+    jle .maxx_ok
+    mov eax, ecx
+.maxx_ok:
+    mov [rel basix_tri_maxx], eax
+
+    movsd xmm0, [rel basix_tri_y0f]
+    movsd xmm1, [rel basix_tri_y1f]
+    minsd xmm0, xmm1
+    movsd xmm1, [rel basix_tri_y2f]
+    minsd xmm0, xmm1
+    call basix_rt_dfloor
+    cmp eax, 0
+    jge .miny_ok
+    xor eax, eax
+.miny_ok:
+    mov [rel basix_tri_miny], eax
+
+    movsd xmm0, [rel basix_tri_y0f]
+    movsd xmm1, [rel basix_tri_y1f]
+    maxsd xmm0, xmm1
+    movsd xmm1, [rel basix_tri_y2f]
+    maxsd xmm0, xmm1
+    call basix_rt_dfloor
+    inc eax
+    mov ecx, [rel basix_backbuf_h]
+    dec ecx
+    cmp eax, ecx
+    jle .maxy_ok
+    mov eax, ecx
+.maxy_ok:
+    mov [rel basix_tri_maxy], eax
+
+    ; Per-edge coefficients so each pixel's edge test is just
+    ; A*sx+B*sy+C (2 muls, 2 adds) instead of recomputing every
+    ; subtraction from the raw vertices -- and each is pre-scaled by
+    ; "area" too, folding the separate "multiply by area" step (see
+    ; the header comment) into these constants instead of repeating it
+    ; per pixel. w_i(x,y) = A_i*x + B_i*y + C_i is the standard linear
+    ; form of the edge function E(a,b,P) = (b.x-a.x)*(P.y-a.y) -
+    ; (b.y-a.y)*(P.x-a.x), with A=a.y-b.y, B=b.x-a.x, C=-A*a.x-B*a.y.
+    ; This all runs ONCE per triangle (outside the pixel loop below) --
+    ; the loop it feeds is the actual hot path, since it runs once per
+    ; covered pixel, easily tens of thousands of times for one cube
+    ; face at this resolution.
+    movsd xmm7, [rel basix_tri_area]
+
+    movsd xmm0, [rel basix_tri_y1f]
+    subsd xmm0, [rel basix_tri_y2f]
+    mulsd xmm0, xmm7
+    movsd [rel basix_tri_a0], xmm0
+    movsd xmm0, [rel basix_tri_x2f]
+    subsd xmm0, [rel basix_tri_x1f]
+    mulsd xmm0, xmm7
+    movsd [rel basix_tri_b0], xmm0
+    movsd xmm0, [rel basix_tri_x1f]
+    mulsd xmm0, [rel basix_tri_y2f]
+    movsd xmm1, [rel basix_tri_x2f]
+    mulsd xmm1, [rel basix_tri_y1f]
+    subsd xmm0, xmm1
+    mulsd xmm0, xmm7
+    movsd [rel basix_tri_c0], xmm0
+
+    movsd xmm0, [rel basix_tri_y2f]
+    subsd xmm0, [rel basix_tri_y0f]
+    mulsd xmm0, xmm7
+    movsd [rel basix_tri_a1], xmm0
+    movsd xmm0, [rel basix_tri_x0f]
+    subsd xmm0, [rel basix_tri_x2f]
+    mulsd xmm0, xmm7
+    movsd [rel basix_tri_b1], xmm0
+    movsd xmm0, [rel basix_tri_x2f]
+    mulsd xmm0, [rel basix_tri_y0f]
+    movsd xmm1, [rel basix_tri_x0f]
+    mulsd xmm1, [rel basix_tri_y2f]
+    subsd xmm0, xmm1
+    mulsd xmm0, xmm7
+    movsd [rel basix_tri_c1], xmm0
+
+    movsd xmm0, [rel basix_tri_y0f]
+    subsd xmm0, [rel basix_tri_y1f]
+    mulsd xmm0, xmm7
+    movsd [rel basix_tri_a2], xmm0
+    movsd xmm0, [rel basix_tri_x1f]
+    subsd xmm0, [rel basix_tri_x0f]
+    mulsd xmm0, xmm7
+    movsd [rel basix_tri_b2], xmm0
+    movsd xmm0, [rel basix_tri_x0f]
+    mulsd xmm0, [rel basix_tri_y1f]
+    movsd xmm1, [rel basix_tri_x1f]
+    mulsd xmm1, [rel basix_tri_y0f]
+    subsd xmm0, xmm1
+    mulsd xmm0, xmm7
+    movsd [rel basix_tri_c2], xmm0
+
+    ; Registers held resident for the whole pixel loop below (never
+    ; reloaded from memory per-pixel): xmm8/9/10 = A0/B0/C0, xmm11/12/13
+    ; = A1/B1/C1, xmm14 = A2 -- B2/C2 stay in memory (only so many XMM
+    ; registers to go around), plus xmm15 = 0.0 for the inside tests.
+    movsd xmm8,  [rel basix_tri_a0]
+    movsd xmm9,  [rel basix_tri_b0]
+    movsd xmm10, [rel basix_tri_c0]
+    movsd xmm11, [rel basix_tri_a1]
+    movsd xmm12, [rel basix_tri_b1]
+    movsd xmm13, [rel basix_tri_c1]
+    movsd xmm14, [rel basix_tri_a2]
+    xorpd xmm15, xmm15
+
+    mov eax, [rel basix_tri_miny]
+    mov [rel basix_tri_py], eax
+.yloop:
+    mov eax, [rel basix_tri_py]
+    cmp eax, [rel basix_tri_maxy]
+    jg .out
+
+    mov eax, [rel basix_tri_minx]
+    mov [rel basix_tri_px], eax
+.xloop:
+    mov eax, [rel basix_tri_px]
+    cmp eax, [rel basix_tri_maxx]
+    jg .ynext
+
+    mov eax, [rel basix_tri_px]
+    cvtsi2sd xmm4, eax
+    addsd xmm4, [rel basix_rt_half]      ; xmm4 = sample x (px+0.5)
+    mov eax, [rel basix_tri_py]
+    cvtsi2sd xmm5, eax
+    addsd xmm5, [rel basix_rt_half]      ; xmm5 = sample y (py+0.5)
+
+    ; w0 = A0*sx + B0*sy + C0
+    movsd xmm0, xmm8
+    mulsd xmm0, xmm4
+    movsd xmm1, xmm9
+    mulsd xmm1, xmm5
+    addsd xmm0, xmm1
+    addsd xmm0, xmm10
+    comisd xmm0, xmm15
+    jb .not_inside
+
+    ; w1 = A1*sx + B1*sy + C1
+    movsd xmm0, xmm11
+    mulsd xmm0, xmm4
+    movsd xmm1, xmm12
+    mulsd xmm1, xmm5
+    addsd xmm0, xmm1
+    addsd xmm0, xmm13
+    comisd xmm0, xmm15
+    jb .not_inside
+
+    ; w2 = A2*sx + B2*sy + C2
+    movsd xmm0, xmm14
+    mulsd xmm0, xmm4
+    movsd xmm1, [rel basix_tri_b2]
+    mulsd xmm1, xmm5
+    addsd xmm0, xmm1
+    addsd xmm0, [rel basix_tri_c2]
+    comisd xmm0, xmm15
+    jb .not_inside
+
+    mov edx, [rel basix_tri_py]
+    mov ecx, [rel basix_tri_px]
+    cmp ecx, 0
+    jl .not_inside
+    cmp edx, 0
+    jl .not_inside
+    cmp ecx, [rel basix_backbuf_w]
+    jge .not_inside
+    cmp edx, [rel basix_backbuf_h]
+    jge .not_inside
+    mov eax, edx
+    imul eax, [rel basix_backbuf_w]
+    add eax, ecx
+    shl rax, 2
+    mov rdi, [rel basix_backbuf_ptr]
+    add rdi, rax
+    mov eax, [rel basix_tri_color]
+    mov [rdi], eax
+
+.not_inside:
+    mov eax, [rel basix_tri_px]
+    inc eax
+    mov [rel basix_tri_px], eax
+    jmp .xloop
+.ynext:
+    mov eax, [rel basix_tri_py]
+    inc eax
+    mov [rel basix_tri_py], eax
+    jmp .yloop
+
+.out:
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_rt_blend_pixel: ECX = x, EDX = y, R8D = packed 32-bit color,
 ; XMM0 = coverage (0.0..1.0, clamped here). Alpha-blends color into the
 ; back buffer at (x,y): new = bg + (fg-bg)*coverage, done independently
@@ -1008,3 +1275,30 @@ basix_wu_ypxl1:    dd 0
 basix_wu_xpxl2:    dd 0
 basix_wu_ypxl2:    dd 0
 basix_wu_loopx:    dd 0
+
+; TRIFILL's vertices (basix_parse_trifill stores them; basix_rt_fill_tri
+; reads them) and its own working state.
+align 8
+basix_tri_x0f:   dq 0
+basix_tri_y0f:   dq 0
+basix_tri_x1f:   dq 0
+basix_tri_y1f:   dq 0
+basix_tri_x2f:   dq 0
+basix_tri_y2f:   dq 0
+basix_tri_area:  dq 0
+basix_tri_a0:    dq 0
+basix_tri_b0:    dq 0
+basix_tri_c0:    dq 0
+basix_tri_a1:    dq 0
+basix_tri_b1:    dq 0
+basix_tri_c1:    dq 0
+basix_tri_a2:    dq 0
+basix_tri_b2:    dq 0
+basix_tri_c2:    dq 0
+basix_tri_minx:  dd 0
+basix_tri_maxx:  dd 0
+basix_tri_miny:  dd 0
+basix_tri_maxy:  dd 0
+basix_tri_px:    dd 0
+basix_tri_py:    dd 0
+basix_tri_color: dd 0

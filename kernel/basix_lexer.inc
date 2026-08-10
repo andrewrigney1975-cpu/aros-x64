@@ -99,6 +99,7 @@ TOK_WAIT    equ 84
 
 TOK_CLS     equ 85
 TOK_FLIP    equ 86
+TOK_TRIFILL equ 87
 
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
@@ -1097,5 +1098,9 @@ basix_keywords:
     db 4
     dd TOK_FLIP
     db 'FLIP', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_TRIFILL
+    db 'TRIFILL', 0,0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table
