@@ -1227,6 +1227,19 @@ basix_parse_line:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_parse_wait: "WAIT n" -- spins until n more PIT ticks (hundredths
+; of a second, same units basix_rt_timer/TIMER reads) have elapsed.
+; Single argument, same "parse, convert-if-float, push/pop" plumbing as
+; PSET/LINE above.
+; -------------------------------------------------------------------------
+basix_parse_wait:
+    call basix_parse_int_arg_push        ; ticks
+    call basix_emit_pop_rcx              ; ticks
+    lea rcx, [rel basix_rt_wait]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_parse_trig_arg: shared by SIN/COS/TAN/ASIN/ACOS/ATAN -- parses
 ; "(expr)" (the function keyword itself already consumed by the
 ; caller), coercing an int result to float (XMM0) since every one of
@@ -1272,6 +1285,8 @@ basix_parse_primary:
     je .do_acos
     cmp eax, TOK_ATAN
     je .do_atan
+    cmp eax, TOK_TIMER
+    je .do_timer
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
@@ -1319,6 +1334,13 @@ basix_parse_primary:
     lea rcx, [rel basix_rt_atan]
     call basix_emit_call_to
     mov r11d, 2
+    ret
+
+.do_timer:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_timer]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
     ret
 
 .int_lit:
@@ -2569,6 +2591,8 @@ basix_parse_statement:
     je .do_pset
     cmp r15d, TOK_LINE
     je .do_line
+    cmp r15d, TOK_WAIT
+    je .do_wait
     cmp r15d, TOK_IDENT
     je .do_ident_stmt
 
@@ -2632,6 +2656,10 @@ basix_parse_statement:
 .do_line:
     call basix_lex_next
     call basix_parse_line
+    jmp .out
+.do_wait:
+    call basix_lex_next
+    call basix_parse_wait
     jmp .out
 
 .do_ident_stmt:

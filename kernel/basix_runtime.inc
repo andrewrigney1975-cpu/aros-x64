@@ -460,6 +460,41 @@ basix_fpu_init:
     fninit
     ret
 
+; -------------------------------------------------------------------------
+; basix_rt_timer: no arguments. Returns RAX = timer_ticks, the free-
+; running PIT tick counter irq0_stub increments at PIT_HZ (100Hz, see
+; pic.inc) -- i.e. hundredths of a second since boot. A BASIX64 program
+; reads this to compute elapsed/delta time for animation.
+; -------------------------------------------------------------------------
+basix_rt_timer:
+    mov rax, [rel timer_ticks]
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_wait: RCX = number of PIT ticks (hundredths of a second) to
+; wait. Busy-spins (PAUSE-throttled) until timer_ticks has advanced by
+; at least that many -- the same counter basix_rt_timer reads -- so a
+; BASIX64 program can pace an animation loop to a fixed frame rate
+; without a real sleep/yield primitive. Fine for a single-threaded
+; compiled program; not reentrant-safe to call concurrently, same
+; caveat as the trig helpers above.
+; -------------------------------------------------------------------------
+basix_rt_wait:
+    push rax
+    push rdx
+
+    mov rax, [rel timer_ticks]
+    add rax, rcx                         ; rax = target tick count
+.spin:
+    pause
+    mov rdx, [rel timer_ticks]
+    cmp rdx, rax
+    jl .spin
+
+    pop rdx
+    pop rax
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================

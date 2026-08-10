@@ -94,6 +94,9 @@ TOK_ASIN    equ 80
 TOK_ACOS    equ 81
 TOK_ATAN    equ 82
 
+TOK_TIMER   equ 83
+TOK_WAIT    equ 84
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -1075,5 +1078,13 @@ basix_keywords:
     db 4
     dd TOK_ATAN
     db 'ATAN', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 5
+    dd TOK_TIMER
+    db 'TIMER', 0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_WAIT
+    db 'WAIT', 0,0,0,0,0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table
