@@ -11,6 +11,7 @@ BASIX_MAX_VARS    equ 64
 BASIX_MAX_LABELS  equ 32
 BASIX_MAX_FIXUPS  equ 64
 BASIX_MAX_FOR_DEPTH equ 8
+BASIX_MAX_ARRAY_DIMS equ 4       ; DIM arr(d0,d1,...) -- up to 4 dimensions
 
 ; var_type encoding continued (0=INT,1=SFLOAT,2=DFLOAT,3=VECTOR2,
 ; 4=VECTOR3,5=VECTOR4,6=MATRIX4 -- see basix_parser.inc's DIM parsing):
@@ -467,7 +468,26 @@ basix_var_slots: times BASIX_MAX_VARS dq 0
 align 8
 basix_var_wide_slots: times (BASIX_MAX_VARS * 128) db 0
 
-basix_var_arr_len: times BASIX_MAX_VARS dd 0   ; element count, arrays only
+basix_var_arr_len: times BASIX_MAX_VARS dd 0   ; TOTAL element count
+                                                ; (product of all dims),
+                                                ; arrays only
+
+; Per-dimension shape, arrays only. ndims=1 for an ordinary 1D array
+; (DIM arr(N) ...) -- the read/write index paths in basix_parser.inc
+; treat that as the trivial 1-dimension case of the same general
+; multi-index code, not a separate path. dims[var*BASIX_MAX_ARRAY_DIMS
+; + k] is dimension k's size (row-major: the LAST dimension is the one
+; whose index moves fastest through memory, same convention as C).
+basix_var_arr_ndims: times BASIX_MAX_VARS dd 0
+basix_var_arr_dims:  times (BASIX_MAX_VARS * BASIX_MAX_ARRAY_DIMS) dd 0
+
+; DIM's own scratch while parsing "(d0, d1, ...)" -- the sizes are
+; known before the variable they belong to is (var creation happens
+; after the trailing "AS type" clause), so they're staged here and
+; copied into basix_var_arr_ndims/dims once the var index is known.
+basix_dim_scratch_ndims: dd 0
+basix_dim_scratch_dims:  times BASIX_MAX_ARRAY_DIMS dd 0
+
 basix_array_arena_pos: dd 0
 align 8
 basix_array_arena: times BASIX_ARRAY_ARENA_SIZE db 0

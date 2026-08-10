@@ -1460,40 +1460,86 @@ basix_parse_primary:
     ret
 
 ; -------------------------------------------------------------------------
-; .ident_array: arr[i] read, i a general runtime expression (not just a
-; literal). Emits a bounds check (index unsigned >= length, so a
-; negative index -- reinterpreted as a huge unsigned value -- fails
-; the same single compare a too-large index does) before computing
-; base+index*8 and loading; out of range silently yields 0/0.0 rather
-; than touching memory outside the array, matching basix_rt_pset's
-; silent-clip precedent (basix_runtime.inc) since this compiler has no
-; runtime error/panic mechanism to invent one for here.
+; .ident_array: arr[i] or arr[i,j,...] read, each index a general
+; runtime expression (not just a literal). N indices (N =
+; basix_var_arr_ndims for this variable) are parsed left to right and
+; combined via Horner's method into one linear offset --
+; acc = acc*dims[k] + index_k for each dimension k after the first --
+; entirely with EMITTED instructions (the compiled program's own
+; RAX/RCX/RDX and its own runtime stack, not this compiler's), since
+; only the per-dimension SIZES are known at compile time; the index
+; VALUES are only known once the compiled program actually runs.
+; ndims==1 (an ordinary 1D array) falls out of this as the trivial
+; case: the loop body runs once, the "combine with the previous
+; dimension" step never triggers, and the parsed index is used as-is.
+;
+; Only the FINAL combined offset is bounds-checked (against the
+; array's total element count) before computing base+offset*8 and
+; loading; an individual out-of-range index that still lands inside
+; the flattened array by coincidence isn't caught -- consistent with
+; every other silent-clip/best-effort check in this compiler (e.g.
+; basix_rt_pset's off-screen coordinates), and catching it properly
+; would need a bounds check (and a shared not-taken jump target) per
+; dimension instead of one at the end; not worth the complexity here.
 ; -------------------------------------------------------------------------
 .ident_array:
     push r13
+    push r14
+    push r15
 
     cmp dword [rel basix_tok_type], TOK_LBRACKET
     jne .index_bad_arr
     call basix_lex_next                   ; consume '['
+
+    mov r14d, [rel basix_var_arr_ndims + r10*4]   ; how many indices expected
+    xor r15d, r15d                                ; which index we're on (0-based)
+.arr_idx_loop:
     push r9                               ; preserve this array's own
-    push r10                              ; var_type/var_index across
-                                           ; the index expression -- it
+    push r10                              ; var_type/var_index (and our
+    push r14                              ; own ndims/position) across
+    push r15                              ; the index expression -- it
                                            ; may itself reference another
                                            ; variable, recursing back
                                            ; into .ident and clobbering
-                                           ; r9/r10 as THAT call's own
+                                           ; these as THAT call's own
                                            ; scratch (real bug, caught
                                            ; via "nums[i]" printing 0.0
                                            ; instead of nums[i]'s value)
     call basix_parse_arith                ; index expr; r11d = type
+    pop r15
+    pop r14
     pop r10
     pop r9
     test r11d, r11d
     jz .arr_idx_int
     call basix_emit_cvttsd2si_rax_x0
 .arr_idx_int:
+    test r15d, r15d
+    jz .arr_idx_first
+    ; combine: acc (pushed at the end of the previous iteration) with
+    ; this index, weighted by the size of THIS dimension.
+    call basix_emit_push_rax              ; push this index
+    call basix_emit_pop_rdx               ; rdx = this index
+    call basix_emit_pop_rax               ; rax = running acc
+    mov eax, r10d
+    imul eax, BASIX_MAX_ARRAY_DIMS
+    add eax, r15d
+    mov eax, [rel basix_var_arr_dims + rax*4]   ; this dimension's size
+    call basix_emit_mov_rcx_imm64
+    call basix_emit_imul_rax_rcx          ; rax = acc * dim_size
+    call basix_emit_add_rax_rdx           ; rax = acc*dim_size + index
+.arr_idx_first:
+    inc r15d
+    cmp r15d, r14d
+    jge .arr_idx_done
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_emit_push_rax              ; save running acc for the next index
+    jmp .arr_idx_loop
+.arr_idx_done:
     mov eax, TOK_RBRACKET
     call basix_expect
+    ; rax (emitted/runtime) = final combined linear offset
 
     mov eax, [rel basix_var_arr_len + r10*4]
     call basix_emit_mov_rcx_imm64
@@ -1544,6 +1590,8 @@ basix_parse_primary:
     mov rdx, rax
     call basix_patch_rel32
 
+    pop r15
+    pop r14
     pop r13
     cmp r9d, BASIX_VARTYPE_ARRAY_INT
     je .arr_read_result_int
@@ -1556,6 +1604,8 @@ basix_parse_primary:
     ret
 
 .index_bad_arr:
+    pop r15
+    pop r14
     pop r13
     mov dword [rel basix_compile_ok], 0
     mov r11d, 2
@@ -2061,14 +2111,56 @@ basix_parse_assignment:
     cmp dword [rel basix_tok_type], TOK_LBRACKET
     jne .assign_array_bad
     call basix_lex_next                  ; consume '['
+
+    push r14
+    push r15
+    mov r14d, [rel basix_var_arr_ndims + r13*4]   ; how many indices expected
+    xor r15d, r15d                                ; which index we're on (0-based)
+.aidx_loop:
+    push r12                             ; preserve array kind/var index
+    push r13                             ; (and our own ndims/position)
+    push r14                             ; across the index expression --
+    push r15                             ; it may itself reference another
+                                          ; array's element, recursing back
+                                          ; in here and clobbering these as
+                                          ; THAT call's own scratch (same
+                                          ; hazard the read path's .ident
+                                          ; recursion comment describes)
     call basix_parse_arith               ; index expr; r11d = type
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     test r11d, r11d
     jz .aidx_int
     call basix_emit_cvttsd2si_rax_x0
 .aidx_int:
+    test r15d, r15d
+    jz .aidx_first
+    call basix_emit_push_rax             ; push this index
+    call basix_emit_pop_rdx              ; rdx = this index
+    call basix_emit_pop_rax              ; rax = running acc
+    mov eax, r13d
+    imul eax, BASIX_MAX_ARRAY_DIMS
+    add eax, r15d
+    mov eax, [rel basix_var_arr_dims + rax*4]     ; this dimension's size
+    call basix_emit_mov_rcx_imm64
+    call basix_emit_imul_rax_rcx         ; rax = acc * dim_size
+    call basix_emit_add_rax_rdx          ; rax = acc*dim_size + index
+.aidx_first:
+    inc r15d
+    cmp r15d, r14d
+    jge .aidx_done
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_emit_push_rax             ; save running acc for the next index
+    jmp .aidx_loop
+.aidx_done:
+    pop r15
+    pop r14
     mov eax, TOK_RBRACKET
     call basix_expect
-    call basix_emit_push_rax             ; save index (emitted code)
+    call basix_emit_push_rax             ; save final combined offset (emitted code)
 
     mov eax, TOK_EQ
     call basix_expect
@@ -2473,19 +2565,39 @@ basix_parse_dim:
     push qword [rel basix_saved_ident_len]
     call basix_lex_next
 
-    ; Optional "(size)" -- an array declaration. r12d = element count,
-    ; 0 meaning "not an array" (the ordinary scalar/vector/matrix path,
-    ; unchanged from before arrays existed).
+    ; Optional "(d0[, d1[, d2[, d3]]])" -- an array declaration, one to
+    ; BASIX_MAX_ARRAY_DIMS comma-separated compile-time-constant
+    ; dimension sizes (row-major -- the last dimension is contiguous,
+    ; same convention as C). r12d = TOTAL element count (product of
+    ; every dimension), 0 meaning "not an array" (the ordinary
+    ; scalar/vector/matrix path, unchanged from before arrays existed).
+    ; The individual sizes are staged in basix_dim_scratch_dims/ndims
+    ; until the variable's own index is known, a few lines further
+    ; down past the "AS type" clause.
     xor r12d, r12d
+    mov dword [rel basix_dim_scratch_ndims], 0
     cmp dword [rel basix_tok_type], TOK_LPAREN
     jne .no_arrsize
     call basix_lex_next                  ; consume '('
+    mov r12, 1                           ; running product of dims seen so far
+.dimloop:
     cmp dword [rel basix_tok_type], TOK_INT
     jne .bail_after_push
-    mov r12, [rel basix_tok_ival]
-    cmp r12, 1
-    jl .bail_after_push                  ; zero/negative-sized array
+    mov rax, [rel basix_tok_ival]
+    cmp rax, 1
+    jl .bail_after_push                  ; zero/negative-sized dimension
+    mov ecx, [rel basix_dim_scratch_ndims]
+    cmp ecx, BASIX_MAX_ARRAY_DIMS
+    jge .bail_after_push
+    mov [rel basix_dim_scratch_dims + rcx*4], eax
+    inc dword [rel basix_dim_scratch_ndims]
+    imul r12, rax
     call basix_lex_next                  ; consume the size literal
+    cmp dword [rel basix_tok_type], TOK_COMMA
+    jne .dims_done
+    call basix_lex_next                  ; consume ','
+    jmp .dimloop
+.dims_done:
     mov eax, TOK_RPAREN
     call basix_expect
 .no_arrsize:
@@ -2572,6 +2684,25 @@ basix_parse_dim:
     mov [rax], rcx
     mov eax, r13d
     mov [rel basix_var_arr_len + rax*4], r12d
+
+    ; Copy this array's per-dimension sizes out of DIM's scratch and
+    ; into its own permanent slot (basix_var_arr_ndims/dims), indexed
+    ; by variable so the read/write index paths can look them up by
+    ; var index alone.
+    mov ecx, [rel basix_dim_scratch_ndims]
+    mov [rel basix_var_arr_ndims + r13*4], ecx
+    xor edx, edx
+.copy_dims_loop:
+    cmp edx, ecx
+    jge .copy_dims_done
+    mov r9d, [rel basix_dim_scratch_dims + rdx*4]
+    mov r10d, r13d
+    imul r10d, BASIX_MAX_ARRAY_DIMS
+    add r10d, edx
+    mov [rel basix_var_arr_dims + r10*4], r9d
+    inc edx
+    jmp .copy_dims_loop
+.copy_dims_done:
     jmp .out
 
 .arena_overflow:
