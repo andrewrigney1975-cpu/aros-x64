@@ -175,6 +175,8 @@ exfat_mount:
     mov [rel exfat_cluster_count], eax
     mov eax, [rsi+96]
     mov [rel exfat_root_dir_cluster], eax
+    mov [rel exfat_cwd_cluster], eax
+    mov dword [rel exfat_cwd_depth], 0
 
     movzx ecx, byte [rsi+108]           ; BytesPerSectorShift
     mov [rel exfat_sector_shift], cl
@@ -360,26 +362,43 @@ exfat_fat_set_entry:
     ret
 
 ; -------------------------------------------------------------------------
-; exfat_dir_list_start: resets the root-directory iterator used by
-; exfat_dir_list_next.
+; exfat_dir_list_start: resets the directory iterator used by
+; exfat_dir_list_next to the start of the current directory
+; (exfat_cwd_cluster).
 ; -------------------------------------------------------------------------
 exfat_dir_list_start:
+    push rcx
+    mov ecx, [rel exfat_cwd_cluster]
+    call exfat_dir_list_start_at
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_dir_list_start_at: resets the directory iterator used by
+; exfat_dir_list_next to the start of an explicit directory cluster.
+; ECX = starting cluster. Used by TREE to descend into subdirectories
+; without disturbing exfat_cwd_cluster.
+; -------------------------------------------------------------------------
+exfat_dir_list_start_at:
     push rax
-    mov eax, [rel exfat_root_dir_cluster]
+    mov eax, ecx
     mov [rel exfat_list_cluster], eax
     mov dword [rel exfat_list_offset], 0
     pop rax
     ret
 
 ; -------------------------------------------------------------------------
-; exfat_dir_list_next: iterates the root directory, one File entry at a
+; exfat_dir_list_next: iterates the current directory (as set by
+; exfat_dir_list_start / exfat_dir_list_start_at), one File entry at a
 ; time (skipping non-File entries such as the Allocation Bitmap/Up-case
 ; Table/Volume Label). RCX = output buffer for the ASCII name (caller-
 ; sized, NUL-terminated -- names can be up to 255 chars per spec, so a
-; 256-byte buffer is recommended), RDX = output pointer for a qword
-; DataLength. Call exfat_dir_list_start first. Returns EAX=1 with the
-; outputs filled in, or EAX=0 once the directory is exhausted (safe to
-; call again afterward -- keeps returning 0 without re-reading).
+; 256-byte buffer is recommended), RDX = output pointer for a 16-byte
+; struct: [0]=FirstCluster(dd), [4]=FileAttributes(dd, low byte only --
+; test bit ATTR_DIRECTORY), [8]=DataLength(dq). Call exfat_dir_list_start
+; (or _at) first. Returns EAX=1 with the outputs filled in, or EAX=0 once
+; the directory is exhausted (safe to call again afterward -- keeps
+; returning 0 without re-reading).
 ; -------------------------------------------------------------------------
 exfat_dir_list_next:
     push rbx
@@ -393,7 +412,7 @@ exfat_dir_list_next:
     push r11
 
     mov r10, rcx                        ; r10 = output name buffer
-    mov r11, rdx                        ; r11 = output DataLength ptr
+    mov r11, rdx                        ; r11 = output struct ptr
 
     cmp dword [rel exfat_list_cluster], 0xFFFFFFFF
     je .done
@@ -432,8 +451,12 @@ exfat_dir_list_next:
     jg .skip_entry
 
     movzx r9d, byte [rsi+rdx+32+3]      ; NameLength (Stream Ext, offset+3)
+    mov eax, [rsi+rdx+32+20]            ; FirstCluster (Stream Ext, offset+20)
+    mov [r11+0], eax
+    movzx eax, word [rsi+rdx+4]         ; FileAttributes (primary entry, +4)
+    mov [r11+4], eax
     mov rax, [rsi+rdx+32+24]            ; DataLength (Stream Ext, offset+24)
-    mov [r11], rax
+    mov [r11+8], rax
 
     lea rdi, [rsi+rdx+64]               ; first FileName entry
     xor ecx, ecx                        ; chars copied so far
@@ -880,8 +903,8 @@ exfat_checksum_entries:
 
 ; -------------------------------------------------------------------------
 ; exfat_dir_find_slot: ECX = number of consecutive 32-byte directory
-; entries needed. Finds (or makes, by extending the root directory's
-; cluster chain) a run of that many free entries. Returns EAX=1/0; on
+; entries needed. Finds (or makes, by extending the current directory's
+; (exfat_cwd_cluster) cluster chain) a run of that many free entries. Returns EAX=1/0; on
 ; success EBX = the cluster containing the run, EDX = byte offset of the
 ; run's start within exfat_dir_buf (which is left holding that cluster's
 ; current on-disk content, ready for the caller to patch in place and
@@ -897,7 +920,7 @@ exfat_dir_find_slot:
 
     mov r9d, ecx                        ; r9d = entries needed
 
-    mov ecx, [rel exfat_root_dir_cluster]
+    mov ecx, [rel exfat_cwd_cluster]
 .cluster_loop:
     mov r10d, ecx                       ; r10d = current cluster
     lea r8, [rel exfat_dir_buf]
@@ -1025,16 +1048,20 @@ exfat_dir_find_slot:
     ret
 
 EXFAT_MAX_NAME_LEN equ 64               ; matches shell_arg_buf's own cap
+ATTR_ARCHIVE       equ 0x20
+ATTR_DIRECTORY     equ 0x10
 
 ; -------------------------------------------------------------------------
 ; exfat_dir_write_entry_set: RCX = ptr to a NUL-terminated ASCII filename,
 ; <= EXFAT_MAX_NAME_LEN characters (ASCII only -- full Unicode is future
 ; work); EDX = FirstCluster; R8 = DataLength (qword, also used as
 ; ValidDataLength); R9B = Stream Extension GeneralSecondaryFlags (bit0
-; AllocationPossible, bit1 NoFatChain). Builds and writes a File/
+; AllocationPossible, bit1 NoFatChain); AL = FileAttributes (low byte --
+; ATTR_ARCHIVE or ATTR_DIRECTORY). Builds and writes a File/
 ; StreamExtension/FileName... entry set (one FileName entry per 15
-; characters of the name, per spec) in the root directory. Timestamps
-; are left zeroed (future work). Returns EAX=1/0.
+; characters of the name, per spec) in the current directory
+; (exfat_cwd_cluster). Timestamps are left zeroed (future work).
+; Returns EAX=1/0.
 ; -------------------------------------------------------------------------
 exfat_dir_write_entry_set:
     push rbx
@@ -1051,6 +1078,8 @@ exfat_dir_write_entry_set:
     push r13
     push r14
     push r15
+    movzx eax, al
+    push rax                            ; [rsp] = FileAttributes, until popped in .out
 
     mov r10, rcx                        ; r10 = name ptr
     mov r11d, edx                       ; r11d = FirstCluster
@@ -1105,7 +1134,9 @@ exfat_dir_write_entry_set:
     mov eax, r15d
     inc eax                             ; SecondaryCount: StreamExt + N FileName
     mov [rsi+1], al
-    mov word [rsi+4], 0x0020            ; FileAttributes: ARCHIVE
+    mov al, [rsp]                       ; FileAttributes (pushed at entry)
+    mov ah, 0
+    mov [rsi+4], ax                     ; FileAttributes
 
     mov byte [rsi+32], 0xC0             ; Stream Extension EntryType
     mov [rsi+33], r13b                  ; GeneralSecondaryFlags
@@ -1168,6 +1199,7 @@ exfat_dir_write_entry_set:
 .fail:
     xor eax, eax
 .out:
+    add rsp, 8                          ; discard the FileAttributes local
     pop r15
     pop r14
     pop r13
@@ -1197,11 +1229,91 @@ exfat_create_file:
     xor edx, edx                        ; FirstCluster = 0
     xor r8, r8                          ; DataLength = 0
     mov r9b, 0x01                       ; AllocationPossible=1, NoFatChain=0
+    mov al, ATTR_ARCHIVE
     call exfat_dir_write_entry_set
 
     pop r9
     pop r8
     pop rdx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_create_dir: RCX = ptr to a NUL-terminated ASCII name, <=
+; EXFAT_MAX_NAME_LEN characters. Creates a new, empty subdirectory of the
+; current directory (exfat_cwd_cluster): allocates and zero-fills one
+; cluster (an all-zero cluster is this codebase's existing "no entries"
+; convention, same end marker every scan already respects), terminates
+; its FAT chain entry, then writes a File entry set with
+; FileAttributes=ATTR_DIRECTORY pointing at it. Fails (and frees the
+; cluster back) if the name already exists. Returns EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_create_dir:
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+
+    push rcx
+    lea r8, [rel exfat_wf_scratch]
+    call exfat_find_root_file
+    pop rcx
+    test eax, eax
+    jnz .fail                           ; already exists
+
+    call exfat_alloc_cluster
+    test eax, eax
+    jz .fail
+    mov ebx, eax                        ; ebx = new directory's cluster
+
+    mov ecx, ebx
+    mov edx, 0xFFFFFFFF
+    call exfat_fat_set_entry            ; terminate its FAT chain
+    test eax, eax
+    jz .fail_free
+
+    lea rdi, [rel exfat_dir_buf]
+    mov eax, [rel exfat_sectors_per_cluster]
+    imul eax, [rel exfat_bytes_per_sector]
+    mov ecx, eax
+    xor eax, eax
+    cld
+    rep stosb
+
+    mov ecx, ebx
+    call exfat_cluster_to_lba
+    mov rcx, rax
+    mov edx, [rel exfat_sectors_per_cluster]
+    lea r8, [rel exfat_dir_buf]
+    call storage_write_sectors
+    test eax, eax
+    jz .fail_free
+
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx                             ; rcx = name ptr again
+
+    mov edx, ebx                        ; FirstCluster
+    mov eax, [rel exfat_sectors_per_cluster]
+    imul eax, [rel exfat_bytes_per_sector]
+    mov r8d, eax                        ; DataLength = one cluster, bytes
+    mov r9b, 0x01                       ; AllocationPossible=1, NoFatChain=0
+    mov al, ATTR_DIRECTORY
+    call exfat_dir_write_entry_set
+    jmp .out
+
+.fail_free:
+    mov ecx, ebx
+    call exfat_free_cluster
+.fail:
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    xor eax, eax
+.out:
+    pop rbx
     ret
 
 ; -------------------------------------------------------------------------
@@ -1325,6 +1437,7 @@ exfat_write_file:
     mov edx, r13d
     mov r8, rbp                         ; DataLength = original total length
     mov r9b, 0x01                       ; AllocationPossible=1, NoFatChain=0
+    mov al, ATTR_ARCHIVE
     call exfat_dir_write_entry_set
     test eax, eax
     jz .fail
@@ -1436,11 +1549,13 @@ exfat_name_matches:
 ;         [24]=EntryDirCluster(dd), [28]=EntryOffset(dd) -- the on-disk
 ;         location of the File entry itself, for callers that need to
 ;         edit or delete it in place (exfat_delete_file/exfat_rename_file/
-;         exfat_truncate_file/exfat_append_file). Needs a 32-byte buffer;
-;         older callers that only care about the first three fields can
-;         still pass a smaller one as long as nothing else follows it in
-;         memory, but every caller in this codebase uses the same shared,
-;         32-byte exfat_find_result buffer.
+;         exfat_truncate_file/exfat_append_file); [32]=FileAttributes(dd,
+;         low byte only -- test bit ATTR_DIRECTORY to tell a folder from
+;         a regular file). Needs a 36-byte buffer; older callers that
+;         only care about the first three fields can still pass a
+;         smaller one as long as nothing else follows it in memory, but
+;         every caller in this codebase uses the same shared, 36-byte
+;         exfat_find_result buffer.
 ; Returns EAX=1/0.
 ; -------------------------------------------------------------------------
 exfat_find_root_file:
@@ -1457,7 +1572,7 @@ exfat_find_root_file:
     mov r12, r8                         ; r12 = result output ptr
     mov r11, rcx                        ; r11 = target name ptr
 
-    mov ecx, [rel exfat_root_dir_cluster]
+    mov ecx, [rel exfat_cwd_cluster]
 .cluster_loop:
     mov r10d, ecx                       ; r10d = current cluster
     lea r8, [rel exfat_dir_buf]
@@ -1517,6 +1632,8 @@ exfat_find_root_file:
     mov [r12+16], eax
     mov [r12+24], r10d                  ; EntryDirCluster (for delete/rename)
     mov [r12+28], edi                   ; EntryOffset within that cluster
+    movzx eax, byte [rsi+rdi+4]         ; FileAttributes (primary entry, +4)
+    mov [r12+32], eax
     mov eax, 1
     jmp .out
 
@@ -1975,6 +2092,8 @@ exfat_delete_file:
     call exfat_find_root_file
     test eax, eax
     jz .fail
+    test byte [rel exfat_find_result+32], ATTR_DIRECTORY
+    jnz .fail                           ; DEL refuses to target a folder
 
     ; exfat_dir_buf still holds the cluster exfat_find_root_file just
     ; matched in (it stopped scanning right there), so mark it in place
@@ -1988,6 +2107,74 @@ exfat_delete_file:
     mov ecx, [rel exfat_find_result+0]   ; FirstCluster
     mov rdx, [rel exfat_find_result+8]   ; DataLength
     mov r9d, [rel exfat_find_result+16]  ; NoFatChain
+    call exfat_free_file_clusters
+    test eax, eax
+    jz .fail
+
+    mov eax, 1
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_delete_dir: RCX = ptr to a NUL-terminated ASCII directory name (a
+; direct child of the current directory, exfat_cwd_cluster). Fails if
+; the name doesn't exist, isn't a directory, or the directory is not
+; empty. Frees its data cluster(s) and marks its own directory entry
+; unused in the parent (does not touch exfat_cwd_cluster). Returns
+; EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_delete_dir:
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .fail
+    test byte [rel exfat_find_result+32], ATTR_DIRECTORY
+    jz .fail                            ; not a directory
+
+    ; Emptiness check: list the target directory's own contents. This
+    ; borrows the single-instance exfat_list_cluster/exfat_list_offset
+    ; iterator, which exfat_find_root_file above never touches, so it's
+    ; safe here before anything is committed.
+    mov ecx, [rel exfat_find_result+0]  ; target's FirstCluster
+    call exfat_dir_list_start_at
+    lea rcx, [rel exfat_rmdir_name_buf]
+    lea rdx, [rel exfat_wf_scratch]
+    call exfat_dir_list_next
+    test eax, eax
+    jnz .fail                           ; not empty
+
+    ; exfat_dir_buf no longer holds the parent's cluster (dir_list_next
+    ; just read the target directory's own cluster instead) -- re-read
+    ; the parent's cluster before marking the entry unused there.
+    mov ecx, [rel exfat_find_result+24] ; EntryDirCluster
+    lea r8, [rel exfat_dir_buf]
+    call exfat_read_cluster
+    test eax, eax
+    jz .fail
+
+    mov ebx, [rel exfat_find_result+24] ; EntryDirCluster
+    mov edx, [rel exfat_find_result+28] ; EntryOffset
+    call exfat_mark_entries_unused
+    test eax, eax
+    jz .fail
+
+    mov ecx, [rel exfat_find_result+0]  ; FirstCluster
+    mov rdx, [rel exfat_find_result+8]  ; DataLength
+    mov r9d, [rel exfat_find_result+16] ; NoFatChain
     call exfat_free_file_clusters
     test eax, eax
     jz .fail
@@ -2037,6 +2224,8 @@ exfat_rename_file:
     call exfat_find_root_file
     test eax, eax
     jz .fail                            ; old name doesn't exist
+    test byte [rel exfat_find_result+32], ATTR_DIRECTORY
+    jnz .fail                           ; RENAME refuses to target a folder
 
     mov ebx, [rel exfat_find_result+0]  ; ebx = FirstCluster (saved --
                                          ; exfat_mark_entries_unused
@@ -2063,10 +2252,14 @@ exfat_rename_file:
     pop r8                              ; DataLength (into r8 for the call below)
     pop rdx                             ; FirstCluster (into edx for the call below)
 
-    mov ecx, r9d                        ; GeneralSecondaryFlags: reuse
-                                         ; NoFatChain as bit1, AllocationPossible
-                                         ; (bit0) whenever there's any data
-    shl ecx, 1
+    mov ecx, r9d                        ; GeneralSecondaryFlags: r9d is
+                                         ; already bit1-shaped (0x00 or
+                                         ; 0x02, see exfat_find_root_file's
+                                         ; "and eax, 0x02" when it captured
+                                         ; this), NOT a plain boolean -- so
+                                         ; just OR in AllocationPossible
+                                         ; (bit0) whenever there's any data,
+                                         ; no shift.
     test rdx, rdx
     jz .no_alloc_bit
     or ecx, 0x01
@@ -2074,6 +2267,8 @@ exfat_rename_file:
     mov r9b, cl
 
     mov rcx, r11                        ; new name
+    mov al, ATTR_ARCHIVE                ; renaming a directory is rejected
+                                         ; before reaching this point
     call exfat_dir_write_entry_set
     test eax, eax
     jz .fail
@@ -2087,6 +2282,141 @@ exfat_rename_file:
     pop r10
     pop r9
     pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_move_file: RCX = ptr to a NUL-terminated ASCII filename, RDX =
+; ptr to a NUL-terminated ASCII name of a subdirectory of the current
+; directory (exfat_cwd_cluster) to move it into. Fails if the filename
+; doesn't exist in the current directory, is itself a directory, the
+; destination name doesn't exist or isn't a directory, or a file of the
+; same name already exists in the destination. The file's data
+; (FirstCluster/DataLength/NoFatChain) is carried over unchanged -- a
+; fresh entry set is written in the destination FIRST, and only once
+; that succeeds is the original entry set removed, so a failure before
+; that point leaves the source file untouched. (A failure removing the
+; original entry, after the destination write already succeeded, leaves
+; a duplicate rather than losing data -- same risk tolerance as the rest
+; of this codebase's multi-step directory-entry operations.) Returns
+; EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_move_file:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r10, rcx                        ; r10 = filename
+    mov r11, rdx                        ; r11 = destination folder name
+    mov r12d, [rel exfat_cwd_cluster]   ; r12d = original cwd cluster
+
+    mov rcx, r11
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .fail                            ; destination doesn't exist
+    test byte [rel exfat_find_result+32], ATTR_DIRECTORY
+    jz .fail                            ; destination isn't a directory
+    mov r13d, [rel exfat_find_result+0] ; r13d = destination's FirstCluster
+
+    mov rcx, r10
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .fail                            ; source doesn't exist
+    test byte [rel exfat_find_result+32], ATTR_DIRECTORY
+    jnz .fail                           ; MOVE refuses to target a folder
+
+    mov r14d, [rel exfat_find_result+0] ; r14d = source's FirstCluster
+    mov r15, [rel exfat_find_result+8]  ; r15 = source's DataLength
+    mov ebx, [rel exfat_find_result+16] ; ebx = source's NoFatChain
+    mov r8d, [rel exfat_find_result+24] ; source's EntryDirCluster
+    mov r9d, [rel exfat_find_result+28] ; source's EntryOffset
+    push r8
+    push r9
+
+    ; Switch into the destination directory to check for a name
+    ; collision and, if clear, write the moved entry there.
+    mov [rel exfat_cwd_cluster], r13d
+
+    mov rcx, r10
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .collision                      ; name already exists in destination
+
+    mov ecx, ebx                        ; GeneralSecondaryFlags: ebx is
+                                         ; already bit1-shaped (0x00 or
+                                         ; 0x02, see exfat_find_root_file's
+                                         ; "and eax, 0x02" when it captured
+                                         ; this), NOT a plain boolean -- so
+                                         ; just OR in AllocationPossible
+                                         ; (bit0) whenever there's any data,
+                                         ; no shift.
+    test r14d, r14d
+    jz .no_alloc_bit
+    or ecx, 0x01
+.no_alloc_bit:
+    mov r9b, cl
+
+    mov rcx, r10                        ; filename
+    mov edx, r14d                       ; FirstCluster
+    mov r8, r15                         ; DataLength
+    mov al, ATTR_ARCHIVE
+    call exfat_dir_write_entry_set
+    test eax, eax
+    jz .restore_fail
+
+    ; Written successfully -- restore CWD, then remove the original entry.
+    mov [rel exfat_cwd_cluster], r12d
+
+    pop r9                               ; EntryOffset
+    pop r8                               ; EntryDirCluster
+    mov ecx, r8d
+    lea r8, [rel exfat_dir_buf]
+    call exfat_read_cluster
+    test eax, eax
+    jz .fail
+
+    mov ebx, ecx                        ; ebx = EntryDirCluster
+    mov edx, r9d                        ; edx = EntryOffset
+    call exfat_mark_entries_unused
+    test eax, eax
+    jz .fail
+
+    mov eax, 1
+    jmp .out
+
+.collision:
+.restore_fail:
+    mov [rel exfat_cwd_cluster], r12d
+    pop r9
+    pop r8
+.fail:
+    xor eax, eax
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
     pop rsi
     pop rdx
     pop rcx
@@ -2118,6 +2448,8 @@ exfat_truncate_file:
     call exfat_find_root_file
     test eax, eax
     jz .fail
+    test byte [rel exfat_find_result+32], ATTR_DIRECTORY
+    jnz .fail                           ; TRUNCATE refuses to target a folder
 
     mov r10, [rel exfat_find_result+8]  ; r10 = current DataLength
     cmp r11, r10
@@ -2289,6 +2621,8 @@ exfat_append_file:
     call exfat_find_root_file
     test eax, eax
     jz .fail                            ; appending to a nonexistent file
+    test byte [rel exfat_find_result+32], ATTR_DIRECTORY
+    jnz .fail                           ; APPEND refuses to target a folder
 
     mov ebx, [rel exfat_find_result+0]  ; ebx = FirstCluster
     mov r15, [rel exfat_find_result+8]  ; r15 = old DataLength
@@ -2558,6 +2892,25 @@ exfat_fat_length:          dd 0
 exfat_cluster_heap_offset: dd 0
 exfat_cluster_count:       dd 0
 exfat_root_dir_cluster:    dd 0
+
+; Current-directory state. exFAT has no on-disk "." / ".." entries, so
+; OPEN/UP are backed entirely by this in-memory breadcrumb stack rather
+; than anything read from the volume. exfat_cwd_cluster is what every
+; directory-scanning primitive (exfat_dir_list_start, exfat_dir_find_slot,
+; exfat_find_root_file) actually reads; it starts out equal to
+; exfat_root_dir_cluster at mount and is the only thing OPEN/UP touch.
+EXFAT_CWD_MAX_DEPTH equ 16
+EXFAT_CWD_NAME_LEN  equ 64               ; matches EXFAT_MAX_NAME_LEN/shell_arg_buf
+exfat_cwd_cluster:         dd 0
+exfat_cwd_stack:           times EXFAT_CWD_MAX_DEPTH dd 0
+exfat_cwd_depth:           dd 0
+; exfat_cwd_name_stack[i] = the name OPEN was given to descend to depth
+; i+1 (i.e. the name of the directory currently at depth i+1), used only
+; to render the shell prompt's breadcrumb path -- not consulted by any
+; exFAT traversal logic.
+align 8
+exfat_cwd_name_stack:      times (EXFAT_CWD_MAX_DEPTH * EXFAT_CWD_NAME_LEN) db 0
+
 exfat_bytes_per_sector:    dd 0
 exfat_sector_shift:        db 0
 exfat_sector_mask:         dd 0
@@ -2594,4 +2947,7 @@ exfat_bitmap_buf: times 4096 db 0
 exfat_write_buf:  times 4096 db 0
 
 align 8
-exfat_wf_scratch: times 24 db 0
+exfat_wf_scratch: times 36 db 0
+
+align 8
+exfat_rmdir_name_buf: times 256 db 0

@@ -2158,10 +2158,25 @@ shell_streq:
 
 ; -------------------------------------------------------------------------
 ; shell_cursor_to: repositions the console's logical cursor (console_col/
-; console_row) to a given index within the line being edited, WITHOUT
-; drawing anything -- used after Left/Right/Home/End and after a redraw
-; already left the video cursor somewhere else. R8D=target index (0..line
-; length), R9D=the line's starting column, R10D=the line's starting row.
+; console_row) to a given index within the line being edited, and draws
+; the cursor indicator (a solid underscore glyph) there. R8D=target
+; index (0..line length), R9D=the line's starting column, R10D=the
+; line's starting row, R11D=the line's current length (shell_line_buf[0
+; .. R11D-1]).
+;
+; Before moving, repaints the WHOLE line from its start via
+; shell_redraw_range -- this is what erases the cursor glyph left behind
+; by wherever it was last drawn, without this function (or any of its
+; many call sites) needing to separately track/restore that position:
+; the cursor is always within [0, length] of the very same line
+; (inclusive -- it can sit one past the last real character, in the
+; empty cell right after it), so the redraw covers [0, length) PLUS one
+; trailing blank space to reach that cell too, and always correctly
+; restores whatever cell the previous cursor draw was overlaying.
+; Callers that already did their own partial redraw before calling this
+; (insert/delete) end up doing some redundant redraw work, which is
+; cheap and harmless at SHELL_LINE_MAX (120).
+;
 ; Does not account for the line wrapping past the bottom of the screen
 ; and triggering a scroll mid-edit -- acceptable for SHELL_LINE_MAX (120)
 ; against any reasonable console width/height, not a general terminal.
@@ -2170,15 +2185,48 @@ shell_cursor_to:
     push rax
     push rcx
     push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+
+    mov r12d, r8d                       ; r12d = target index (survives
+                                         ; the shell_redraw_range call
+                                         ; below, which reuses r8/r9/r10)
+
+    mov [rel console_col], r9d
+    mov [rel console_row], r10d
+
+    push r9                              ; save start_col/start_row across
+    push r10                             ; shell_redraw_range's own r9/r10 use
+    xor r8d, r8d
+    mov r9d, r11d
+    mov r10d, 1                          ; +1 trailing blank: the cursor
+                                         ; can sit one past the last real
+                                         ; character (the empty tail cell)
+    call shell_redraw_range
+    pop r10
+    pop r9
 
     mov eax, r9d
-    add eax, r8d                        ; eax = start_col + index
+    add eax, r12d                       ; eax = start_col + index
     xor edx, edx
     div dword [rel console_cols]        ; eax = row delta, edx = column
     add eax, r10d
     mov [rel console_row], eax
     mov [rel console_col], edx
 
+    mov ecx, edx
+    mov edx, eax
+    mov r8b, '_'
+    call fb_draw_char
+
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
     pop rdx
     pop rcx
     pop rax
@@ -2260,6 +2308,7 @@ shell_line_insert:
     mov r8d, r12d
     mov r9d, r13d
     mov r10d, r14d
+    mov r11d, ecx
     call shell_cursor_to
 
     pop r10
@@ -2310,6 +2359,7 @@ shell_line_delete_before:
     mov r8d, r12d
     mov r9d, r13d
     mov r10d, r14d
+    mov r11d, ecx
     call shell_cursor_to
 
     mov r8d, r12d
@@ -2320,6 +2370,7 @@ shell_line_delete_before:
     mov r8d, r12d
     mov r9d, r13d
     mov r10d, r14d
+    mov r11d, ecx
     call shell_cursor_to
 
     pop r10
@@ -2368,6 +2419,7 @@ shell_line_delete_at:
     mov r8d, r12d
     mov r9d, r13d
     mov r10d, r14d
+    mov r11d, ecx
     call shell_cursor_to
 
     mov r8d, r12d
@@ -2378,6 +2430,7 @@ shell_line_delete_at:
     mov r8d, r12d
     mov r9d, r13d
     mov r10d, r14d
+    mov r11d, ecx
     call shell_cursor_to
 
     pop r10
@@ -2481,6 +2534,9 @@ shell_history_recall:
     mov r10d, r14d
     push r8
     mov r8d, 0
+    mov r11d, ecx                       ; r11d = 0 (new length); the
+                                         ; history-count value r11d held
+                                         ; is no longer needed past here
     call shell_cursor_to
     pop r8
 
@@ -2537,6 +2593,7 @@ shell_history_recall:
     mov r8d, r12d
     mov r9d, r13d
     mov r10d, r14d
+    mov r11d, ecx
     call shell_cursor_to
 
 .out:
@@ -2574,6 +2631,12 @@ shell_read_line:
     mov r13d, [rel console_col]         ; r13d = this line's starting column
     mov r14d, [rel console_row]         ; r14d = this line's starting row
     lea rdi, [rel shell_line_buf]
+
+    mov r8d, r12d                       ; draw the cursor indicator at the
+    mov r9d, r13d                       ; empty prompt, before any keystroke
+    mov r10d, r14d
+    mov r11d, ecx
+    call shell_cursor_to
 .loop:
     call kbd_read_char
     cmp al, 13
@@ -2615,6 +2678,7 @@ shell_read_line:
     mov r8d, r12d
     mov r9d, r13d
     mov r10d, r14d
+    mov r11d, ecx
     call shell_cursor_to
     jmp .loop
 .move_right:
@@ -2624,6 +2688,7 @@ shell_read_line:
     mov r8d, r12d
     mov r9d, r13d
     mov r10d, r14d
+    mov r11d, ecx
     call shell_cursor_to
     jmp .loop
 .move_home:
@@ -2631,6 +2696,7 @@ shell_read_line:
     mov r8d, r12d
     mov r9d, r13d
     mov r10d, r14d
+    mov r11d, ecx
     call shell_cursor_to
     jmp .loop
 .move_end:
@@ -2638,6 +2704,7 @@ shell_read_line:
     mov r8d, r12d
     mov r9d, r13d
     mov r10d, r14d
+    mov r11d, ecx
     call shell_cursor_to
     jmp .loop
 .hist_up:
@@ -2653,6 +2720,7 @@ shell_read_line:
     mov r8d, ecx
     mov r9d, r13d
     mov r10d, r14d
+    mov r11d, ecx
     call shell_cursor_to
     mov al, 13
     call console_putc
@@ -2786,6 +2854,42 @@ shell_dispatch:
     test eax, eax
     jnz .do_truncate
 
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_mkdir]
+    call shell_streq
+    test eax, eax
+    jnz .do_mkdir
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_open]
+    call shell_streq
+    test eax, eax
+    jnz .do_open
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_up]
+    call shell_streq
+    test eax, eax
+    jnz .do_up
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_tree]
+    call shell_streq
+    test eax, eax
+    jnz .do_tree
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_move]
+    call shell_streq
+    test eax, eax
+    jnz .do_move
+
+    lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_rmdir]
+    call shell_streq
+    test eax, eax
+    jnz .do_rmdir
+
     lea rcx, [rel msg_shell_unknown]
     call console_puts
     jmp .out
@@ -2803,13 +2907,24 @@ shell_dispatch:
     call exfat_dir_list_start
 .dir_loop:
     lea rcx, [rel shell_dir_name_buf]
-    lea rdx, [rel shell_dir_datalen]
+    lea rdx, [rel shell_dir_entry]
     call exfat_dir_list_next
     test eax, eax
     jz .out
+    test byte [rel shell_dir_entry+4], ATTR_DIRECTORY
+    jz .dir_file_size
+    lea rcx, [rel msg_shell_dir_tag]
+    call console_puts
+    jmp .dir_name
+.dir_file_size:
+    mov rcx, [rel shell_dir_entry+8]
+    call basix_rt_print_int
+    lea rcx, [rel msg_shell_dir_sep]
+    call console_puts
+.dir_name:
     lea rcx, [rel shell_dir_name_buf]
     call console_puts
-    lea rcx, [rel msg_shell_nl]
+    lea rcx, [rel msg_shell_lf]
     call console_puts
     jmp .dir_loop
 
@@ -2838,6 +2953,8 @@ shell_dispatch:
     call exfat_find_root_file
     test eax, eax
     jz .type_notfound
+    test byte [rel exfat_find_result+32], ATTR_DIRECTORY
+    jnz .type_isdir
 
     mov rax, [rel exfat_find_result+8]
     cmp rax, SHELL_TYPE_BUF_MAX
@@ -2865,6 +2982,10 @@ shell_dispatch:
     jmp .out
 .type_notfound:
     lea rcx, [rel msg_shell_notfound]
+    call console_puts
+    jmp .out
+.type_isdir:
+    lea rcx, [rel msg_shell_isdir]
     call console_puts
     jmp .out
 .type_toobig:
@@ -3200,6 +3321,236 @@ shell_dispatch:
     call console_puts
     jmp .out
 
+.do_mkdir:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.mkdir_copy:
+    mov al, [rsi]
+    test al, al
+    jz .mkdir_arg_done
+    cmp al, ' '
+    je .mkdir_arg_done
+    cmp ecx, 63
+    jge .mkdir_arg_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .mkdir_copy
+.mkdir_arg_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .mkdir_usage
+
+    lea rcx, [rel shell_arg_buf]
+    call exfat_create_dir
+    test eax, eax
+    jz .mkdir_fail
+
+    lea rcx, [rel msg_shell_mkdir_ok]
+    call console_puts
+    jmp .out
+.mkdir_usage:
+    lea rcx, [rel msg_shell_mkdir_usage]
+    call console_puts
+    jmp .out
+.mkdir_fail:
+    lea rcx, [rel msg_shell_mkdir_fail]
+    call console_puts
+    jmp .out
+
+.do_open:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.open_copy:
+    mov al, [rsi]
+    test al, al
+    jz .open_arg_done
+    cmp al, ' '
+    je .open_arg_done
+    cmp ecx, 63
+    jge .open_arg_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .open_copy
+.open_arg_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .open_usage
+
+    lea rcx, [rel shell_arg_buf]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .open_notfound
+    test byte [rel exfat_find_result+32], ATTR_DIRECTORY
+    jz .open_notadir
+
+    mov eax, [rel exfat_cwd_depth]
+    cmp eax, EXFAT_CWD_MAX_DEPTH
+    jge .open_toodeep
+
+    mov ecx, [rel exfat_cwd_cluster]
+    lea rdx, [rel exfat_cwd_stack]
+    mov [rdx+rax*4], ecx
+
+    push rsi
+    push rdi
+    mov ecx, eax
+    imul ecx, EXFAT_CWD_NAME_LEN
+    lea rdi, [rel exfat_cwd_name_stack]
+    add rdi, rcx
+    lea rsi, [rel shell_arg_buf]
+    mov ecx, EXFAT_CWD_NAME_LEN
+    cld
+    rep movsb                           ; record the name for the prompt breadcrumb
+    pop rdi
+    pop rsi
+
+    inc eax
+    mov [rel exfat_cwd_depth], eax
+
+    mov eax, [rel exfat_find_result+0]  ; target's FirstCluster
+    mov [rel exfat_cwd_cluster], eax
+    jmp .out
+.open_usage:
+    lea rcx, [rel msg_shell_open_usage]
+    call console_puts
+    jmp .out
+.open_notfound:
+    lea rcx, [rel msg_shell_open_notfound]
+    call console_puts
+    jmp .out
+.open_notadir:
+    lea rcx, [rel msg_shell_open_notadir]
+    call console_puts
+    jmp .out
+.open_toodeep:
+    lea rcx, [rel msg_shell_open_toodeep]
+    call console_puts
+    jmp .out
+
+.do_up:
+    mov eax, [rel exfat_cwd_depth]
+    test eax, eax
+    jz .up_atroot
+    dec eax
+    mov [rel exfat_cwd_depth], eax
+    lea rdx, [rel exfat_cwd_stack]
+    mov ecx, [rdx+rax*4]
+    mov [rel exfat_cwd_cluster], ecx
+    jmp .out
+.up_atroot:
+    lea rcx, [rel msg_shell_up_atroot]
+    call console_puts
+    jmp .out
+
+.do_tree:
+    mov ecx, [rel exfat_cwd_cluster]
+    xor edx, edx
+    call shell_tree_walk
+    jmp .out
+
+.do_move:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.move_copy1:
+    mov al, [rsi]
+    test al, al
+    jz .move_arg1_done
+    cmp al, ' '
+    je .move_arg1_done
+    cmp ecx, 63
+    jge .move_arg1_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .move_copy1
+.move_arg1_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .move_usage
+
+.move_skip_sp:
+    cmp byte [rsi], ' '
+    jne .move_copy2_start
+    inc rsi
+    jmp .move_skip_sp
+.move_copy2_start:
+    lea rdi, [rel shell_arg_buf2]
+    xor ecx, ecx
+.move_copy2:
+    mov al, [rsi]
+    test al, al
+    jz .move_arg2_done
+    cmp al, ' '
+    je .move_arg2_done
+    cmp ecx, 63
+    jge .move_arg2_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .move_copy2
+.move_arg2_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .move_usage
+
+    lea rcx, [rel shell_arg_buf]
+    lea rdx, [rel shell_arg_buf2]
+    call exfat_move_file
+    test eax, eax
+    jz .move_fail
+
+    lea rcx, [rel msg_shell_move_ok]
+    call console_puts
+    jmp .out
+.move_usage:
+    lea rcx, [rel msg_shell_move_usage]
+    call console_puts
+    jmp .out
+.move_fail:
+    lea rcx, [rel msg_shell_move_fail]
+    call console_puts
+    jmp .out
+
+.do_rmdir:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.rmdir_copy:
+    mov al, [rsi]
+    test al, al
+    jz .rmdir_arg_done
+    cmp al, ' '
+    je .rmdir_arg_done
+    cmp ecx, 63
+    jge .rmdir_arg_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .rmdir_copy
+.rmdir_arg_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .rmdir_usage
+
+    lea rcx, [rel shell_arg_buf]
+    call exfat_delete_dir
+    test eax, eax
+    jz .rmdir_fail
+
+    lea rcx, [rel msg_shell_rmdir_ok]
+    call console_puts
+    jmp .out
+.rmdir_usage:
+    lea rcx, [rel msg_shell_rmdir_usage]
+    call console_puts
+    jmp .out
+.rmdir_fail:
+    lea rcx, [rel msg_shell_rmdir_fail]
+    call console_puts
+    jmp .out
+
 .out:
     pop r11
     pop r10
@@ -3210,6 +3561,133 @@ shell_dispatch:
     pop rdx
     pop rcx
     pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; shell_tree_walk: ECX = directory cluster to list, EDX = indentation
+; depth (0 at the top). Recursively prints the directory tree rooted at
+; ECX, one "<DIR> name" or plain "name" per line indented two spaces per
+; depth level. Recursion is capped at EXFAT_CWD_MAX_DEPTH to guard
+; against a corrupt/cyclic cluster chain.
+;
+; exfat_list_cluster/exfat_list_offset are single-instance global
+; iterator state (see exfat_dir_list_next), not reentrant -- before
+; descending into a subdirectory this saves them (in r14d/r15d, which
+; this function's own prologue/epilogue preserve per call frame, so each
+; recursion level keeps its own copy) and restores them after returning,
+; so the parent directory's enumeration resumes correctly.
+;
+; NOTE: never stash cross-call scratch in rbx here -- it is a global
+; invariant elsewhere in this kernel (holds boot_info*, read by
+; fb_draw_char via console_putc) and is not preserved across the
+; console_puts calls this function makes.
+; -------------------------------------------------------------------------
+shell_tree_walk:
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+
+    cmp edx, EXFAT_CWD_MAX_DEPTH
+    jge .out
+    mov r12d, edx                       ; r12d = this call's depth
+
+    call exfat_dir_list_start_at
+.walk_loop:
+    lea rcx, [rel shell_dir_name_buf]
+    lea rdx, [rel shell_dir_entry]
+    call exfat_dir_list_next
+    test eax, eax
+    jz .out
+
+    mov r13d, r12d
+.indent_loop:
+    test r13d, r13d
+    jz .indent_done
+    lea rcx, [rel msg_shell_dir_sep]
+    call console_puts
+    dec r13d
+    jmp .indent_loop
+.indent_done:
+
+    test byte [rel shell_dir_entry+4], ATTR_DIRECTORY
+    jz .walk_name
+    lea rcx, [rel msg_shell_dir_tag]
+    call console_puts
+.walk_name:
+    lea rcx, [rel shell_dir_name_buf]
+    call console_puts
+    lea rcx, [rel msg_shell_lf]
+    call console_puts
+
+    test byte [rel shell_dir_entry+4], ATTR_DIRECTORY
+    jz .walk_loop
+
+    mov eax, [rel shell_dir_entry+0]    ; child's FirstCluster
+    test eax, eax
+    jz .walk_loop                       ; defensive: nothing to descend into
+
+    mov r14d, [rel exfat_list_cluster]
+    mov r15d, [rel exfat_list_offset]
+
+    mov ecx, eax
+    mov edx, r12d
+    inc edx
+    call shell_tree_walk
+
+    mov [rel exfat_list_cluster], r14d
+    mov [rel exfat_list_offset], r15d
+    jmp .walk_loop
+
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; shell_print_cwd_path: prints the current-directory breadcrumb ahead of
+; the prompt, e.g. "ROOT > GRAPHICS > WIREFRAME" -- built purely from
+; exfat_cwd_name_stack/exfat_cwd_depth (see exfat.inc), never touching
+; the disk.
+; -------------------------------------------------------------------------
+shell_print_cwd_path:
+    push rax
+    push rcx
+    push rdx
+
+    lea rcx, [rel msg_shell_root_label]
+    call console_puts
+
+    xor edx, edx
+.loop:
+    cmp edx, [rel exfat_cwd_depth]
+    jge .done
+
+    lea rcx, [rel msg_shell_path_sep]
+    call console_puts
+
+    mov eax, edx
+    imul eax, EXFAT_CWD_NAME_LEN
+    lea rcx, [rel exfat_cwd_name_stack]
+    add rcx, rax
+    call console_puts
+
+    inc edx
+    jmp .loop
+.done:
+    pop rdx
+    pop rcx
+    pop rax
     ret
 
 ; -------------------------------------------------------------------------
@@ -3224,6 +3702,7 @@ shell_main:
 .prompt:
     call sched_reap_zombies              ; free any tasks that ended since last prompt
 
+    call shell_print_cwd_path
     lea rcx, [rel msg_shell_prompt]
     call console_puts
 
@@ -3408,7 +3887,7 @@ exfat_test_name:      db 'TEST.TXT', 0
 exfat_marker:         db 'END-OF-FILE-MARKER'
 
 align 8
-exfat_find_result: times 32 db 0
+exfat_find_result: times 36 db 0
 
 align 4096
 exfat_test_buf: times 65536 db 0
@@ -3437,13 +3916,25 @@ shell_str_del:      db 'del', 0
 shell_str_rename:   db 'rename', 0
 shell_str_append:   db 'append', 0
 shell_str_truncate: db 'truncate', 0
+shell_str_mkdir:    db 'mkdir', 0
+shell_str_open:      db 'open', 0
+shell_str_up:        db 'up', 0
+shell_str_tree:      db 'tree', 0
+shell_str_move:       db 'move', 0
+shell_str_rmdir:      db 'rmdir', 0
 
 msg_shell_banner:      db 'arOS-X64 shell. Type HELP for commands.', 13, 10, 0
-msg_shell_prompt:      db '] ', 0
-msg_shell_help:        db 'Commands: HELP  DIR  TYPE <file>  WRITE <file> <text>  APPEND <file> <text>', 13, 10
-                       db '  DEL <file>  RENAME <old> <new>  TRUNCATE <file> <size>  RUN <file.bas>  CLEAR', 13, 10, 0
+msg_shell_prompt:      db ' > : ', 0
+msg_shell_help:        db 'Commands: HELP  DIR  TREE  TYPE <file>  WRITE <file> <text>  APPEND <file> <text>', 13, 10
+                       db '  DEL <file>  RENAME <old> <new>  TRUNCATE <file> <size>  RUN <file.bas>  CLEAR', 13, 10
+                       db '  MKDIR <name>  RMDIR <name>  OPEN <name>  UP  MOVE <file> <folder>', 13, 10, 0
 msg_shell_unknown:     db 'Unknown command. Type HELP for a list.', 13, 10, 0
 msg_shell_nl:          db 13, 10, 0
+msg_shell_lf:          db 10, 0        ; single newline -- console_putc treats
+                                        ; CR and LF as independent full
+                                        ; newlines, so msg_shell_nl's CR+LF
+                                        ; advances two lines; DIR/TREE want
+                                        ; exactly one line per entry
 msg_shell_type_usage:  db 'Usage: TYPE <filename>', 13, 10, 0
 msg_shell_notfound:    db 'File not found.', 13, 10, 0
 msg_shell_toobig:      db 'File too large to display.', 13, 10, 0
@@ -3465,6 +3956,25 @@ msg_shell_append_fail:  db 'Append failed (file may not exist).', 13, 10, 0
 msg_shell_truncate_usage: db 'Usage: TRUNCATE <filename> <newsize>', 13, 10, 0
 msg_shell_truncate_ok:    db 'File truncated.', 13, 10, 0
 msg_shell_truncate_fail:  db 'Truncate failed (file may not exist, or newsize > current size).', 13, 10, 0
+msg_shell_dir_tag:        db '<DIR>  ', 0
+msg_shell_dir_sep:        db '  ', 0
+msg_shell_isdir:          db 'Cannot TYPE a directory.', 13, 10, 0
+msg_shell_mkdir_usage:    db 'Usage: MKDIR <name>', 13, 10, 0
+msg_shell_mkdir_ok:       db 'Directory created.', 13, 10, 0
+msg_shell_mkdir_fail:     db 'MKDIR failed (name may already exist).', 13, 10, 0
+msg_shell_open_usage:     db 'Usage: OPEN <name>', 13, 10, 0
+msg_shell_open_notfound:  db 'Directory not found.', 13, 10, 0
+msg_shell_open_notadir:   db 'Not a directory.', 13, 10, 0
+msg_shell_open_toodeep:   db 'Too many nested directories.', 13, 10, 0
+msg_shell_up_atroot:      db 'Already at the root directory.', 13, 10, 0
+msg_shell_move_usage:     db 'Usage: MOVE <filename> <destination folder>', 13, 10, 0
+msg_shell_move_ok:        db 'File moved.', 13, 10, 0
+msg_shell_move_fail:      db 'Move failed (file/folder missing, folder is not a directory, or name already exists there).', 13, 10, 0
+msg_shell_rmdir_usage:    db 'Usage: RMDIR <name>', 13, 10, 0
+msg_shell_rmdir_ok:       db 'Directory deleted.', 13, 10, 0
+msg_shell_rmdir_fail:     db 'RMDIR failed (not found, not a directory, or not empty).', 13, 10, 0
+msg_shell_root_label:     db 'ROOT', 0
+msg_shell_path_sep:       db ' > ', 0
 
 shell_line_buf:     times SHELL_LINE_MAX db 0
 shell_history:      times (SHELL_HISTORY_MAX * SHELL_LINE_MAX) db 0
@@ -3474,7 +3984,8 @@ shell_cmd_buf:      times 16 db 0
 shell_arg_buf:       times 64 db 0
 shell_arg_buf2:      times 64 db 0
 shell_dir_name_buf: times 256 db 0
-shell_dir_datalen:  dq 0
+align 8
+shell_dir_entry:    times 16 db 0    ; FirstCluster(dd), FileAttributes(dd), DataLength(dq)
 
 basixtest_src: db 'LET x = 5', 10, 'PRINT x * 3 + 2', 10, 'GOSUB sub1', 10, 'END', 10, 'sub1:', 10, 'PRINT 1', 10, 'RETURN', 10, 0
 msg_basixtest_ran:      db 'basixtest: compiled and ran OK', 13, 10, 0
