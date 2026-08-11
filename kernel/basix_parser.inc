@@ -1197,6 +1197,35 @@ basix_parse_pset:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_parse_putchar: "PUTCHAR expr" -- prints one raw character (not
+; its decimal digits) via basix_rt_print_char, for rendering a text
+; buffer's stored char codes.
+; -------------------------------------------------------------------------
+basix_parse_putchar:
+    call basix_parse_int_arg_push        ; char code
+    call basix_emit_pop_rcx
+    lea rcx, [rel basix_rt_print_char]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_locate: "LOCATE row, col" -- positions the text console
+; cursor (console_row/console_col), so a program can redraw a specific
+; screen line instead of only ever continuing linearly like PRINT.
+; -------------------------------------------------------------------------
+basix_parse_locate:
+    call basix_parse_int_arg_push        ; row
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; col
+
+    call basix_emit_pop_rdx              ; col
+    call basix_emit_pop_rcx              ; row
+    lea rcx, [rel basix_rt_locate]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_parse_float_arg_store: RAX = a fixed (compile-time-constant)
 ; scratch address. Parses one arithmetic expression, coercing an int
 ; result to float, then emits code storing that float (XMM0) to the
@@ -1383,6 +1412,16 @@ basix_parse_primary:
     je .do_screenw
     cmp eax, TOK_SCREENH
     je .do_screenh
+    cmp eax, TOK_GETKEY
+    je .do_getkey
+    cmp eax, TOK_FSAVE
+    je .do_fsave
+    cmp eax, TOK_FLOAD
+    je .do_fload
+    cmp eax, TOK_TEXTCOLS
+    je .do_textcols
+    cmp eax, TOK_TEXTROWS
+    je .do_textrows
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
@@ -1449,6 +1488,88 @@ basix_parse_primary:
 .do_screenh:
     call basix_lex_next                  ; bare keyword, no parens/args
     lea rcx, [rel basix_rt_screenh]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+.do_getkey:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_getkey]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+.do_textcols:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_textcols]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+.do_textrows:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_textrows]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+; -------------------------------------------------------------------------
+; FSAVE(namearr, namelen, dataarr, datalen) / FLOAD(namearr, namelen,
+; dataarr, maxlen) -- four plain int-valued arguments each. A bare array
+; name used as an argument (not indexed) now evaluates to its compile-
+; time-known base address as an int (see .ident_array's no-'['  path
+; above), so basix_parse_int_arg_push handles namearr/dataarr exactly
+; like any other int expression -- no special array-argument parsing
+; needed beyond that.
+; -------------------------------------------------------------------------
+.do_fsave:
+    call basix_lex_next
+    mov eax, TOK_LPAREN
+    call basix_expect
+    call basix_parse_int_arg_push        ; namearr (base ptr)
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; namelen
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; dataarr (base ptr)
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; datalen
+    mov eax, TOK_RPAREN
+    call basix_expect
+
+    call basix_emit_pop_r9               ; datalen
+    call basix_emit_pop_r8               ; dataarr
+    call basix_emit_pop_rdx              ; namelen
+    call basix_emit_pop_rcx              ; namearr
+    lea rcx, [rel basix_rt_fsave]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+.do_fload:
+    call basix_lex_next
+    mov eax, TOK_LPAREN
+    call basix_expect
+    call basix_parse_int_arg_push        ; namearr (base ptr)
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; namelen
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; dataarr (base ptr)
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; maxlen
+    mov eax, TOK_RPAREN
+    call basix_expect
+
+    call basix_emit_pop_r9               ; maxlen
+    call basix_emit_pop_r8               ; dataarr
+    call basix_emit_pop_rdx              ; namelen
+    call basix_emit_pop_rcx              ; namearr
+    lea rcx, [rel basix_rt_fload]
     call basix_emit_call_to
     xor r11d, r11d                       ; result type = int
     ret
@@ -1544,7 +1665,25 @@ basix_parse_primary:
     push r15
 
     cmp dword [rel basix_tok_type], TOK_LBRACKET
-    jne .index_bad_arr
+    je .ident_array_indexed
+
+    ; Bare array name used as an argument (not arr[i]): emit its
+    ; compile-time-known base address as a plain int result, so it can
+    ; be passed to FSAVE/FLOAD etc. exactly like any other int expr
+    ; (see basix_parse_int_arg_push). DIM already wrote this array's
+    ; base pointer into its slot earlier in this same compile pass.
+    mov eax, r10d
+    call basix_var_slot_addr
+    mov rax, [rax]
+    call basix_emit_mov_rax_imm64
+    pop r15
+    pop r14
+    pop r13
+    xor r11d, r11d
+    pop r12
+    ret
+
+.ident_array_indexed:
     call basix_lex_next                   ; consume '['
 
     mov r14d, [rel basix_var_arr_ndims + r10*4]   ; how many indices expected
@@ -2575,8 +2714,23 @@ basix_parse_print_list:
     call basix_emit_call_to
     jmp .after_item
 .str_item:
-    mov r12, [rel basix_tok_text]
-    mov r13d, [rel basix_tok_len]
+    mov rcx, [rel basix_tok_text]
+    mov edx, [rel basix_tok_len]
+    call basix_strlit_intern            ; rax=permanent ptr, ecx=length --
+                                         ; basix_tok_text points into the
+                                         ; lexer's shared, reused scratch
+                                         ; buffer (valid only during
+                                         ; compilation, see the comment on
+                                         ; basix_tok_text_buf), but this
+                                         ; pointer gets baked into the
+                                         ; compiled program as an immediate
+                                         ; for basix_rt_print_str to read
+                                         ; at RUNTIME -- long after later
+                                         ; tokens have overwritten that
+                                         ; scratch buffer's contents. A
+                                         ; permanent copy is required.
+    mov r12, rax
+    mov r13d, ecx
     mov rax, r12
     call basix_emit_mov_rcx_imm64
     mov eax, r13d
@@ -2731,7 +2885,7 @@ basix_parse_dim:
     ja .arena_overflow
 
     mov eax, [rel basix_array_arena_pos]
-    lea rcx, [rel basix_array_arena]
+    mov rcx, [rel basix_array_arena_ptr]
     add rcx, rax                         ; rcx = this array's base address
     mov [rel basix_array_arena_pos], edx
 
@@ -2840,6 +2994,10 @@ basix_parse_statement:
     je .do_flip
     cmp r15d, TOK_TRIFILL
     je .do_trifill
+    cmp r15d, TOK_PUTCHAR
+    je .do_putchar
+    cmp r15d, TOK_LOCATE
+    je .do_locate
     cmp r15d, TOK_IDENT
     je .do_ident_stmt
 
@@ -2919,6 +3077,14 @@ basix_parse_statement:
 .do_trifill:
     call basix_lex_next
     call basix_parse_trifill
+    jmp .out
+.do_putchar:
+    call basix_lex_next
+    call basix_parse_putchar
+    jmp .out
+.do_locate:
+    call basix_lex_next
+    call basix_parse_locate
     jmp .out
 
 .do_ident_stmt:
@@ -3053,6 +3219,83 @@ basix_parse_statement:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_strlit_intern: RCX = ptr to text, RDX = length. Copies into the
+; permanent basix_strlit_pool at the current bump position and advances
+; it, so the copy survives long after the lexer's own shared scratch
+; buffer (basix_tok_text_buf) gets reused by later tokens -- unlike
+; that buffer, this pool is never reused within one compile, so a
+; pointer into it baked into the compiled program as an immediate stays
+; valid at runtime. Clamped to the pool's remaining space; on overflow,
+; fails closed (basix_compile_ok=0, returns a zero-length copy) rather
+; than corrupt memory, matching this compiler's established convention
+; for every other fixed-size resource (variables, labels, code buffer).
+; Returns RAX = pool address of the copy, ECX = length actually copied.
+; -------------------------------------------------------------------------
+basix_strlit_intern:
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    mov r8, rcx                         ; r8 = source ptr
+    mov r9d, edx                        ; r9d = requested length
+    mov r10d, [rel basix_strlit_pool_pos] ; r10d = start of this copy
+
+    mov eax, BASIX_STRLIT_POOL_SIZE
+    sub eax, r10d                       ; eax = remaining space
+    cmp r9d, eax
+    jbe .len_ok
+    mov dword [rel basix_compile_ok], 0
+    xor r9d, r9d
+.len_ok:
+    lea rdi, [rel basix_strlit_pool]
+    add rdi, r10
+    mov rsi, r8
+    mov ecx, r9d
+    cld
+    rep movsb
+
+    mov eax, r10d
+    add eax, r9d
+    mov [rel basix_strlit_pool_pos], eax
+
+    lea rax, [rel basix_strlit_pool]
+    add rax, r10                        ; rax = address of this copy
+    mov ecx, r9d                        ; ecx = length copied
+
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_heap_init: called once from kernel.asm's boot sequence, right
+; after pmm_init, and before anything might compile/run a BASIX64
+; program. Heap-allocates basix_array_arena/basix_file_scratch (via
+; kmalloc_large) instead of embedding them as literal zero bytes in the
+; kernel image -- at a combined 17MB, embedding them directly would
+; have bloated KERNEL.BIN enough to make the bootloader's fixed-address
+; AllocatePages(KERNEL_LOAD_ADDR) call fail outright (see basix_symbols.
+; inc's comment on basix_array_arena_ptr).
+; -------------------------------------------------------------------------
+basix_heap_init:
+    push rcx
+    mov rcx, BASIX_ARRAY_ARENA_SIZE
+    call kmalloc_large
+    mov [rel basix_array_arena_ptr], rax
+
+    mov rcx, BASIX_FILE_SCRATCH_SIZE
+    call kmalloc_large
+    mov [rel basix_file_scratch_ptr], rax
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_compile_reset_state: shared by basix_compile/basix_compile_file
 ; -- clears every piece of per-compile state (variables, labels,
 ; fixups, FOR nesting, the array arena, the emitted-code position, and
@@ -3069,6 +3312,7 @@ basix_compile_reset_state:
     mov dword [rel basix_fixup_count], 0
     mov dword [rel basix_for_depth], 0
     mov dword [rel basix_array_arena_pos], 0
+    mov dword [rel basix_strlit_pool_pos], 0
     ret
 
 ; -------------------------------------------------------------------------

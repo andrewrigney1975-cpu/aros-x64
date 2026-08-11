@@ -24,6 +24,7 @@ KBD_KEY_DOWN  equ 0x84
 KBD_KEY_HOME  equ 0x85
 KBD_KEY_END   equ 0x86
 KBD_KEY_DELETE equ 0x87
+KBD_KEY_ESCAPE equ 0x88
 
 ; -------------------------------------------------------------------------
 ; kbd_irq_stub: IRQ1 handler. Reads the scancode, updates shift/caps
@@ -56,6 +57,8 @@ kbd_irq_stub:
     je .shift_down
     cmp bl, 0x3A
     je .capslock_toggle
+    cmp bl, 0x01
+    je .escape_down
 
     movzx ecx, bl
     cmp ecx, 0x80
@@ -105,6 +108,10 @@ kbd_irq_stub:
     jmp .eoi
 .capslock_toggle:
     xor byte [rel kbd_capslock_active], 1
+    jmp .eoi
+.escape_down:
+    mov al, KBD_KEY_ESCAPE
+    call kbd_buf_push
     jmp .eoi
 
 .ext_byte:

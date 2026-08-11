@@ -24,10 +24,15 @@ BASIX_MAX_ARRAY_DIMS equ 4       ; DIM arr(d0,d1,...) -- up to 4 dimensions
 BASIX_VARTYPE_ARRAY_INT   equ 7
 BASIX_VARTYPE_ARRAY_FLOAT equ 8
 
-BASIX_ARRAY_ARENA_SIZE equ 262144        ; 256KB, bump-allocated by DIM's
-                                          ; array path; ~32K doubles total
-                                          ; across however many arrays a
-                                          ; program declares
+BASIX_ARRAY_ARENA_SIZE equ 16777216      ; 16MB, bump-allocated by DIM's
+                                          ; array path. Grown from the
+                                          ; original 256KB so a text editor
+                                          ; program can DIM buf(1048576) AS
+                                          ; INTEGER (~8MB, since arrays here
+                                          ; are uniformly 8 bytes/element)
+                                          ; to edit files up to 1MB, with
+                                          ; headroom left for other arrays
+                                          ; (e.g. a filename buffer).
 
 ; -------------------------------------------------------------------------
 ; basix_name_eq: RCX = candidate ptr, EDX = candidate len, R8 = stored
@@ -488,9 +493,47 @@ basix_var_arr_dims:  times (BASIX_MAX_VARS * BASIX_MAX_ARRAY_DIMS) dd 0
 basix_dim_scratch_ndims: dd 0
 basix_dim_scratch_dims:  times BASIX_MAX_ARRAY_DIMS dd 0
 
+; basix_array_arena is heap-allocated at kernel init (basix_heap_init,
+; kernel.asm) via kmalloc_large rather than baked into the kernel image
+; as literal zero bytes -- at 16MB, embedding it directly would have
+; bloated KERNEL.BIN from ~2MB to ~18MB, big enough to make the
+; bootloader's fixed-address AllocatePages(KERNEL_LOAD_ADDR) call fail
+; (not enough contiguous free physical memory at that fixed range).
 basix_array_arena_pos: dd 0
 align 8
-basix_array_arena: times BASIX_ARRAY_ARENA_SIZE db 0
+basix_array_arena_ptr: dq 0
+
+; Permanent home for PRINT's string-literal arguments (see
+; basix_strlit_intern, basix_parser.inc) -- unlike basix_tok_text_buf,
+; never reused within one compile, so a compiled program can safely
+; read from it at runtime long after compilation has moved on to later
+; tokens.
+BASIX_STRLIT_POOL_SIZE equ 16384
+basix_strlit_pool_pos: dd 0
+align 8
+basix_strlit_pool: times BASIX_STRLIT_POOL_SIZE db 0
+
+; FSAVE/FLOAD (basix_rt_fsave/basix_rt_fload, basix_runtime.inc) scratch:
+; BASIX64 has no string type, so a filename/file-content array arrives as
+; one int (8 bytes) per character/byte -- these buffers hold the packed,
+; byte-per-char/byte form that exfat_write_file/exfat_read_file actually
+; want. Not reentrant (fine: FSAVE/FLOAD are never called concurrently
+; with themselves, same convention as exfat_dir_buf/exfat_wf_scratch).
+BASIX_FSAVE_NAME_BUF_SIZE equ 65         ; EXFAT_MAX_NAME_LEN + NUL
+BASIX_FILE_SCRATCH_SIZE   equ 1048576    ; matches editor.bas's 1MB cap
+basix_fsave_name_buf: times BASIX_FSAVE_NAME_BUF_SIZE db 0
+; Also heap-allocated at kernel init (see basix_array_arena_ptr above) --
+; 1MB of literal zero bytes is a smaller offender but the same fix.
+align 8
+basix_file_scratch_ptr: dq 0
+
+; basix_resolve_dir_path (basix_runtime.inc) walks basix_fsave_name_buf's
+; '/'-separated directory components by temporarily repointing
+; exfat_cwd_cluster, exactly like the shell's OPEN command does one
+; level at a time -- this holds the original cwd so basix_rt_fsave/
+; basix_rt_fload can put it back once the file op is done, leaving the
+; shell's own OPEN/UP navigation state untouched by a FSAVE/FLOAD call.
+basix_path_saved_cwd: dd 0
 
 align 8
 basix_vec_scalar_temp: dq 0              ; accumulator for dot/length/matmul

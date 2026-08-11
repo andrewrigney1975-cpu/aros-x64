@@ -1209,6 +1209,321 @@ basix_rt_screenh:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_rt_textcols / basix_rt_textrows: no arguments. Return RAX = the
+; text console's width/height in character cells (console_cols/
+; console_rows, kernel.asm -- computed at boot from the framebuffer and
+; font metrics), distinct from SCREENW/SCREENH's PIXEL dimensions above.
+; Lets a program like the text editor lay out status/text/hint rows by
+; character cell instead of guessing a font size.
+; -------------------------------------------------------------------------
+basix_rt_textcols:
+    mov eax, [rel console_cols]
+    ret
+
+basix_rt_textrows:
+    mov eax, [rel console_rows]
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_getkey: no arguments. Returns RAX = the next keystroke's code
+; (blocks until one is available -- see kbd_read_char, keyboard.inc):
+; printable ASCII (32-126), Backspace (8), Enter (13), or one of the
+; KBD_KEY_* virtual codes (0x81-0x88: Left/Right/Up/Down/Home/End/
+; Delete/Escape). A compiled program branches on this value directly
+; (e.g. `IF k = 8 THEN ...` for backspace) -- BASIX64 has no named
+; constant mechanism, so callers hardcode these literals.
+; -------------------------------------------------------------------------
+basix_rt_getkey:
+    call kbd_read_char
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_print_char: RCX = character code. Prints it as one raw byte
+; via console_putc -- unlike PRINT (always decimal digits or a string
+; literal), this is how a program renders an int-array-of-char-codes
+; text buffer as actual text.
+; -------------------------------------------------------------------------
+basix_rt_print_char:
+    push rax
+    movzx eax, cl
+    call console_putc
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_locate: RCX = row, RDX = col. Sets the text console's cursor
+; position directly, so a program can redraw one line at a time instead
+; of only ever continuing linearly the way PRINT does.
+; -------------------------------------------------------------------------
+basix_rt_locate:
+    mov [rel console_row], ecx
+    mov [rel console_col], edx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_resolve_dir_path: RCX = ptr to a NUL-terminated path inside
+; basix_fsave_name_buf that may contain '/'-separated directory
+; components (e.g. "SUB/DEEPER/FILE.TXT"). Mutates the buffer in place,
+; overwriting each '/' with a NUL to split it into components, then
+; walks every component except the last as a subdirectory -- exactly
+; the shell's OPEN, minus the exfat_cwd_stack/exfat_cwd_depth breadcrumb
+; bookkeeping OPEN also does for its own UP command, since this is a
+; transient lookup scoped to one FSAVE/FLOAD call, not a persistent
+; shell navigation. Advances exfat_cwd_cluster one level per component;
+; the CALLER is responsible for saving it beforehand and restoring it
+; afterward (basix_path_saved_cwd), since this leaves cwd pointing at
+; the final directory on success, ready for the file op that follows.
+; Returns RAX = pointer to the final component (the filename) on
+; success, or 0 if some intermediate component doesn't exist or isn't a
+; directory (cwd may have advanced partway before the failure -- still
+; the caller's job to restore it).
+; -------------------------------------------------------------------------
+basix_resolve_dir_path:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+
+    mov rbx, rcx                         ; rbx = cursor into the path
+.next_component:
+    mov rsi, rbx                         ; rsi = start of this component
+.scan:
+    mov al, [rbx]
+    test al, al
+    jz .last_component                   ; end of string -- rsi is final
+    cmp al, '/'
+    je .found_sep
+    inc rbx
+    jmp .scan
+.found_sep:
+    mov byte [rbx], 0                    ; split the path here
+    inc rbx                              ; rbx -> next component's start
+
+    mov rcx, rsi
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .fail
+    test byte [rel exfat_find_result+32], ATTR_DIRECTORY
+    jz .fail
+    mov eax, [rel exfat_find_result+0]
+    mov [rel exfat_cwd_cluster], eax
+    jmp .next_component
+
+.last_component:
+    mov rax, rsi
+    jmp .out
+.fail:
+    xor eax, eax
+.out:
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_fsave: RCX = namearr base ptr (int array, one char code per
+; 8-byte element), RDX = namelen, R8 = dataarr base ptr (int array, one
+; byte value per 8-byte element), R9 = datalen. BASIX64 has no string
+; type, so both arrays arrive this way -- pack each down into a plain
+; byte buffer (basix_fsave_name_buf/basix_file_scratch, basix_symbols.inc)
+; before handing off to the exfat_* layer, which only speaks bytes. The
+; packed name may contain '/' separators (see basix_resolve_dir_path)
+; to reach a file in a subdirectory relative to the current directory.
+; Overwrite semantics (unlike exfat_write_file's own create-only
+; behavior): if a file of this name already exists, delete it first.
+; Returns EAX=1/0.
+; -------------------------------------------------------------------------
+basix_rt_fsave:
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, rcx                         ; namearr ptr
+    mov r13d, edx                        ; namelen
+    mov r14, r8                          ; dataarr ptr
+    mov r15d, r9d                        ; datalen
+
+    cmp r13d, EXFAT_MAX_NAME_LEN
+    jbe .name_len_ok
+    mov r13d, EXFAT_MAX_NAME_LEN
+.name_len_ok:
+    lea rdi, [rel basix_fsave_name_buf]
+    xor ecx, ecx
+.name_copy:
+    cmp ecx, r13d
+    jge .name_copy_done
+    mov rax, [r12 + rcx*8]
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .name_copy
+.name_copy_done:
+    mov byte [rdi+rcx], 0                ; NUL-terminate
+
+    mov eax, [rel exfat_cwd_cluster]
+    mov [rel basix_path_saved_cwd], eax
+    lea rcx, [rel basix_fsave_name_buf]
+    call basix_resolve_dir_path
+    mov r13, rax                         ; r13 = filename component ptr (0 = bad path)
+    test r13, r13
+    jz .fail
+
+    mov eax, BASIX_FILE_SCRATCH_SIZE
+    cmp r15d, eax
+    jbe .data_len_ok
+    mov r15d, eax
+.data_len_ok:
+    mov rdi, [rel basix_file_scratch_ptr]
+    xor ecx, ecx
+.data_copy:
+    cmp ecx, r15d
+    jge .data_copy_done
+    mov rax, [r14 + rcx*8]
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .data_copy
+.data_copy_done:
+
+    mov rcx, r13
+    call exfat_delete_file               ; overwrite semantics; result
+                                          ; ignored -- fine if it didn't
+                                          ; already exist
+
+    mov rcx, r13
+    mov r8, [rel basix_file_scratch_ptr]
+    mov r9d, r15d
+    call exfat_write_file
+    mov r15d, eax                        ; save result across the cwd restore
+
+    mov eax, [rel basix_path_saved_cwd]
+    mov [rel exfat_cwd_cluster], eax
+    mov eax, r15d
+    jmp .out
+
+.fail:
+    mov eax, [rel basix_path_saved_cwd]
+    mov [rel exfat_cwd_cluster], eax
+    xor eax, eax
+
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_fload: RCX = namearr base ptr, RDX = namelen, R8 = dataarr
+; base ptr, R9 = maxlen. Looks the file up (path may contain '/'
+; separators, see basix_resolve_dir_path), reads up to maxlen bytes of
+; its content into basix_file_scratch, then expands each byte back out
+; into one 8-byte int-array element (the reverse of basix_rt_fsave's
+; packing). Returns EAX = bytes read (0 if not found or on failure).
+; -------------------------------------------------------------------------
+basix_rt_fload:
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, rcx                         ; namearr ptr
+    mov r13d, edx                        ; namelen
+    mov r14, r8                          ; dataarr ptr
+    mov r15d, r9d                        ; maxlen
+
+    cmp r13d, EXFAT_MAX_NAME_LEN
+    jbe .name_len_ok
+    mov r13d, EXFAT_MAX_NAME_LEN
+.name_len_ok:
+    lea rdi, [rel basix_fsave_name_buf]
+    xor ecx, ecx
+.name_copy:
+    cmp ecx, r13d
+    jge .name_copy_done
+    mov rax, [r12 + rcx*8]
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .name_copy
+.name_copy_done:
+    mov byte [rdi+rcx], 0
+
+    mov eax, [rel exfat_cwd_cluster]
+    mov [rel basix_path_saved_cwd], eax
+    lea rcx, [rel basix_fsave_name_buf]
+    call basix_resolve_dir_path
+    mov r13, rax                         ; r13 = filename component ptr (0 = bad path)
+    test r13, r13
+    jz .fail
+
+    mov rcx, r13
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .fail
+
+    mov eax, BASIX_FILE_SCRATCH_SIZE
+    cmp r15d, eax
+    jbe .maxlen_ok
+    mov r15d, eax
+.maxlen_ok:
+    mov rax, [rel exfat_find_result+8]   ; DataLength
+    cmp rax, r15
+    jbe .len_ok
+    mov rax, r15
+.len_ok:
+    mov r15, rax                         ; r15 = actual bytes to read
+
+    mov ecx, [rel exfat_find_result+0]   ; FirstCluster
+    mov rdx, r15                         ; bytes to read
+    mov r8, [rel basix_file_scratch_ptr]
+    mov r9d, [rel exfat_find_result+16]  ; NoFatChain
+    call exfat_read_file
+    test eax, eax
+    jz .fail
+
+    mov rsi, [rel basix_file_scratch_ptr]
+    xor ecx, ecx
+.data_expand:
+    cmp rcx, r15
+    jge .done
+    movzx eax, byte [rsi+rcx]
+    mov [r14 + rcx*8], rax
+    inc rcx
+    jmp .data_expand
+.done:
+    mov rbx, r15                          ; save result across the cwd restore
+    mov eax, [rel basix_path_saved_cwd]
+    mov [rel exfat_cwd_cluster], eax
+    mov rax, rbx
+    jmp .out
+.fail:
+    mov eax, [rel basix_path_saved_cwd]
+    mov [rel exfat_cwd_cluster], eax
+    xor eax, eax
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_rt_wait: RCX = number of PIT ticks (hundredths of a second) to
 ; wait. Busy-spins (PAUSE-throttled) until timer_ticks has advanced by
 ; at least that many -- the same counter basix_rt_timer reads -- so a

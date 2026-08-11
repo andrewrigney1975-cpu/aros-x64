@@ -49,6 +49,8 @@ entry:
     mov rcx, rbx                        ; boot_info
     call pmm_init
 
+    call basix_heap_init
+
     call fb_clear
     call draw_logo
 

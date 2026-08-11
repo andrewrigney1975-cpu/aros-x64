@@ -105,6 +105,22 @@ TOK_TRIFILL equ 87
 TOK_SCREENW equ 88
 TOK_SCREENH equ 89
 
+; Text editor support: keyboard read (bare keyword, function),
+; raw-character print and cursor positioning (statements)
+TOK_GETKEY  equ 90
+TOK_PUTCHAR equ 91
+TOK_LOCATE  equ 92
+
+; Text editor support: file I/O (functions, int result 1/0 or bytes-read)
+TOK_FSAVE   equ 93
+TOK_FLOAD   equ 94
+
+; Text console dimensions in character cells (distinct from SCREENW/
+; SCREENH, which are the framebuffer's PIXEL dimensions) -- same bare-
+; keyword shape as SCREENW/SCREENH.
+TOK_TEXTCOLS equ 95
+TOK_TEXTROWS equ 96
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -1114,5 +1130,33 @@ basix_keywords:
     db 7
     dd TOK_SCREENH
     db 'SCREENH', 0,0,0,0,0,0,0,0,0
+
+    db 6
+    dd TOK_GETKEY
+    db 'GETKEY', 0,0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_PUTCHAR
+    db 'PUTCHAR', 0,0,0,0,0,0,0,0,0
+
+    db 6
+    dd TOK_LOCATE
+    db 'LOCATE', 0,0,0,0,0,0,0,0,0,0
+
+    db 5
+    dd TOK_FSAVE
+    db 'FSAVE', 0,0,0,0,0,0,0,0,0,0,0
+
+    db 5
+    dd TOK_FLOAD
+    db 'FLOAD', 0,0,0,0,0,0,0,0,0,0,0
+
+    db 8
+    dd TOK_TEXTCOLS
+    db 'TEXTCOLS', 0,0,0,0,0,0,0,0
+
+    db 8
+    dd TOK_TEXTROWS
+    db 'TEXTROWS', 0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table

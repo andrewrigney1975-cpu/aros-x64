@@ -11,7 +11,7 @@ rendered 2D/3D graphics pipeline (pixels/lines/filled triangles, hidden-line
 removal, flat shading), compiled directly to native machine code by a
 compiler running inside the kernel itself.
 
-## Status: Phase 18 — GOP video-mode picker and resolution-aware BASIX64 demos
+## Status: Phase 19 — BASIX64 text editor (keyboard I/O, file I/O, a real editor.bas)
 
 This is an as-built log: each phase below is implemented, tested (either via
 the boot-time regression suite or interactively through QEMU), and merged.
@@ -570,6 +570,70 @@ scheduler bring-up, preemption proof, process-termination/canary-guard
 verification (now exercising per-task page tables) → BASIX64 compile-and-
 run smoke test → drops into the interactive shell.
 
+### Phase 19 — BASIX64 text editor (keyboard I/O, file I/O, a real editor.bas)
+- **Escape key decoding** (`kernel/keyboard.inc`) — scancode `0x01` was
+  previously silently swallowed by the IRQ handler before it ever reached a
+  buffer; special-cased before the normal table lookup, pushing a new
+  `KBD_KEY_ESCAPE` (`0x88`) virtual code, mirroring the existing
+  Left/Right/Up/Down/Home/End/Delete pattern.
+- **`GETKEY`, `PUTCHAR`, `LOCATE` BASIX64 builtins** (`basix_lexer.inc`,
+  `basix_parser.inc`, `basix_runtime.inc`) — the language previously had no
+  way to read a key, print a raw character (`PRINT` only ever emits decimal
+  digits or a string literal), or reposition the console cursor. `GETKEY`
+  (bare-keyword function, blocks on `kbd_read_char`) returns printable ASCII,
+  Backspace/Enter, or a `KBD_KEY_*` virtual code; `PUTCHAR expr` prints one
+  raw byte; `LOCATE row, col` sets `console_row`/`console_col` directly.
+- **`TEXTCOLS`/`TEXTROWS` BASIX64 builtins** — bare-keyword functions
+  returning the text console's width/height in character cells
+  (`console_cols`/`console_rows`), distinct from the existing `SCREENW`/
+  `SCREENH`'s *pixel* dimensions, so a program can lay out text by cell
+  instead of guessing a font size.
+- **Array-as-argument parsing** (`basix_parser.inc`) — a bare array
+  variable name used as a function argument (not indexed with `[i]`) now
+  resolves to its compile-time-known base address as a plain int, reusing
+  the existing string-literal-argument immediate-marshaling pattern. The one
+  new piece of codegen `FSAVE`/`FLOAD` needed.
+- **`FSAVE(namearr, namelen, dataarr, datalen)` / `FLOAD(namearr, namelen,
+  dataarr, maxlen)` BASIX64 builtins** — file I/O functions (int result:
+  1/0 for `FSAVE`, bytes-read for `FLOAD`). BASIX64 has no string type, so
+  both the filename and file content arrive as int arrays (one character/
+  byte per 8-byte element); packed down to plain byte buffers before
+  handing off to the existing `exfat_write_file`/`exfat_read_file`/
+  `exfat_delete_file`/`exfat_find_root_file` layer. `FSAVE` has overwrite
+  semantics (deletes any existing file of that name first). The packed name
+  may contain `/`-separated directory components (e.g. `"SUB/FILE.TXT"`) —
+  `basix_resolve_dir_path` walks each one exactly like the shell's `OPEN`
+  command, temporarily repointing `exfat_cwd_cluster` and restoring it
+  afterward so a `FSAVE`/`FLOAD` call never leaks into the shell's own
+  `OPEN`/`UP` navigation state.
+- **`basix_array_arena` grown from 256KB to 16MB** — needed so a program
+  can `DIM buf(1048576) AS INTEGER` (~8MB, since arrays here are uniformly
+  8 bytes/element) to edit files up to 1MB. Embedding 16MB directly in the
+  kernel image (this is a flat `nasm -f bin` binary — no `.bss` stripping,
+  every `times N db 0` becomes N real bytes on disk) bloated `KERNEL.BIN`
+  enough that the bootloader's fixed-address `AllocatePages(KERNEL_LOAD_
+  ADDR)` call failed outright and the machine wouldn't boot. Fixed by
+  switching `basix_array_arena`/`basix_file_scratch` to real heap
+  allocations (`kmalloc_large`, `kernel/kheap.inc`) made once at boot
+  (`basix_heap_init`, called right after `pmm_init`) instead of static
+  buffers baked into the image.
+- **`examples/editor.bas`** — a real text editor written in BASIX64 itself:
+  load/save/save-as through an ESC-triggered modal menu (no mouse on this
+  OS, and no other key the keyboard driver decodes safely without shadowing
+  normal typing), arrow-key/Home/End/Backspace/Delete navigation and
+  editing at a cursor, and a scrolling viewport — the filename/status line
+  (row 0) and key-hint bar (last row) stay fixed regardless of file length;
+  content between them scrolls to keep the cursor's line in view, computed
+  fresh each redraw (scroll up instantly if the cursor moved above the
+  window, scroll down one line at a time if it moved below). Since `LOCATE`
+  alone has no visible caret of its own (unlike real hardware text mode),
+  the cursor's screen cell is overdrawn with an underscore glyph as the
+  last drawing step, the same convention the shell's own line editor uses
+  (`shell_cursor_to`). The whole file lives as one flat int array with
+  embedded newline bytes — the same byte layout `FSAVE`/`FLOAD` round-trip
+  to/from exFAT. Deployed onto `testdata/exfat_test.vhd`'s root as
+  `EDITOR.BAS` (`RUN EDITOR.BAS` from the shell).
+
 ## Toolchain
 
 - **NASM** (`nasm -f bin`) — the only assembler/build tool needed; no
@@ -654,7 +718,13 @@ OVMF but not real firmware. Root cause not yet found.
   relative to the current directory, not a `/`-separated path -- moving or
   descending more than one level needs one command per level. `RMDIR`
   only removes empty directories (no recursive delete). Nesting is capped
-  at `EXFAT_CWD_MAX_DEPTH` (16).
+  at `EXFAT_CWD_MAX_DEPTH` (16). (`FSAVE`/`FLOAD`, Phase 19, are the
+  exception -- they do accept a `/`-separated path directly.)
+- `examples/editor.bas` (Phase 19): no line wrapping (a line longer than
+  the console width is clipped, not wrapped -- horizontal scrolling isn't
+  implemented, only vertical), no undo, and a combined path+filename is
+  capped at 64 ASCII characters (`EXFAT_MAX_NAME_LEN`, shared with the
+  exFAT write path above).
 - USB: only xHCI is supported (no UHCI/OHCI/EHCI), only one USB mass-
   storage device at a time (no hot-plug, no hubs, only LUN 0), and the
   UEFI bootloader itself still boots via UEFI's own file-system protocol
