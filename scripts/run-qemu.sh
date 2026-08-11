@@ -15,7 +15,8 @@ USB_IMG="$(cygpath -w "$ROOT/testdata/usb_test.img")"
 ARGS=(
   -machine q35
   -cpu qemu64,pdpe1gb=on
-  -m 256M
+  -m 16G
+  -smp 4
   -drive if=pflash,format=raw,readonly=on,file="$OVMF"
   -drive file=fat:rw:"$DISK",format=raw,if=virtio
   -drive file=fat:rw:"$DISK",format=raw,if=ide

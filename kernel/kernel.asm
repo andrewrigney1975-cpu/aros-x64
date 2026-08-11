@@ -2271,6 +2271,116 @@ shell_redraw_range:
     ret
 
 ; -------------------------------------------------------------------------
+; shell_print_spaces: ECX = count. Prints that many space characters.
+; -------------------------------------------------------------------------
+shell_print_spaces:
+    push rax
+    push rcx
+.sp_loop:
+    test ecx, ecx
+    jz .sp_done
+    mov al, ' '
+    call console_putc
+    dec ecx
+    jmp .sp_loop
+.sp_done:
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_strcpy: RCX = dest, RDX = src (NUL-terminated). Copies src to
+; dest, including the NUL. Returns EAX = length copied, excluding NUL.
+; -------------------------------------------------------------------------
+shell_strcpy:
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    mov rdi, rcx
+    mov rsi, rdx
+    xor eax, eax
+.sc_loop:
+    mov cl, [rsi]
+    mov [rdi], cl
+    test cl, cl
+    jz .sc_done
+    inc rsi
+    inc rdi
+    inc eax
+    jmp .sc_loop
+.sc_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; shell_format_dec: RCX = value (unsigned qword), RDX = dest buffer.
+; Writes its decimal digits (no NUL) into the buffer. Returns EAX =
+; digit count written. Sibling of bl_print_dec (boot/bootloader.asm)
+; but writes to a buffer instead of printing directly, and works with a
+; full qword since exFAT DataLength is a qword (values seen in practice
+; are always far smaller, but this is correct for the general case).
+; -------------------------------------------------------------------------
+shell_format_dec:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+
+    mov rdi, rdx                        ; rdi = dest buffer
+    mov rax, rcx                        ; rax = remaining value
+
+    test rax, rax
+    jnz .fd_have_digits
+    mov byte [rdi], '0'
+    mov eax, 1
+    jmp .fd_out
+
+.fd_have_digits:
+    lea r8, [rel shell_dec_scratch + 24] ; r8 = end of scratch; work backwards
+    xor esi, esi                        ; esi = digit count
+    mov r9, 10
+.fd_divloop:
+    test rax, rax
+    jz .fd_copyout
+    xor edx, edx
+    div r9                              ; rax = rax/10, rdx = rax%10
+    add dl, '0'
+    dec r8
+    mov [r8], dl
+    inc esi
+    jmp .fd_divloop
+.fd_copyout:
+    mov ecx, esi
+.fd_copy:
+    cmp ecx, 0
+    je .fd_copy_done
+    mov al, [r8]
+    mov [rdi], al
+    inc r8
+    inc rdi
+    dec ecx
+    jmp .fd_copy
+.fd_copy_done:
+    mov eax, esi
+.fd_out:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
 ; shell_line_insert: inserts AL at cursor index R12D into shell_line_buf,
 ; growing ECX (length) and R12D (cursor) by one, and redraws the (now
 ; shifted) tail of the line. R13D/R14D = the line's starting column/row
@@ -2904,29 +3014,16 @@ shell_dispatch:
     jmp .out
 
 .do_dir:
-    call exfat_dir_list_start
-.dir_loop:
-    lea rcx, [rel shell_dir_name_buf]
-    lea rdx, [rel shell_dir_entry]
-    call exfat_dir_list_next
-    test eax, eax
-    jz .out
-    test byte [rel shell_dir_entry+4], ATTR_DIRECTORY
-    jz .dir_file_size
-    lea rcx, [rel msg_shell_dir_tag]
-    call console_puts
-    jmp .dir_name
-.dir_file_size:
-    mov rcx, [rel shell_dir_entry+8]
-    call basix_rt_print_int
-    lea rcx, [rel msg_shell_dir_sep]
-    call console_puts
-.dir_name:
-    lea rcx, [rel shell_dir_name_buf]
-    call console_puts
-    lea rcx, [rel msg_shell_lf]
-    call console_puts
-    jmp .dir_loop
+    mov ecx, [rel exfat_cwd_cluster]
+    xor edx, edx                        ; DIR always uses depth 0
+    call shell_dir_collect
+    xor edx, edx
+    call shell_dir_print_grid
+    lea rcx, [rel msg_shell_lf]         ; blank line to separate the listing
+    call console_puts                   ; from the next prompt -- the grid
+                                         ; itself already ends on a fresh
+                                         ; line, so one more LF is the gap
+    jmp .out
 
 .do_type:
     lea rdi, [rel shell_arg_buf]
@@ -3449,6 +3546,10 @@ shell_dispatch:
     mov ecx, [rel exfat_cwd_cluster]
     xor edx, edx
     call shell_tree_walk
+    lea rcx, [rel msg_shell_lf]          ; blank line to separate the listing
+    call console_puts                    ; from the next prompt -- shell_tree_
+                                          ; walk already ends on a fresh line,
+                                          ; so one more LF is the gap
     jmp .out
 
 .do_move:
@@ -3564,92 +3665,367 @@ shell_dispatch:
     ret
 
 ; -------------------------------------------------------------------------
-; shell_tree_walk: ECX = directory cluster to list, EDX = indentation
-; depth (0 at the top). Recursively prints the directory tree rooted at
-; ECX, one "<DIR> name" or plain "name" per line indented two spaces per
-; depth level. Recursion is capped at EXFAT_CWD_MAX_DEPTH to guard
-; against a corrupt/cyclic cluster chain.
-;
-; exfat_list_cluster/exfat_list_offset are single-instance global
-; iterator state (see exfat_dir_list_next), not reentrant -- before
-; descending into a subdirectory this saves them (in r14d/r15d, which
-; this function's own prologue/epilogue preserve per call frame, so each
-; recursion level keeps its own copy) and restores them after returning,
-; so the parent directory's enumeration resumes correctly.
-;
-; NOTE: never stash cross-call scratch in rbx here -- it is a global
-; invariant elsewhere in this kernel (holds boot_info*, read by
-; fb_draw_char via console_putc) and is not preserved across the
-; console_puts calls this function makes.
+; shell_dir_collect: ECX = directory cluster, EDX = depth index
+; (0..EXFAT_CWD_MAX_DEPTH-1). Drains exfat_dir_list_next into this
+; depth's slice of the shell_dir_col_* arrays (raw name, FileAttributes,
+; FirstCluster, DataLength), bounded at DIR_LIST_MAX_ENTRIES -- extra
+; entries beyond that are silently dropped, matching this codebase's
+; existing bounded-limit conventions elsewhere. Records the final count
+; in shell_dir_col_count[depth]. Does not format or print anything.
 ; -------------------------------------------------------------------------
-shell_tree_walk:
+shell_dir_collect:
+    push rax
     push rcx
     push rdx
     push rsi
     push rdi
+    push r8
+    push r12
+    push r13
+
+    mov r12d, edx                       ; r12d = depth
+    call exfat_dir_list_start_at        ; ecx = cluster, still the input value
+
+    xor r13d, r13d                      ; r13d = count so far
+.dc_loop:
+    cmp r13d, DIR_LIST_MAX_ENTRIES
+    jge .dc_done
+
+    mov eax, r12d
+    imul eax, DIR_LIST_MAX_ENTRIES
+    add eax, r13d                       ; eax = flat entry index
+    mov r8d, eax                        ; r8d = flat index (exfat_dir_list_next
+                                         ; preserves r8 -- see its own push list)
+    imul eax, DIR_NAME_SLOT_LEN
+    lea rcx, [rel shell_dir_col_names]
+    add rcx, rax                        ; rcx = this entry's raw-name slot
+
+    lea rdx, [rel shell_dir_entry]
+    call exfat_dir_list_next
+    test eax, eax
+    jz .dc_done
+
+    lea rdi, [rel shell_dir_col_attrs]
+    mov eax, [rel shell_dir_entry+4]
+    mov [rdi + r8*4], eax
+
+    lea rdi, [rel shell_dir_col_clusters]
+    mov eax, [rel shell_dir_entry+0]
+    mov [rdi + r8*4], eax
+
+    lea rdi, [rel shell_dir_col_sizes]
+    mov rax, [rel shell_dir_entry+8]
+    mov [rdi + r8*8], rax
+
+    inc r13d
+    jmp .dc_loop
+.dc_done:
+    lea rdi, [rel shell_dir_col_count]
+    mov [rdi + r12*4], r13d
+
+    pop r13
+    pop r12
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_dir_format_entry: ECX = depth, EDX = index within that depth's
+; collected entries. Formats that entry's display text ("<DIR>  name"
+; or "size  name", matching the old single-column DIR's own formatting)
+; into shell_dir_col_text[depth][index] (NUL-terminated, via
+; shell_strcpy's own copy-including-NUL behavior on the final append)
+; and records its length (excluding NUL) into
+; shell_dir_col_textlen[depth][index].
+; -------------------------------------------------------------------------
+shell_dir_format_entry:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
     push r12
     push r13
     push r14
     push r15
 
-    cmp edx, EXFAT_CWD_MAX_DEPTH
-    jge .out
-    mov r12d, edx                       ; r12d = this call's depth
+    mov r12d, ecx                       ; r12d = depth
+    mov r13d, edx                       ; r13d = index
 
-    call exfat_dir_list_start_at
-.walk_loop:
-    lea rcx, [rel shell_dir_name_buf]
-    lea rdx, [rel shell_dir_entry]
-    call exfat_dir_list_next
-    test eax, eax
-    jz .out
+    mov eax, r12d
+    imul eax, DIR_LIST_MAX_ENTRIES
+    add eax, r13d
+    mov r14d, eax                       ; r14d = flat index
 
-    mov r13d, r12d
-.indent_loop:
-    test r13d, r13d
-    jz .indent_done
-    lea rcx, [rel msg_shell_dir_sep]
-    call console_puts
-    dec r13d
-    jmp .indent_loop
-.indent_done:
+    mov eax, r14d
+    imul eax, DIR_TEXT_SLOT_LEN
+    lea r15, [rel shell_dir_col_text]
+    add r15, rax                        ; r15 = this entry's text slot
 
-    test byte [rel shell_dir_entry+4], ATTR_DIRECTORY
-    jz .walk_name
-    lea rcx, [rel msg_shell_dir_tag]
-    call console_puts
-.walk_name:
-    lea rcx, [rel shell_dir_name_buf]
-    call console_puts
-    lea rcx, [rel msg_shell_lf]
-    call console_puts
+    lea rsi, [rel shell_dir_col_attrs]
+    mov eax, [rsi + r14*4]
+    test al, ATTR_DIRECTORY
+    jz .fe_file
 
-    test byte [rel shell_dir_entry+4], ATTR_DIRECTORY
-    jz .walk_loop
+    mov rcx, r15
+    lea rdx, [rel msg_shell_dir_tag]
+    call shell_strcpy
+    mov r8d, eax
+    jmp .fe_append_name
 
-    mov eax, [rel shell_dir_entry+0]    ; child's FirstCluster
-    test eax, eax
-    jz .walk_loop                       ; defensive: nothing to descend into
+.fe_file:
+    lea rsi, [rel shell_dir_col_sizes]
+    mov rcx, [rsi + r14*8]
+    mov rdx, r15
+    call shell_format_dec
+    mov r8d, eax
 
-    mov r14d, [rel exfat_list_cluster]
-    mov r15d, [rel exfat_list_offset]
+    lea rcx, [r15 + r8]
+    lea rdx, [rel msg_shell_dir_sep]
+    call shell_strcpy
+    add r8d, eax
 
-    mov ecx, eax
-    mov edx, r12d
-    inc edx
-    call shell_tree_walk
+.fe_append_name:
+    lea rcx, [r15 + r8]
+    mov eax, r14d
+    imul eax, DIR_NAME_SLOT_LEN
+    lea rdx, [rel shell_dir_col_names]
+    add rdx, rax
+    call shell_strcpy
+    add r8d, eax
 
-    mov [rel exfat_list_cluster], r14d
-    mov [rel exfat_list_offset], r15d
-    jmp .walk_loop
+    lea rdi, [rel shell_dir_col_textlen]
+    mov [rdi + r14*4], r8d
 
-.out:
     pop r15
     pop r14
     pop r13
     pop r12
+    pop r8
     pop rdi
     pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_dir_print_grid: EDX = depth index whose entries (already
+; collected via shell_dir_collect) should be printed. Formats every
+; entry at this depth, finds the widest formatted entry, computes how
+; many columns fit the console width (each column = widest-entry-width
+; + DIR_GUTTER, at least 1 column), and prints them row-major with
+; depth*2 leading spaces on every row. No-op if this depth has zero
+; collected entries.
+; -------------------------------------------------------------------------
+shell_dir_print_grid:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12d, edx                       ; r12d = depth
+    lea rax, [rel shell_dir_col_count]
+    mov r13d, [rax + r12*4]             ; r13d = entry count at this depth
+    test r13d, r13d
+    jz .pg_out
+
+    ; Pass 1: format every entry, track the widest.
+    xor r14d, r14d                      ; r14d = index 0..count-1
+    xor r15d, r15d                      ; r15d = running max length
+.pg_fmt_loop:
+    cmp r14d, r13d
+    jge .pg_fmt_done
+    mov ecx, r12d
+    mov edx, r14d
+    call shell_dir_format_entry
+
+    mov eax, r12d
+    imul eax, DIR_LIST_MAX_ENTRIES
+    add eax, r14d
+    lea rdi, [rel shell_dir_col_textlen]
+    mov eax, [rdi + rax*4]
+    cmp eax, r15d
+    jle .pg_fmt_next
+    mov r15d, eax
+.pg_fmt_next:
+    inc r14d
+    jmp .pg_fmt_loop
+.pg_fmt_done:
+
+    ; Columns = console width / (widest + gutter), at least 1.
+    mov eax, [rel console_cols]
+    xor edx, edx
+    mov ecx, r15d
+    add ecx, DIR_GUTTER
+    div ecx
+    test eax, eax
+    jnz .pg_have_cols
+    mov eax, 1
+.pg_have_cols:
+    mov r8d, eax                        ; r8d = column count
+
+    ; Pass 2: print row-major, r8d columns wide, r12d*2-space indent.
+    xor r14d, r14d                      ; r14d = index 0..count-1
+    mov ecx, r12d
+    call shell_dir_print_indent
+.pg_print_loop:
+    cmp r14d, r13d
+    jge .pg_print_finish
+
+    mov eax, r12d
+    imul eax, DIR_LIST_MAX_ENTRIES
+    add eax, r14d
+    mov ecx, eax
+    imul ecx, DIR_TEXT_SLOT_LEN
+    lea rdx, [rel shell_dir_col_text]
+    add rdx, rcx
+    mov rcx, rdx
+    call console_puts
+
+    mov eax, r12d
+    imul eax, DIR_LIST_MAX_ENTRIES
+    add eax, r14d
+    lea rdx, [rel shell_dir_col_textlen]
+    mov eax, [rdx + rax*4]
+    mov ecx, r15d
+    sub ecx, eax
+    add ecx, DIR_GUTTER
+    call shell_print_spaces
+
+    mov eax, r14d
+    inc eax
+    mov r14d, eax
+    xor edx, edx
+    div r8d
+    test edx, edx
+    jnz .pg_print_loop               ; not a row boundary yet
+
+    cmp r14d, r13d
+    jge .pg_print_loop               ; last entry landed exactly on a row
+                                      ; boundary -- let the loop-top check
+                                      ; reach .pg_print_finish for the
+                                      ; single trailing newline below
+    lea rcx, [rel msg_shell_lf]
+    call console_puts
+    mov ecx, r12d
+    call shell_dir_print_indent
+    jmp .pg_print_loop
+
+.pg_print_finish:
+    ; Always end on a fresh line -- whether the grid's last row was full
+    ; or partial, and whether or not more content (a caller's own
+    ; trailing blank line, or TREE recursing into a subdirectory
+    ; collected at this level) follows immediately afterward.
+    lea rcx, [rel msg_shell_lf]
+    call console_puts
+
+.pg_out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; shell_dir_print_indent: ECX = depth. Prints depth*2 spaces.
+; -------------------------------------------------------------------------
+shell_dir_print_indent:
+    push rcx
+    shl ecx, 1
+    call shell_print_spaces
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; shell_tree_walk: ECX = directory cluster to list, EDX = indentation
+; depth (0 at the top). Collects and prints this directory's own
+; contents as a multi-column grid (shell_dir_collect +
+; shell_dir_print_grid), THEN recurses into each subdirectory found at
+; this level -- collecting a whole level before printing (needed for
+; column-width sizing) naturally means siblings are grouped together in
+; the output before any of their children appear, rather than
+; interleaving a subdirectory's contents immediately after its own
+; name the way the old single-column version did. Recursion is capped
+; at EXFAT_CWD_MAX_DEPTH to guard against a corrupt/cyclic cluster
+; chain. Since each level is fully collected into its own depth-indexed
+; array slice before any recursive call happens, there is no shared
+; iterator state to save/restore across recursion (unlike the old
+; version) -- exfat_list_cluster/exfat_list_offset are safely reused by
+; the time a recursive call touches them again.
+;
+; NOTE: never stash cross-call scratch in rbx here -- it is a global
+; invariant elsewhere in this kernel (holds boot_info*, read by
+; fb_draw_char via console_putc) and is not preserved across the
+; console_puts calls this function (and its helpers) make.
+; -------------------------------------------------------------------------
+shell_tree_walk:
+    push rcx
+    push rdx
+    push r12
+    push r13
+    push r14
+
+    cmp edx, EXFAT_CWD_MAX_DEPTH
+    jge .out
+    mov r13d, edx                       ; r13d = this call's depth
+
+    call shell_dir_collect               ; ecx=cluster, edx=depth: still
+                                         ; the original input values
+
+    mov edx, r13d
+    call shell_dir_print_grid
+
+    lea rax, [rel shell_dir_col_count]
+    mov r14d, [rax + r13*4]             ; r14d = entry count at this depth
+    xor r12d, r12d                       ; r12d = recursion loop index
+.walk_recurse_loop:
+    cmp r12d, r14d
+    jge .out
+
+    mov eax, r13d
+    imul eax, DIR_LIST_MAX_ENTRIES
+    add eax, r12d                        ; eax = flat index
+
+    lea rdx, [rel shell_dir_col_attrs]
+    mov edx, [rdx + rax*4]
+    test dl, ATTR_DIRECTORY
+    jz .walk_recurse_next
+
+    lea rdx, [rel shell_dir_col_clusters]
+    mov ecx, [rdx + rax*4]              ; ecx = child's FirstCluster
+    test ecx, ecx
+    jz .walk_recurse_next               ; defensive: nothing to descend into
+
+    mov edx, r13d
+    inc edx
+    call shell_tree_walk
+
+.walk_recurse_next:
+    inc r12d
+    jmp .walk_recurse_loop
+
+.out:
+    pop r14
+    pop r13
+    pop r12
     pop rdx
     pop rcx
     ret
@@ -3983,9 +4359,44 @@ shell_history_write: dd 0
 shell_cmd_buf:      times 16 db 0
 shell_arg_buf:       times 64 db 0
 shell_arg_buf2:      times 64 db 0
-shell_dir_name_buf: times 256 db 0
 align 8
 shell_dir_entry:    times 16 db 0    ; FirstCluster(dd), FileAttributes(dd), DataLength(dq)
+
+; -------------------------------------------------------------------------
+; DIR/TREE column-layout state. A directory's entries must all be known
+; before printing can start (column width depends on the widest entry,
+; and TREE needs to know which entries are subdirectories to recurse
+; into only *after* this level's grid is printed) -- so both commands
+; buffer a whole directory's worth of entries into these per-depth
+; arrays first. TREE needs one array slice per recursion depth (not a
+; single shared buffer) since a child level's buffering would otherwise
+; overwrite its parent's before the parent finishes printing/recursing;
+; DIR always uses depth 0. Sized for EXFAT_CWD_MAX_DEPTH (16) levels.
+; -------------------------------------------------------------------------
+DIR_LIST_MAX_ENTRIES equ 32             ; per directory level
+DIR_NAME_SLOT_LEN     equ 256           ; matches exfat_dir_list_next's own
+                                         ; "256-byte buffer recommended" doc
+DIR_TEXT_SLOT_LEN     equ 320           ; name slot + room for the widest
+                                         ; possible "<DIR>  "/size prefix
+DIR_GUTTER            equ 5
+; TIMES needs its count resolved at the point it's assembled, which
+; EXFAT_CWD_MAX_DEPTH (defined in exfat.inc, %included after this data
+; section) isn't yet -- unlike ordinary code operands, which resolve
+; fine via NASM's multi-pass address resolution (see ATTR_DIRECTORY
+; used the same way elsewhere in this file). A local mirror constant
+; sidesteps that; the runtime depth-cap checks in shell_tree_walk still
+; use EXFAT_CWD_MAX_DEPTH directly. Keep this in sync if that changes.
+DIR_MAX_DEPTH         equ 16
+
+align 8
+shell_dir_col_names:    times (DIR_MAX_DEPTH * DIR_LIST_MAX_ENTRIES * DIR_NAME_SLOT_LEN) db 0
+shell_dir_col_text:     times (DIR_MAX_DEPTH * DIR_LIST_MAX_ENTRIES * DIR_TEXT_SLOT_LEN) db 0
+shell_dir_col_textlen:  times (DIR_MAX_DEPTH * DIR_LIST_MAX_ENTRIES) dd 0
+shell_dir_col_attrs:    times (DIR_MAX_DEPTH * DIR_LIST_MAX_ENTRIES) dd 0
+shell_dir_col_clusters: times (DIR_MAX_DEPTH * DIR_LIST_MAX_ENTRIES) dd 0
+shell_dir_col_sizes:    times (DIR_MAX_DEPTH * DIR_LIST_MAX_ENTRIES) dq 0
+shell_dir_col_count:    times DIR_MAX_DEPTH dd 0
+shell_dec_scratch:      times 24 db 0
 
 basixtest_src: db 'LET x = 5', 10, 'PRINT x * 3 + 2', 10, 'GOSUB sub1', 10, 'END', 10, 'sub1:', 10, 'PRINT 1', 10, 'RETURN', 10, 0
 msg_basixtest_ran:      db 'basixtest: compiled and ran OK', 13, 10, 0
