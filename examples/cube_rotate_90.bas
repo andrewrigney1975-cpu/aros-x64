@@ -39,8 +39,8 @@ LET cx = 0.9
 LET sx = 0.3
 LET d = 6
 LET f = 700
-LET ex = 640
-LET ey = 400
+LET ex = SCREENW / 2
+LET ey = SCREENH / 2
 
 ' -- Cube geometry: 8 corners of a unit cube (base/object-space, never
 ' -- rotated in place -- each frame re-spins from these), 12 edges as

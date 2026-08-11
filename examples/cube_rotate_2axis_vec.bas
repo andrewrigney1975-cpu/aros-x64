@@ -43,8 +43,8 @@ LET cx = 0.9
 LET sx = 0.3
 LET d = 6
 LET f = 700
-LET ex = 640
-LET ey = 400
+LET ex = SCREENW / 2
+LET ey = SCREENH / 2
 
 ' -- Cube geometry: base(8,3) is 8 corners of a unit cube, one row per
 ' -- corner, columns 0/1/2 = x/y/z (object-space, never rotated in

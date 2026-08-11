@@ -44,8 +44,8 @@ LET cx = 0.9
 LET sx = 0.3
 LET d = 6
 LET f = 700
-LET ex = 640
-LET ey = 400
+LET ex = SCREENW / 2
+LET ey = SCREENH / 2
 
 ' -- Cube geometry: base(8,3), one row per corner (columns x/y/z),
 ' -- corner i's signs from its own bit pattern (bit0=x,bit1=y,bit2=z).

@@ -11,7 +11,7 @@ rendered 2D/3D graphics pipeline (pixels/lines/filled triangles, hidden-line
 removal, flat shading), compiled directly to native machine code by a
 compiler running inside the kernel itself.
 
-## Status: Phase 17 — exFAT subdirectories and shell UX polish
+## Status: Phase 18 — GOP video-mode picker and resolution-aware BASIX64 demos
 
 This is an as-built log: each phase below is implemented, tested (either via
 the boot-time regression suite or interactively through QEMU), and merged.
@@ -508,6 +508,55 @@ kernel are read back correctly by Windows' own exFAT driver.
   no data movement — just the flags byte and entry checksum rewritten in
   place.
 
+### Phase 18 — GOP video-mode picker and resolution-aware BASIX64 demos
+- **Interactive video-mode menu** (`boot/bootloader.asm`) — GOP mode
+  switching only works pre-`ExitBootServices`, so the whole
+  enumerate/prompt/`SetMode` flow lives entirely in the bootloader, right
+  after GOP is located and before the existing Mode/Info→`boot_info`
+  capture (which now just runs afterward, capturing whichever mode ends
+  up active). Enumerates every mode via `QueryMode` and prints `"N)
+  WxH"` for each through `SystemTable->ConOut` (a new `bl_print_dec`
+  UTF-16 decimal-conversion helper, since ConOut needs UTF-16 text and
+  none existed yet); polls `SystemTable->ConIn->ReadKeyStroke` for a
+  typed mode number + Enter, bounded by a ~3-second timeout (`BS->Stall`
+  in small chunks between poll attempts) so a headless/serial-only boot
+  — with no keystrokes ever reaching ConIn — just times out and proceeds
+  with the current mode exactly as before this feature existed. Every
+  value that needs to survive across an EFI call is kept in a dedicated
+  global rather than pushed on the stack, sidestepping this function's
+  manual 16-byte stack-alignment bookkeeping entirely (the whole new
+  block makes zero pushes). No `boot_info` struct changes needed — it
+  already carries the active mode's `FrameBufferBase`/`Width`/`Height`/
+  etc., and the kernel already derives `console_cols`/`console_rows`
+  from those fields dynamically at every boot.
+- **`SCREENW`/`SCREENH` BASIX64 builtins** (`basix_lexer.inc`,
+  `basix_parser.inc`, `basix_runtime.inc`) — bare-keyword expression
+  functions (no parens, same shape as the existing `TIMER`) returning
+  the real framebuffer width/height straight from `boot_info`, so a
+  compiled program can size/center itself instead of assuming a fixed
+  resolution. All 7 `examples/*.bas` demos updated to compute their
+  screen center as `SCREENW / 2` / `SCREENH / 2` instead of the
+  previously hardcoded `640`/`400` — picking a very different
+  resolution no longer renders them off-center or clipped. (Overall
+  scale/FOV still isn't resolution-derived — a demo looks proportionally
+  bigger/smaller at very different resolutions, just always centered.)
+- Verified resolutions available under QEMU's virtual GOP device (via
+  `QueryMode`, OVMF + the q35 machine type's `virtio-gpu`/stdvga — real
+  hardware or a different virtual GPU will offer a different list):
+
+  | # | Resolution | # | Resolution | # | Resolution | # | Resolution |
+  |---|-----------|---|-----------|---|-----------|---|-----------|
+  | 0 | 1280x800  | 8 | 1152x864  | 16 | 1366x768  | 24 | 1920x1440 |
+  | 1 | 640x480   | 9 | 1152x870  | 17 | 1400x1050 | 25 | 2000x2000 |
+  | 2 | 800x480   | 10 | 1280x720 | 18 | 1440x900  | 26 | 2048x1536 |
+  | 3 | 800x600   | 11 | 1280x760 | 19 | 1600x900  | 27 | 2048x2048 |
+  | 4 | 832x624   | 12 | 1280x768 | 20 | 1600x1200 | 28 | 2560x1440 |
+  | 5 | 960x640   | 13 | 1280x960 | 21 | 1680x1050 | 29 | 2560x1600 |
+  | 6 | 1024x600  | 14 | 1280x1024| 22 | 1920x1080 |    |           |
+  | 7 | 1024x768  | 15 | 1360x768 | 23 | 1920x1200 |    |           |
+
+  Mode 0 (1280x800) is QEMU/OVMF's default/current mode at boot.
+
 Current boot sequence (verified via serial log and QEMU screendumps):
 GDT/IDT/PIC/timer → paging → PMM/VMM/heap self-tests (including
 split/coalesce) → local APIC bring-up → AHCI + NVMe device bring-up and
@@ -582,6 +631,14 @@ OVMF but not real firmware. Root cause not yet found.
   needs ring 3 + syscalls, out of scope here.
 - exFAT write path: file names capped at 64 ASCII characters
   (`EXFAT_MAX_NAME_LEN`).
+- Video-mode picker: no persistence across boots (a mode must be
+  reselected every boot, always starting back at whatever the firmware's
+  own default is), numeric entry only (no arrow-key/highlight menu, no
+  backspace/editing of a mistyped number -- it simply fails the range
+  check and falls back to the default), and only overall scale/FOV isn't
+  resolution-derived in the BASIX64 demos (see Phase 18) -- they're
+  correctly centered at any resolution but still look proportionally
+  bigger/smaller at very different ones.
 - One unresolved anomaly: a file written to a freshly-formatted
   `testdata/exfat_test.vhd` by Windows (PowerShell, before the kernel ever
   boots) is invisible to the kernel's own exFAT lookups, reproduced on two

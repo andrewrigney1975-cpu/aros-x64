@@ -1193,6 +1193,22 @@ basix_rt_timer:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_rt_screenw / basix_rt_screenh: no arguments. Return RAX = the
+; real framebuffer width/height (boot_info's FB_WIDTH/FB_HEIGHT, chosen
+; at boot by the bootloader's video-mode picker), so a compiled program
+; can size/center itself instead of assuming a fixed resolution. RBX is
+; the kernel-wide boot_info* convention (see the note on
+; basix_rt_print_int above -- never repurposed as scratch).
+; -------------------------------------------------------------------------
+basix_rt_screenw:
+    mov eax, [rbx+FB_WIDTH]
+    ret
+
+basix_rt_screenh:
+    mov eax, [rbx+FB_HEIGHT]
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_rt_wait: RCX = number of PIT ticks (hundredths of a second) to
 ; wait. Busy-spins (PAUSE-throttled) until timer_ticks has advanced by
 ; at least that many -- the same counter basix_rt_timer reads -- so a

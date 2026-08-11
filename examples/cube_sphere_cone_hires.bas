@@ -49,8 +49,8 @@ LET cx = 0.939693
 LET sx = 0.342020
 LET d = 6
 LET f = 700
-LET ex = 640
-LET ey = 400
+LET ex = SCREENW / 2
+LET ey = SCREENH / 2
 LET n = 60
 LET astep = 6.283185307 / n
 

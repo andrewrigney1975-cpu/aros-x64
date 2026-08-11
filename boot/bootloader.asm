@@ -19,6 +19,8 @@ ORG 0
 %define FILE_ALIGN       0x20
 %define KERNEL_LOAD_ADDR 0x200000
 %define MAP_BUF_SIZE     8192
+%define VIDEO_MENU_STALL_US      50000  ; one poll chunk, in microseconds
+%define VIDEO_MENU_TIMEOUT_ITERS 60     ; 60 * 50ms = ~3s to type a choice
 
 ; -----------------------------------------------------------------------
 ; DOS header (64 bytes) -- only 'MZ' and e_lfanew matter to the PE loader
@@ -214,6 +216,145 @@ entry:
     test eax, eax
     jnz .efi_fail
 
+    ; ---------------------------------------------------------------
+    ; Video mode picker: enumerate GOP modes via QueryMode, print a
+    ; menu, and let the user type a mode number + Enter within a short
+    ; timeout before falling through to whatever mode is already
+    ; active. Every value that must survive across a call is kept in a
+    ; var_* global rather than pushed on the stack, sidestepping this
+    ; function's manual 16-byte stack-alignment bookkeeping entirely
+    ; (this whole block makes zero pushes). A headless/serial-only
+    ; boot (no keystrokes ever reach ConIn) just times out and
+    ; proceeds exactly as before this feature existed.
+    ; ---------------------------------------------------------------
+    mov rax, [rel var_gop]
+    mov rax, [rax+24]                   ; rax = Mode
+    mov eax, [rax+0]                    ; eax = MaxMode
+    mov [rel var_gop_maxmode], eax
+
+    mov rax, [rbx+0x40]                 ; ConOut
+    mov rcx, rax
+    lea rdx, [rel msg_video_menu_header_u16]
+    call qword [rax+8]
+
+    mov dword [rel var_video_modenum], 0
+.video_menu_loop:
+    mov eax, [rel var_video_modenum]
+    cmp eax, [rel var_gop_maxmode]
+    jge .video_menu_done
+
+    mov rax, [rel var_gop]
+    mov rcx, rax
+    mov edx, [rel var_video_modenum]
+    lea r8, [rel var_query_size]
+    lea r9, [rel var_query_info]
+    call qword [rax+0]                  ; GOP->QueryMode
+    test eax, eax
+    jnz .video_menu_next                ; skip a mode that fails to query
+
+    mov eax, [rel var_video_modenum]
+    call bl_print_dec
+
+    mov rax, [rbx+0x40]
+    mov rcx, rax
+    lea rdx, [rel msg_paren_space_u16]
+    call qword [rax+8]
+
+    mov rax, [rel var_query_info]
+    mov eax, [rax+4]                    ; Info->HorizontalResolution
+    call bl_print_dec
+
+    mov rax, [rbx+0x40]
+    mov rcx, rax
+    lea rdx, [rel msg_x_u16]
+    call qword [rax+8]
+
+    mov rax, [rel var_query_info]
+    mov eax, [rax+8]                    ; Info->VerticalResolution
+    call bl_print_dec
+
+    mov rax, [rbx+0x40]
+    mov rcx, rax
+    lea rdx, [rel msg_crlf_u16]
+    call qword [rax+8]
+
+.video_menu_next:
+    mov eax, [rel var_video_modenum]
+    inc eax
+    mov [rel var_video_modenum], eax
+    jmp .video_menu_loop
+.video_menu_done:
+
+    mov rax, [rbx+0x40]
+    mov rcx, rax
+    lea rdx, [rel msg_video_prompt_u16]
+    call qword [rax+8]
+
+    mov dword [rel var_video_mode], 0
+    mov dword [rel var_video_have_input], 0
+    mov dword [rel var_video_timeout], VIDEO_MENU_TIMEOUT_ITERS
+
+.video_input_loop:
+    cmp dword [rel var_video_timeout], 0
+    jle .video_input_done
+
+    mov rax, [rbx+0x30]                 ; ConIn
+    mov rcx, rax
+    lea rdx, [rel var_input_key]
+    call qword [rax+8]                  ; ConIn->ReadKeyStroke
+    test eax, eax
+    jz .video_have_key
+
+    mov rax, [rbx+0x60]                 ; BootServices
+    mov rcx, VIDEO_MENU_STALL_US
+    call qword [rax+248]                ; BS->Stall
+    mov eax, [rel var_video_timeout]
+    dec eax
+    mov [rel var_video_timeout], eax
+    jmp .video_input_loop
+
+.video_have_key:
+    movzx eax, word [rel var_input_key+2]   ; UnicodeChar
+    cmp eax, 13
+    je .video_input_done                     ; Enter
+    cmp eax, '0'
+    jb .video_input_loop
+    cmp eax, '9'
+    ja .video_input_loop
+
+    mov [rel var_input_echo], ax
+    mov rcx, [rbx+0x40]
+    lea rdx, [rel var_input_echo]
+    call qword [rcx+8]                  ; clobbers eax -- re-read the
+                                         ; digit from memory below rather
+                                         ; than trusting eax survived this
+
+    movzx eax, word [rel var_input_echo]
+    sub eax, '0'
+    mov ecx, [rel var_video_mode]
+    imul ecx, 10
+    add ecx, eax
+    mov [rel var_video_mode], ecx
+    mov dword [rel var_video_have_input], 1
+    jmp .video_input_loop
+
+.video_input_done:
+    mov rax, [rbx+0x40]
+    mov rcx, rax
+    lea rdx, [rel msg_crlf_u16]
+    call qword [rax+8]
+
+    cmp dword [rel var_video_have_input], 0
+    je .video_no_setmode
+    mov eax, [rel var_video_mode]
+    cmp eax, [rel var_gop_maxmode]
+    jae .video_no_setmode
+
+    mov rcx, [rel var_gop]
+    mov edx, eax
+    call qword [rcx+8]                  ; GOP->SetMode
+.video_no_setmode:
+
     mov rax, [rel var_gop]                ; EFI_GRAPHICS_OUTPUT_PROTOCOL*
     mov rax, [rax+24]                       ; -> Mode
     mov rcx, [rax+24]                        ; Mode->FrameBufferBase
@@ -399,6 +540,63 @@ serial_puts:
     pop rcx
     ret
 
+; -------------------------------------------------------------------------
+; bl_print_dec: EAX = value (unsigned decimal, up to 10 digits). Prints it
+; via SystemTable->ConOut as a UTF-16 string. Assumes rbx = SystemTable
+; (this bootloader's fixed convention). Used for runtime values (GOP mode
+; numbers/resolutions) that can't be baked in as static __utf16le__ text.
+; -------------------------------------------------------------------------
+bl_print_dec:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    sub rsp, 8                          ; 6 pushes from an odd entry RSP
+                                         ; (the CALL's own return address)
+                                         ; leaves RSP odd again; pad by 8
+                                         ; to be 16-aligned before CALLs
+
+    lea rdi, [rel bl_dec_buf + 22]      ; rdi -> NUL slot (last of 12 words)
+    mov word [rdi], 0
+    mov esi, eax                        ; esi = remaining value
+
+    test esi, esi
+    jnz .digit_loop
+    sub rdi, 2
+    mov word [rdi], '0'
+    jmp .have_digits
+.digit_loop:
+    test esi, esi
+    jz .have_digits
+    mov eax, esi
+    xor edx, edx
+    mov ecx, 10
+    div ecx                             ; eax = esi/10, edx = esi%10 (0-9)
+    mov esi, eax
+    add dl, '0'
+    sub rdi, 2
+    mov word [rdi], dx                  ; edx's upper bits are 0 from the
+                                         ; div above, so dx is already a
+                                         ; correctly zero-extended UTF-16
+                                         ; ASCII digit
+    jmp .digit_loop
+.have_digits:
+    mov rax, [rbx+0x40]                 ; ConOut
+    mov rcx, rax
+    mov rdx, rdi
+    call qword [rax+8]
+
+    add rsp, 8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================
@@ -410,6 +608,17 @@ msg_ebs_ok:     db 'arOS-X64 bootloader: ExitBootServices OK.', 13, 10, 0
 
 msg_banner_u16:
     db __utf16le__(`arOS-X64 bootloader: UEFI entry OK\r\n`), 0, 0
+
+msg_video_menu_header_u16:
+    db __utf16le__(`\r\nAvailable video modes:\r\n`), 0, 0
+msg_video_prompt_u16:
+    db __utf16le__(`Select mode (Enter for default): `), 0, 0
+msg_paren_space_u16:
+    db __utf16le__(`) `), 0, 0
+msg_x_u16:
+    db __utf16le__(`x`), 0, 0
+msg_crlf_u16:
+    db __utf16le__(`\r\n`), 0, 0
 
 ; EFI_LOADED_IMAGE_PROTOCOL_GUID {5B1B31A1-9562-11d2-8E3F-00A0C969723B}
 guid_loaded_image:
@@ -451,6 +660,16 @@ var_kernel_size_io:        dq 0
 var_pages:                   dq 0
 var_kernel_addr:              dq 0
 var_gop:                        dq 0
+var_gop_maxmode:                dd 0
+var_video_modenum:              dd 0
+var_video_mode:                 dd 0
+var_video_have_input:           dd 0
+var_video_timeout:              dd 0
+var_query_size:                 dq 0
+var_query_info:                 dq 0
+var_input_key:                  dw 0, 0
+var_input_echo:                 dw 0, 0
+bl_dec_buf:                     times 12 dw 0
 var_map_size:                    dq 0
 var_map_key:                      dq 0
 var_desc_size:                     dq 0

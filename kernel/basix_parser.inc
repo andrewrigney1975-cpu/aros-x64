@@ -1379,6 +1379,10 @@ basix_parse_primary:
     je .do_atan
     cmp eax, TOK_TIMER
     je .do_timer
+    cmp eax, TOK_SCREENW
+    je .do_screenw
+    cmp eax, TOK_SCREENH
+    je .do_screenh
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
@@ -1431,6 +1435,20 @@ basix_parse_primary:
 .do_timer:
     call basix_lex_next                  ; bare keyword, no parens/args
     lea rcx, [rel basix_rt_timer]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+.do_screenw:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_screenw]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+.do_screenh:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_screenh]
     call basix_emit_call_to
     xor r11d, r11d                       ; result type = int
     ret

@@ -101,6 +101,10 @@ TOK_CLS     equ 85
 TOK_FLIP    equ 86
 TOK_TRIFILL equ 87
 
+; Screen-dimension queries (bare keyword, no parens/args -- same shape as TOK_TIMER)
+TOK_SCREENW equ 88
+TOK_SCREENH equ 89
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -1102,5 +1106,13 @@ basix_keywords:
     db 7
     dd TOK_TRIFILL
     db 'TRIFILL', 0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_SCREENW
+    db 'SCREENW', 0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_SCREENH
+    db 'SCREENH', 0,0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table
