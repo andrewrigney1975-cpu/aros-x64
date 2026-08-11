@@ -4,12 +4,14 @@ A small, multithreaded, UEFI-compatible x86-64 operating system, hand-written
 in NASM assembly, targeting 8th-gen-or-later Intel x64 machines booting from
 NVMe or AHCI. Ships its own UEFI bootloader (GOP graphics, no C/no linker —
 the PE32+ header is emitted directly from NASM), a read/write exFAT user
-filesystem, a preemptive scheduler, a keyboard-driven interactive shell, and
-BASIX64: a mixed-case-keyword BASIC-inspired language with `sfloat`,
-`dfloat`, matrices, and 3D/GUI-oriented math, compiled directly to native
-machine code by a compiler running inside the kernel itself.
+filesystem with subdirectories, a preemptive scheduler, a keyboard-driven
+interactive shell, and BASIX64: a mixed-case-keyword BASIC-inspired language
+with `sfloat`, `dfloat`, matrices, arrays, trig functions, and a software-
+rendered 2D/3D graphics pipeline (pixels/lines/filled triangles, hidden-line
+removal, flat shading), compiled directly to native machine code by a
+compiler running inside the kernel itself.
 
-## Status: Phase 13 — USB device enumeration and Mass Storage (Bulk-Only Transport)
+## Status: Phase 17 — exFAT subdirectories and shell UX polish
 
 This is an as-built log: each phase below is implemented, tested (either via
 the boot-time regression suite or interactively through QEMU), and merged.
@@ -341,6 +343,171 @@ kernel are read back correctly by Windows' own exFAT driver.
   the eventual physical-hardware boot path, not a general-purpose USB
   subsystem.
 
+### Phase 14 — BASIX64 graphics primitives and a 3D wireframe demo
+- **`PSET`/`LINE`** (`basix_lexer.inc`, `basix_parser.inc`,
+  `basix_codegen.inc`, `basix_runtime.inc`) — the first real framebuffer
+  drawing BASIX64 has ever had: `PSET x, y, color` (one pixel, bounds-
+  checked against the real `FB_WIDTH`/`FB_HEIGHT`, out-of-range coordinates
+  silently ignored) and `LINE x1, y1, x2, y2, color` (integer Bresenham, all
+  octants, plotted through `PSET` so off-screen segments clip pixel by
+  pixel). Compiled the same way every other statement is — no interpreter,
+  real x64 emitted directly as the parser walks the arguments — via a new
+  shared `basix_parse_int_arg_push` helper and five new register-popping
+  codegen wrappers (RCX/RDX/R8/R9/R10) to marshal comma-separated arguments
+  into the runtime call.
+- **`examples/cube_sphere_cone.bas`** — a cube (8 vertices/12 edges,
+  exact), a sphere, and a cone, each rotated, perspective-projected, and
+  hidden-line tested by comparing each edge's two rotated endpoints' Z
+  average (white = front-facing, muted grey = back-facing). Since BASIX64
+  had no trig yet at this point, every circle point is a precomputed
+  literal constant. Shaped by two hard limits hit while writing it:
+  `BASIX_MAX_VARS` (64) ruled out a unique variable per vertex, so all
+  three shapes reuse one 8-slot coordinate pool; the RUN command's then-
+  8191-byte file-size ceiling forced 6-sided circles and 1-decimal-place
+  literals to fit.
+- Verified via QEMU monitor screendumps, inspected pixel-by-pixel: exact
+  `PSET`/`LINE` colors confirmed, and cropped close-ups of the demo showing
+  precisely the far/hidden edges in grey and near/visible edges in white,
+  matching real backface-relative depth.
+
+### Phase 15 — BASIX64 arrays, trig functions, streamed compilation, and a real-hardware image builder
+- **1D arrays** (`basix_codegen.inc`, `basix_symbols.inc`) — `DIM
+  arr(N) AS INTEGER/SFLOAT/DFLOAT` with `arr[i]` reading/writing at any
+  *runtime* expression index (a genuinely different capability from
+  `VECTOR2/3/4`/`MATRIX4` component access, which stays compile-time-index-
+  only). Backed by a 256KB bump-allocated arena; every indexed access
+  bounds-checks first and silently yields 0/0.0 on an out-of-range read or
+  no-ops on an out-of-range write, matching `PSET`'s existing silent-clip
+  precedent (this compiler has no runtime panic mechanism). One real bug
+  fixed along the way: an index expression referencing another variable
+  (`arr[i]`) recursed back through the identifier-parsing path, which
+  silently clobbered the *outer* array's own type/index bookkeeping held in
+  the same scratch registers.
+- **`SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`** (`basix_runtime.inc`) — the
+  first callable expression-level functions BASIX64 has had (previously
+  only statement-level ops like `VDOT` existed). Bridges to the x87 FPU for
+  the actual transcendentals (SSE2 has none, and hand-rolled polynomial
+  approximations aren't worth the risk with hardware support available);
+  `ASIN`/`ACOS` are derived from `FPATAN` plus an SSE2 `sqrt(1-v^2)` term
+  since x87 has no direct opcode for either. A one-time `FNINIT`
+  (`basix_fpu_init`) establishes sane x87 control/tag-word state at boot,
+  since UEFI makes no promise about it the way it does for the CR0/CR4 bits
+  SSE2 already depends on.
+- **Streamed `RUN`** (`exfat.inc`, `basix_lexer.inc`, `basix_parser.inc`) —
+  `RUN` no longer reads a whole program into one buffer before compiling;
+  `basix_compile_file` streams through a 4096-byte rolling window refilled
+  directly from exFAT (`exfat_read_file_at`, a `exfat_read_file` sibling
+  that can start mid-file) whenever the lexer's cursor runs low. Program
+  size is no longer bounded by any fixed source buffer, only by the
+  compiled-output and variable/label table limits, which already fail
+  closed rather than corrupt memory on overflow. Found and fixed a real bug
+  along the way: `DIM` and `GOTO`/`GOSUB` target-name parsing each saved a
+  raw pointer into the lexer's shared token-text buffer across a further
+  lex call, which the next keyword lexed (e.g. `DIM`'s own `AS` / type
+  keyword) would silently overwrite — corrupting every declared variable's
+  identity while still "compiling" without error. Fixed via
+  `basix_save_ident`, copying names that must outlive further lexing into
+  their own buffer immediately.
+- Also this phase: a real bug in `basix_parse_term`/`arith`/`comparison`
+  (the left operand's type, tracked in a register that variable-reference
+  parsing unconditionally clobbers as scratch, could silently flip a
+  float/float division into raw integer division on the double's bit
+  pattern); `FXSAVE`/`FXRSTOR` added to the scheduler's timer-driven task
+  switch (the GPR save alone never covered XMM/x87 state, which BASIX64's
+  float pipeline lives in almost entirely); `RUN`/`TYPE`'s file-size cap
+  raised from 8192 to 65536 bytes with an added overflow guard on the
+  compiled-code buffer emitters; and `scripts/make_image.py`, a real
+  GPT-partitioned, FAT32-ESP disk image builder in pure Python stdlib (no
+  mtools/dd/diskpart) for physical-hardware boot testing (see Build & run).
+- Verified with a synthetic 899-statement program crossing multiple
+  refill boundaries, and by re-running the Phase 14 cube/sphere/cone demo
+  through the new streaming path and comparing screendumps pixel-for-pixel
+  against the known-good non-streaming render (identical color counts and
+  geometry).
+
+### Phase 16 — BASIX64 real-time animation, a back buffer, and solid rendering
+- **`TIMER`/`WAIT`** — `TIMER` reads the PIT's free-running 100Hz tick
+  counter; `WAIT` spins until a given tick count elapses, letting a
+  compiled program pace itself to real time instead of running flat-out.
+  `examples/cube_rotate_90.bas` derives its frame count/angle step/pacing
+  entirely from a duration and target FPS rather than hardcoding them.
+- **Back buffer + anti-aliased `LINE`, `CLS`/`FLIP`** — `PSET`/`LINE`/`CLS`
+  now draw into a private, kmalloc'd back buffer instead of the live
+  framebuffer (eliminating mid-redraw flicker), with `FLIP` blitting the
+  finished frame in one shot. `LINE` was rewritten around Xiaolin Wu's
+  algorithm: endpoints keep full float precision and each step blends two
+  adjacent pixels by sub-pixel coverage via a new format-agnostic per-byte
+  blend helper, instead of hard-setting one pixel.
+- **Multi-dimensional arrays** — `DIM arr(d0, d1, ...)` now accepts up to
+  `BASIX_MAX_ARRAY_DIMS` (4) compile-time-constant dimension sizes;
+  `arr[i, j, ...]` indexes with fully runtime-computed indices, combined
+  into one linear offset via Horner's method (row-major) and bounds-checked
+  as a single flattened range — ordinary 1D arrays are just the ndims=1
+  case of the same code path. `examples/cube_rotate_2axis.bas` and
+  `..._vec.bas` demonstrate two-axis rotation, the latter replacing ~13
+  scalar temp variables per vertex with two `VECTOR3`s and reusable
+  `ROTATE_Y`/`ROTATE_X` subroutines.
+- **`TRIFILL`, hidden-line removal, flat shading** — `TRIFILL x0,y0,
+  x1,y1,x2,y2,color` fills a solid triangle into the back buffer via a
+  standard edge-function test, with per-triangle edge coefficients
+  precomputed once and held resident in XMM registers for the whole fill
+  (roughly doubled fill throughput under QEMU's unaccelerated CPU
+  emulation). `examples/cube_rotate_2axis_hlr.bas` culls an edge unless at
+  least one of its two adjacent faces' rotated normals faces the camera
+  (exact for a convex solid, no clipping needed); `..._lit.bas` flat-shades
+  each face (two `TRIFILL` triangles) under a single directional light
+  using the same front-facing test for backface culling.
+- Known issue, still unresolved: an extra stray line artifact appears near
+  a cube vertex only when cube+sphere+cone are all present together in one
+  program (`examples/cube_sphere_cone_hires.bas`); every individual shape
+  or pairing renders correctly, and the underlying vertex data verifies
+  correct before and after the draw, so this looks like a compiled-code
+  interaction specific to that combination rather than a data or timing
+  race.
+
+### Phase 17 — exFAT subdirectories and shell UX polish
+- **Subdirectories** (`exfat.inc`) — folders are ordinary exFAT File entry
+  sets (0x85/0xC0/0xC1) with the `ATTR_DIRECTORY` bit set and a
+  `FirstCluster` pointing at more directory entries instead of file data —
+  no new on-disk format needed. A single `exfat_cwd_cluster` global, read
+  by every directory-scanning primitive instead of the old
+  root-cluster-only constant, makes create/write/append/delete/rename/
+  list/find directory-relative for free. exFAT itself has no "." / ".."
+  entries, so `OPEN`/`UP` are backed entirely by an in-memory breadcrumb
+  stack (cluster, plus name for the prompt), not anything read from disk.
+- **New shell commands**: `MKDIR`, `OPEN <name>` (descend), `UP` (ascend),
+  `TREE` (recursive indented listing), `MOVE <file> <folder>` (writes the
+  destination entry *before* removing the source, so a failure never loses
+  the file — only a same-level-directory move is supported per call;
+  moving further requires `OPEN`-ing a step at a time), and `RMDIR`
+  (empty directories only). `DIR` now tags folders `<DIR>` and shows file
+  byte sizes; `TYPE`/`DEL`/`RENAME`/`APPEND`/`TRUNCATE` all refuse to
+  target a directory.
+- **Shell UX**: a breadcrumb prompt (`ROOT > GRAPHICS > : `, built from the
+  same breadcrumb stack); a persistent underscore cursor indicator in the
+  line editor (drawn by fully repainting the edited line, plus one trailing
+  blank cell for the case where the cursor sits one past the last
+  character, before every move — avoids needing to separately track/erase
+  the glyph's previous position); and single-line-per-entry `DIR`/`TREE`
+  output (previously double-spaced, since `console_putc` treats a bare CR
+  and a bare LF as two independent newlines, and the shared line-end
+  message sends both).
+- One real bug found and fixed: `exfat_rename_file` (pre-existing) and the
+  new `exfat_move_file` both reconstructed a moved/renamed entry's
+  `GeneralSecondaryFlags` by left-shifting the captured `NoFatChain` bit —
+  but `exfat_find_root_file` already captures it pre-shifted to its real
+  on-disk bit position (0x00/0x02, not a plain boolean), so the extra shift
+  silently corrupted the flag into the wrong bit. Invisible to this
+  kernel's own self-tests (everything it creates via `WRITE`/`APPEND` is
+  always `NoFatChain=0`), but broke any pre-existing, contiguously-
+  allocated file the moment it was renamed or moved — surfacing as `TYPE`
+  giving "Error reading file." and `RUN` giving "BASIX64 compile error."
+  partway through the file, since the FAT entries for a `NoFatChain=1`
+  file's clusters are genuinely left unset. `FirstCluster`/`DataLength`
+  were never touched by the bug, only the flags byte, so recovery needed
+  no data movement — just the flags byte and entry checksum rewritten in
+  place.
+
 Current boot sequence (verified via serial log and QEMU screendumps):
 GDT/IDT/PIC/timer → paging → PMM/VMM/heap self-tests (including
 split/coalesce) → local APIC bring-up → AHCI + NVMe device bring-up and
@@ -421,7 +588,16 @@ OVMF but not real firmware. Root cause not yet found.
   separate from-scratch VHDs -- not a worn-volume artifact as previously
   suspected. Files created by the kernel itself are unaffected and found
   reliably every time; only pre-seeded, externally-written files are hit.
-  Root cause unconfirmed.
+  Narrowed in Phase 17: a real, Windows-native `System Volume Information`
+  folder on the same volume (and its children) reads back correctly once
+  `ATTR_DIRECTORY` support existed, so the anomaly is specific to
+  Windows-written flat *files*, not a general problem with this reader's
+  entry parsing. Root cause still unconfirmed.
+- exFAT subdirectories (Phase 17): `MOVE`/`OPEN`/etc. take a single name
+  relative to the current directory, not a `/`-separated path -- moving or
+  descending more than one level needs one command per level. `RMDIR`
+  only removes empty directories (no recursive delete). Nesting is capped
+  at `EXFAT_CWD_MAX_DEPTH` (16).
 - USB: only xHCI is supported (no UHCI/OHCI/EHCI), only one USB mass-
   storage device at a time (no hot-plug, no hubs, only LUN 0), and the
   UEFI bootloader itself still boots via UEFI's own file-system protocol
