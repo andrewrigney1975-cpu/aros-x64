@@ -41,7 +41,6 @@ entry:
     call idt_install
     call irq_install
     call kbd_install
-    sti
     call paging_init
     call lapic_init
     call basix_fpu_init
@@ -50,6 +49,17 @@ entry:
     call pmm_init
 
     call basix_heap_init
+
+    ; Interrupts stay off until every bulk rep-stos/rep-movs boot-time
+    ; clear above (the PMM bitmap fill, the VMM's page-table zeroing, the
+    ; heap arena init) has fully run. A timer tick landing mid-REP on a
+    ; Hyper-V/WHvp-backed hypervisor (VirtualBox on a Windows host with
+    ; Hyper-V active) doesn't resume the interrupted REP cleanly -- seen
+    ; as sporadic triple faults at different RIPs (always right after a
+    ; rep stosd/stosq) depending on exactly when the tick landed. QEMU
+    ; tolerates this fine; delaying STI until after the bulk clears
+    ; sidesteps it either way.
+    sti
 
     call fb_clear
     call draw_logo
@@ -191,20 +201,38 @@ entry:
     test rax, rax
     jz .vmm_bad
     mov r12, rax                        ; r12 = physical frame A
+    lea rcx, [rel msg_dbg_fa]
+    call serial_puts
+    mov rax, r12
+    call dbg_hex64
     call pmm_alloc_page
     test rax, rax
     jz .vmm_bad
     mov r13, rax                        ; r13 = physical frame B
+    lea rcx, [rel msg_dbg_fb]
+    call serial_puts
+    mov rax, r13
+    call dbg_hex64
 
     mov rcx, VMM_VIRT_BASE
     mov rdx, r12
     call vmm_map_page
-    test eax, eax
+    mov r14d, eax                       ; stash return code
+    lea rcx, [rel msg_dbg_m1]
+    call serial_puts
+    mov eax, r14d
+    call dbg_hex64
+    test r14d, r14d
     jz .vmm_bad
     mov rcx, VMM_VIRT_BASE + 4096
     mov rdx, r13
     call vmm_map_page
-    test eax, eax
+    mov r14d, eax
+    lea rcx, [rel msg_dbg_m2]
+    call serial_puts
+    mov eax, r14d
+    call dbg_hex64
+    test r14d, r14d
     jz .vmm_bad
 
     mov rax, VMM_VIRT_BASE
@@ -4202,6 +4230,10 @@ msg_timer_ok:         db 'Timer: IRQ0 firing, ticks=', 0
 msg_timer_bad:        db 'Timer: no ticks observed', 13, 10, 0
 msg_pmm_ok:           db 'PMM: alloc/free/reuse OK', 13, 10, 0
 msg_pmm_bad:          db 'PMM: alloc/free/reuse FAILED', 13, 10, 0
+msg_dbg_fa:            db 'DBG frameA=', 0
+msg_dbg_fb:            db 'DBG frameB=', 0
+msg_dbg_m1:            db 'DBG map1 ret=', 0
+msg_dbg_m2:            db 'DBG map2 ret=', 0
 msg_vmm_ok:           db 'VMM: virtual->physical mapping OK', 13, 10, 0
 msg_vmm_bad:          db 'VMM: virtual->physical mapping FAILED', 13, 10, 0
 msg_kheap_ok:         db 'kmalloc/kfree: alloc/content/reuse OK', 13, 10, 0

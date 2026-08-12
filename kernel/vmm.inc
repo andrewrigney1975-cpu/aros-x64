@@ -107,6 +107,17 @@ vmm_map_page:
     mov rsi, rcx                        ; rsi = virtual address
     mov rbx, rdx                        ; rbx = physical address
 
+    push rax
+    lea rcx, [rel msg_dbg_vmap_v]
+    call serial_puts
+    mov rax, rsi
+    call dbg_hex64
+    lea rcx, [rel msg_dbg_vmap_p]
+    call serial_puts
+    mov rax, rbx
+    call dbg_hex64
+    pop rax
+
     mov rax, rsi
     shr rax, 39
     and eax, 0x1FF
@@ -173,6 +184,17 @@ vmm_map_page_at:
 
     mov rsi, rcx                        ; rsi = virtual address
     mov rbx, rdx                        ; rbx = physical address
+
+    push rax
+    lea rcx, [rel msg_dbg_vmap_v]
+    call serial_puts
+    mov rax, rsi
+    call dbg_hex64
+    lea rcx, [rel msg_dbg_vmap_p]
+    call serial_puts
+    mov rax, rbx
+    call dbg_hex64
+    pop rax
 
     mov rax, rsi
     shr rax, 39
@@ -390,3 +412,9 @@ vmm_unmap_page:
     pop rcx
     pop rax
     ret
+
+; =========================================================================
+; Data
+; =========================================================================
+msg_dbg_vmap_v: db 'DBG vmap virt=', 0
+msg_dbg_vmap_p: db 'DBG vmap phys=', 0
