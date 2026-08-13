@@ -120,6 +120,7 @@ TOK_FLOAD   equ 94
 ; keyword shape as SCREENW/SCREENH.
 TOK_TEXTCOLS equ 95
 TOK_TEXTROWS equ 96
+TOK_COLOR    equ 97
 
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
@@ -1158,5 +1159,9 @@ basix_keywords:
     db 8
     dd TOK_TEXTROWS
     db 'TEXTROWS', 0,0,0,0,0,0,0,0
+
+    db 5
+    dd TOK_COLOR
+    db 'COLOR', 0,0,0,0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table

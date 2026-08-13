@@ -56,6 +56,28 @@ DIM pfcancel AS INTEGER
 DIM saveok AS INTEGER
 DIM readn AS INTEGER
 
+' Syntax-highlighting state (see classify_char and friends, near the
+' bottom of this file). in_comment persists across classify_char calls
+' within one screen line (reset at every newline); hl_len/hl_color are
+' classify_char's per-call outputs. The cc_* vars are private scratch
+' for classify_char's own helper subroutines.
+DIM in_comment AS INTEGER
+DIM hl_len AS INTEGER
+DIM hl_color AS INTEGER
+DIM tki AS INTEGER
+DIM cc_is_alpha AS INTEGER
+DIM cc_prev_word AS INTEGER
+DIM cc_pch AS INTEGER
+DIM cc_wc_result AS INTEGER
+DIM cc_bp AS INTEGER
+DIM cc_bnd_ok AS INTEGER
+
+DIM COL_WHITE AS INTEGER
+DIM COL_GREEN AS INTEGER
+DIM COL_BLUE AS INTEGER
+DIM COL_YELLOW AS INTEGER
+DIM COL_ORANGE AS INTEGER
+
 LET cols = TEXTCOLS
 LET rows = TEXTROWS
 LET buflen = 0
@@ -64,6 +86,13 @@ LET scrolltop = 0
 LET fnamelen = 0
 LET modified = 0
 LET exitreq = 0
+LET in_comment = 0
+
+LET COL_WHITE = 16777215
+LET COL_GREEN = 52224
+LET COL_BLUE = 5676246
+LET COL_YELLOW = 16776960
+LET COL_ORANGE = 14251863
 
 GOSUB clear_all
 
@@ -175,6 +204,9 @@ RETURN
 ' -----------------------------------------------------------------------
 redraw:
 GOSUB clear_all
+' a previous redraw's content scan may have left the console color set
+' to a syntax-highlight color -- the fixed header rows always draw white
+COLOR COL_WHITE
 
 LOCATE 0, 0
 PRINT "ESC=Menu  L=Load  S=Save  A=Save As  X=Exit"
@@ -235,34 +267,254 @@ LOCATE row, col
 LET p = scrolltop
 LET curow = 5
 LET cucol = 0
+' scrolltop always lands on a line start (see the comment above), so a
+' fresh scan never begins mid-comment
+LET in_comment = 0
 redraw_scan:
 IF p >= buflen THEN GOTO redraw_after_scan
+LET ch = buf[p]
+IF ch = 10 THEN
+  IF p = cur THEN
+    LET curow = row
+    LET cucol = col
+  ENDIF
+  LET row = row + 1
+  LET col = 0
+  LET in_comment = 0
+  IF row > rows - 1 THEN GOTO redraw_done
+  LOCATE row, col
+  LET p = p + 1
+  GOTO redraw_scan
+ENDIF
+
+' sets hl_len (>=1) / hl_color for buf[p], may set in_comment
+GOSUB classify_char
+COLOR hl_color
+LET tki = 0
+classify_print_loop:
+IF tki >= hl_len THEN GOTO classify_print_done
+IF p >= buflen THEN GOTO classify_print_done
 IF p = cur THEN
   LET curow = row
   LET cucol = col
 ENDIF
 LET ch = buf[p]
-IF ch = 10 THEN
-  LET row = row + 1
-  LET col = 0
-  IF row > rows - 1 THEN GOTO redraw_done
-  LOCATE row, col
-ELSE
-  IF col < cols THEN
-    PUTCHAR ch
-    LET col = col + 1
-  ENDIF
+IF col < cols THEN
+  PUTCHAR ch
+  LET col = col + 1
 ENDIF
 LET p = p + 1
+LET tki = tki + 1
+GOTO classify_print_loop
+classify_print_done:
 GOTO redraw_scan
+
 redraw_after_scan:
 IF p = cur THEN
   LET curow = row
   LET cucol = col
 ENDIF
 redraw_done:
+' the cursor underscore itself is never syntax-colored
+COLOR COL_WHITE
 LOCATE curow, cucol
 PUTCHAR 95
+RETURN
+
+' -----------------------------------------------------------------------
+' classify_char: input p (buffer position, buf[p] must be valid, i.e.
+' p < buflen). Sets hl_len (>=1, how many characters starting at p share
+' one color) and hl_color (that color). Comments (from ' to end of line,
+' tracked via in_comment across calls within one screen line) are green;
+' DIM/LET are mid-blue; (), [] are yellow; the handful of BASIX64 data-
+' type keywords are Claude-orange; everything else is COL_WHITE. Keyword
+' matching only fires at a word boundary (start of buffer, or the
+' preceding char isn't itself an identifier char) and requires the
+' character immediately following the candidate word to not be an
+' identifier char either -- so e.g. "DIMENSION" or "MYDIM" never get
+' mistaken for the keyword DIM.
+' -----------------------------------------------------------------------
+classify_char:
+LET hl_len = 1
+LET hl_color = COL_WHITE
+
+IF in_comment = 1 THEN
+  LET hl_color = COL_GREEN
+  RETURN
+ENDIF
+
+LET ch = buf[p]
+
+IF ch = 39 THEN
+  LET in_comment = 1
+  LET hl_color = COL_GREEN
+  RETURN
+ENDIF
+
+IF ch = 40 OR ch = 41 OR ch = 91 OR ch = 93 THEN
+  LET hl_color = COL_YELLOW
+  RETURN
+ENDIF
+
+LET cc_is_alpha = 0
+IF ch >= 65 AND ch <= 90 THEN LET cc_is_alpha = 1
+IF ch >= 97 AND ch <= 122 THEN LET cc_is_alpha = 1
+IF cc_is_alpha = 0 THEN RETURN
+
+LET cc_prev_word = 0
+IF p > 0 THEN
+  LET cc_pch = buf[p - 1]
+  GOSUB is_wordchar
+  LET cc_prev_word = cc_wc_result
+ENDIF
+IF cc_prev_word = 1 THEN RETURN
+
+GOSUB try_match_keywords
+RETURN
+
+' -----------------------------------------------------------------------
+' is_wordchar: input cc_pch (a char code), output cc_wc_result (1 if
+' it's an identifier char -- alnum or underscore -- else 0).
+' -----------------------------------------------------------------------
+is_wordchar:
+LET cc_wc_result = 0
+IF cc_pch >= 48 AND cc_pch <= 57 THEN LET cc_wc_result = 1
+IF cc_pch >= 65 AND cc_pch <= 90 THEN LET cc_wc_result = 1
+IF cc_pch >= 97 AND cc_pch <= 122 THEN LET cc_wc_result = 1
+IF cc_pch = 95 THEN LET cc_wc_result = 1
+RETURN
+
+' -----------------------------------------------------------------------
+' check_boundary_after: input cc_bp (the buffer position right after a
+' candidate keyword match), output cc_bnd_ok (1 if that position is NOT
+' another identifier char, or is past the end of the buffer -- i.e. the
+' candidate word actually ends there rather than continuing).
+' -----------------------------------------------------------------------
+check_boundary_after:
+LET cc_bnd_ok = 1
+IF cc_bp < buflen THEN
+  LET cc_pch = buf[cc_bp]
+  GOSUB is_wordchar
+  IF cc_wc_result = 1 THEN LET cc_bnd_ok = 0
+ENDIF
+RETURN
+
+' -----------------------------------------------------------------------
+' try_match_keywords: called only when buf[p] starts a word boundary.
+' Tries each reserved keyword this editor colors; on the first exact
+' match (respecting the trailing word boundary too), sets hl_len/
+' hl_color and returns. Leaves hl_len/hl_color at classify_char's
+' default (1 / COL_WHITE) if nothing matches.
+' -----------------------------------------------------------------------
+try_match_keywords:
+IF buflen >= p + 3 THEN
+  IF buf[p] = 68 AND buf[p+1] = 73 AND buf[p+2] = 77 THEN
+    LET cc_bp = p + 3
+    GOSUB check_boundary_after
+    IF cc_bnd_ok = 1 THEN
+      LET hl_len = 3
+      LET hl_color = COL_BLUE
+      RETURN
+    ENDIF
+  ENDIF
+ENDIF
+
+IF buflen >= p + 3 THEN
+  IF buf[p] = 76 AND buf[p+1] = 69 AND buf[p+2] = 84 THEN
+    LET cc_bp = p + 3
+    GOSUB check_boundary_after
+    IF cc_bnd_ok = 1 THEN
+      LET hl_len = 3
+      LET hl_color = COL_BLUE
+      RETURN
+    ENDIF
+  ENDIF
+ENDIF
+
+IF buflen >= p + 7 THEN
+  IF buf[p] = 73 AND buf[p+1] = 78 AND buf[p+2] = 84 AND buf[p+3] = 69 AND buf[p+4] = 71 AND buf[p+5] = 69 AND buf[p+6] = 82 THEN
+    LET cc_bp = p + 7
+    GOSUB check_boundary_after
+    IF cc_bnd_ok = 1 THEN
+      LET hl_len = 7
+      LET hl_color = COL_ORANGE
+      RETURN
+    ENDIF
+  ENDIF
+ENDIF
+
+IF buflen >= p + 6 THEN
+  IF buf[p] = 83 AND buf[p+1] = 70 AND buf[p+2] = 76 AND buf[p+3] = 79 AND buf[p+4] = 65 AND buf[p+5] = 84 THEN
+    LET cc_bp = p + 6
+    GOSUB check_boundary_after
+    IF cc_bnd_ok = 1 THEN
+      LET hl_len = 6
+      LET hl_color = COL_ORANGE
+      RETURN
+    ENDIF
+  ENDIF
+ENDIF
+
+IF buflen >= p + 6 THEN
+  IF buf[p] = 68 AND buf[p+1] = 70 AND buf[p+2] = 76 AND buf[p+3] = 79 AND buf[p+4] = 65 AND buf[p+5] = 84 THEN
+    LET cc_bp = p + 6
+    GOSUB check_boundary_after
+    IF cc_bnd_ok = 1 THEN
+      LET hl_len = 6
+      LET hl_color = COL_ORANGE
+      RETURN
+    ENDIF
+  ENDIF
+ENDIF
+
+IF buflen >= p + 7 THEN
+  IF buf[p] = 86 AND buf[p+1] = 69 AND buf[p+2] = 67 AND buf[p+3] = 84 AND buf[p+4] = 79 AND buf[p+5] = 82 AND buf[p+6] = 50 THEN
+    LET cc_bp = p + 7
+    GOSUB check_boundary_after
+    IF cc_bnd_ok = 1 THEN
+      LET hl_len = 7
+      LET hl_color = COL_ORANGE
+      RETURN
+    ENDIF
+  ENDIF
+ENDIF
+
+IF buflen >= p + 7 THEN
+  IF buf[p] = 86 AND buf[p+1] = 69 AND buf[p+2] = 67 AND buf[p+3] = 84 AND buf[p+4] = 79 AND buf[p+5] = 82 AND buf[p+6] = 51 THEN
+    LET cc_bp = p + 7
+    GOSUB check_boundary_after
+    IF cc_bnd_ok = 1 THEN
+      LET hl_len = 7
+      LET hl_color = COL_ORANGE
+      RETURN
+    ENDIF
+  ENDIF
+ENDIF
+
+IF buflen >= p + 7 THEN
+  IF buf[p] = 86 AND buf[p+1] = 69 AND buf[p+2] = 67 AND buf[p+3] = 84 AND buf[p+4] = 79 AND buf[p+5] = 82 AND buf[p+6] = 52 THEN
+    LET cc_bp = p + 7
+    GOSUB check_boundary_after
+    IF cc_bnd_ok = 1 THEN
+      LET hl_len = 7
+      LET hl_color = COL_ORANGE
+      RETURN
+    ENDIF
+  ENDIF
+ENDIF
+
+IF buflen >= p + 7 THEN
+  IF buf[p] = 77 AND buf[p+1] = 65 AND buf[p+2] = 84 AND buf[p+3] = 82 AND buf[p+4] = 73 AND buf[p+5] = 88 AND buf[p+6] = 52 THEN
+    LET cc_bp = p + 7
+    GOSUB check_boundary_after
+    IF cc_bnd_ok = 1 THEN
+      LET hl_len = 7
+      LET hl_color = COL_ORANGE
+      RETURN
+    ENDIF
+  ENDIF
+ENDIF
+
 RETURN
 
 ' -----------------------------------------------------------------------

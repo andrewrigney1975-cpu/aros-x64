@@ -1890,10 +1890,11 @@ fb_clear:
 ; -------------------------------------------------------------------------
 ; fb_draw_char: draw one glyph from font8x16. ECX=column, EDX=row (in 8x16
 ; character cells), R8B=ASCII code. Characters outside 32..126 render blank.
-; Paints both the glyph's set pixels (white) AND its clear ones (black),
-; not just the set ones -- this is what makes it safe to redraw a cell
-; that previously held a *different*, wider/taller-stroked character (the
-; shell's line editor depends on this for backspace/delete/insert redraws).
+; Paints both the glyph's set pixels (fb_text_color, white by default) AND
+; its clear ones (black), not just the set ones -- this is what makes it
+; safe to redraw a cell that previously held a *different*, wider/taller-
+; stroked character (the shell's line editor depends on this for
+; backspace/delete/insert redraws).
 ; -------------------------------------------------------------------------
 fb_draw_char:
     push rax
@@ -1937,7 +1938,8 @@ fb_draw_char:
     add rdi, rdx
     test r12d, 0x80
     jz .clear_pixel
-    mov dword [rdi], 0xFFFFFFFF         ; white; channel order doesn't matter
+    mov eax, [rel fb_text_color]
+    mov dword [rdi], eax
     jmp .col_next
 .clear_pixel:
     mov dword [rdi], 0                  ; black -- erases whatever was here before
@@ -3218,6 +3220,10 @@ shell_dispatch:
     jz .run_compilefail
 
     call basix_code_buf
+    mov dword [rel fb_text_color], 0xFFFFFFFF  ; a program may leave COLOR
+                                                ; set to something other than
+                                                ; white -- don't let that leak
+                                                ; into the shell's own prompt
     jmp .out
 .run_usage:
     lea rcx, [rel msg_shell_run_usage]
@@ -4329,6 +4335,9 @@ console_col:  dd 0
 console_row:  dd 0
 console_cols: dd 0
 console_rows: dd 0
+fb_text_color: dd 0xFFFFFFFF        ; current glyph foreground color, set by
+                                     ; BASIX64's COLOR statement -- see
+                                     ; basix_rt_set_text_color and fb_draw_char
 
 shell_str_help:  db 'help', 0
 shell_str_dir:   db 'dir', 0

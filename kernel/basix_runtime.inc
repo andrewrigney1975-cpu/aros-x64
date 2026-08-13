@@ -1261,6 +1261,76 @@ basix_rt_locate:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_rt_set_text_color: RCX = color as a standard 0x00RRGGBB packed
+; value (bits 16-23=R, 8-15=G, 0-7=B), unlike PSET/LINE's raw
+; native-pixel-order color args -- text is drawn one glyph at a time via
+; fb_draw_char (see fb_text_color), not blended pixel-by-pixel, so there's
+; no existing native-order convention to match here, and RRGGBB is what a
+; BASIX64 program will naturally write literal color constants as. Reorders
+; into the framebuffer's actual byte layout (boot_info's FB_PIXFMT: 0 =
+; RGBX8888, 1 = BGRX8888) so PUTCHAR/PRINT text colors come out correct
+; regardless of which byte order this GOP mode happens to use.
+; -------------------------------------------------------------------------
+basix_rt_set_text_color:
+    push rax
+    push rdx
+    push r8
+    push r10
+    push r11
+    push r12
+
+    mov r8d, ecx
+
+    mov eax, r8d
+    shr eax, 16
+    and eax, 0xFF
+    mov r10d, eax                       ; r10d = R
+
+    mov eax, r8d
+    shr eax, 8
+    and eax, 0xFF
+    mov r11d, eax                       ; r11d = G
+
+    mov eax, r8d
+    and eax, 0xFF
+    mov r12d, eax                       ; r12d = B
+
+    mov edx, [rbx+FB_PIXFMT]
+    cmp edx, 1
+    je .bgr
+
+    ; RGBX8888: byte0=R, byte1=G, byte2=B -> dword = R | (G<<8) | (B<<16)
+    mov eax, r10d
+    mov edx, r11d
+    shl edx, 8
+    or eax, edx
+    mov edx, r12d
+    shl edx, 16
+    or eax, edx
+    jmp .store
+
+.bgr:
+    ; BGRX8888: byte0=B, byte1=G, byte2=R -> dword = B | (G<<8) | (R<<16)
+    mov eax, r12d
+    mov edx, r11d
+    shl edx, 8
+    or eax, edx
+    mov edx, r10d
+    shl edx, 16
+    or eax, edx
+
+.store:
+    mov [rel fb_text_color], eax
+
+    pop r12
+    pop r11
+    pop r10
+    pop r8
+    pop rdx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_resolve_dir_path: RCX = ptr to a NUL-terminated path inside
 ; basix_fsave_name_buf that may contain '/'-separated directory
 ; components (e.g. "SUB/DEEPER/FILE.TXT"). Mutates the buffer in place,

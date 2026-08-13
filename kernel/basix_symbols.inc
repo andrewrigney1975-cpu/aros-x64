@@ -7,8 +7,8 @@
 ; -- there is no stack frame or register allocator for v1.
 ; =============================================================================
 
-BASIX_MAX_VARS    equ 64
-BASIX_MAX_LABELS  equ 32
+BASIX_MAX_VARS    equ 96
+BASIX_MAX_LABELS  equ 64
 BASIX_MAX_FIXUPS  equ 64
 BASIX_MAX_FOR_DEPTH equ 8
 BASIX_MAX_ARRAY_DIMS equ 4       ; DIM arr(d0,d1,...) -- up to 4 dimensions

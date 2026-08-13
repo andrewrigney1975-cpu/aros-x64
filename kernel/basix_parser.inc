@@ -1209,6 +1209,19 @@ basix_parse_putchar:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_parse_color: "COLOR expr" -- sets the text console's current
+; glyph foreground color (as a 0x00RRGGBB packed value) via
+; basix_rt_set_text_color; applies to every PUTCHAR/PRINT call from here
+; on, until the next COLOR.
+; -------------------------------------------------------------------------
+basix_parse_color:
+    call basix_parse_int_arg_push        ; 0x00RRGGBB color
+    call basix_emit_pop_rcx
+    lea rcx, [rel basix_rt_set_text_color]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_parse_locate: "LOCATE row, col" -- positions the text console
 ; cursor (console_row/console_col), so a program can redraw a specific
 ; screen line instead of only ever continuing linearly like PRINT.
@@ -2998,6 +3011,8 @@ basix_parse_statement:
     je .do_putchar
     cmp r15d, TOK_LOCATE
     je .do_locate
+    cmp r15d, TOK_COLOR
+    je .do_color
     cmp r15d, TOK_IDENT
     je .do_ident_stmt
 
@@ -3085,6 +3100,10 @@ basix_parse_statement:
 .do_locate:
     call basix_lex_next
     call basix_parse_locate
+    jmp .out
+.do_color:
+    call basix_lex_next
+    call basix_parse_color
     jmp .out
 
 .do_ident_stmt:
