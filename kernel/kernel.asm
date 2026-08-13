@@ -4556,4 +4556,5 @@ gdt_descriptor:
 %include "basix_codegen.inc"
 %include "basix_symbols.inc"
 %include "basix_runtime.inc"
+%include "png.inc"
 %include "basix_parser.inc"

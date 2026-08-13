@@ -1239,6 +1239,24 @@ basix_parse_locate:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_parse_drawpng: "DRAWPNG x, y" -- blits the most recently LOADPNG'd
+; image into the graphics back buffer at (x, y), clipped to the back
+; buffer's own bounds (see basix_rt_drawpng). Same "comma-separated,
+; no parens" statement shape as PSET/LOCATE.
+; -------------------------------------------------------------------------
+basix_parse_drawpng:
+    call basix_parse_int_arg_push        ; x
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; y
+
+    call basix_emit_pop_rdx              ; y
+    call basix_emit_pop_rcx              ; x
+    lea rcx, [rel basix_rt_drawpng]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_parse_float_arg_store: RAX = a fixed (compile-time-constant)
 ; scratch address. Parses one arithmetic expression, coercing an int
 ; result to float, then emits code storing that float (XMM0) to the
@@ -1435,6 +1453,22 @@ basix_parse_primary:
     je .do_textcols
     cmp eax, TOK_TEXTROWS
     je .do_textrows
+    cmp eax, TOK_LOADPNG
+    je .do_loadpng
+    cmp eax, TOK_PNGWIDTH
+    je .do_pngwidth
+    cmp eax, TOK_PNGHEIGHT
+    je .do_pngheight
+    cmp eax, TOK_PNGDEBUG
+    je .do_pngdebug
+    cmp eax, TOK_PNGDEBUG2
+    je .do_pngdebug2
+    cmp eax, TOK_PNGPEEKPIXEL
+    je .do_pngpeekpixel
+    cmp eax, TOK_PNGPEEKINFL
+    je .do_pngpeekinfl
+    cmp eax, TOK_PNGPEEKABC
+    je .do_pngpeekabc
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
@@ -1522,6 +1556,100 @@ basix_parse_primary:
 .do_textrows:
     call basix_lex_next                  ; bare keyword, no parens/args
     lea rcx, [rel basix_rt_textrows]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+.do_pngwidth:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_png_width]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+.do_pngheight:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_png_height]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+.do_pngdebug:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_png_debug]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+.do_pngdebug2:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_png_debug2]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+.do_pngpeekpixel:
+    call basix_lex_next
+    mov eax, TOK_LPAREN
+    call basix_expect
+    call basix_parse_int_arg_push        ; x
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; y
+    mov eax, TOK_RPAREN
+    call basix_expect
+    call basix_emit_pop_rdx              ; y
+    call basix_emit_pop_rcx              ; x
+    lea rcx, [rel basix_rt_png_peek_pixel]
+    call basix_emit_call_to
+    xor r11d, r11d
+    ret
+
+.do_pngpeekinfl:
+    call basix_lex_next
+    mov eax, TOK_LPAREN
+    call basix_expect
+    call basix_parse_int_arg_push        ; offset
+    mov eax, TOK_RPAREN
+    call basix_expect
+    call basix_emit_pop_rcx              ; offset
+    lea rcx, [rel basix_rt_png_peek_infl]
+    call basix_emit_call_to
+    xor r11d, r11d
+    ret
+
+.do_pngpeekabc:
+    call basix_lex_next
+    mov eax, TOK_LPAREN
+    call basix_expect
+    call basix_parse_int_arg_push        ; index
+    mov eax, TOK_RPAREN
+    call basix_expect
+    call basix_emit_pop_rcx              ; index
+    lea rcx, [rel basix_rt_png_peek_abc]
+    call basix_emit_call_to
+    xor r11d, r11d
+    ret
+
+; -------------------------------------------------------------------------
+; LOADPNG(namearr, namelen) -- decodes a PNG file straight from exFAT into
+; the kernel-owned pixel buffer DRAWPNG later blits from. Returns 1/0.
+; Two plain int args, same shape as FSAVE/FLOAD.
+; -------------------------------------------------------------------------
+.do_loadpng:
+    call basix_lex_next
+    mov eax, TOK_LPAREN
+    call basix_expect
+    call basix_parse_int_arg_push        ; namearr (base ptr)
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; namelen
+    mov eax, TOK_RPAREN
+    call basix_expect
+
+    call basix_emit_pop_rdx              ; namelen
+    call basix_emit_pop_rcx              ; namearr
+    lea rcx, [rel basix_rt_loadpng]
     call basix_emit_call_to
     xor r11d, r11d                       ; result type = int
     ret
@@ -3013,6 +3141,8 @@ basix_parse_statement:
     je .do_locate
     cmp r15d, TOK_COLOR
     je .do_color
+    cmp r15d, TOK_DRAWPNG
+    je .do_drawpng
     cmp r15d, TOK_IDENT
     je .do_ident_stmt
 
@@ -3104,6 +3234,10 @@ basix_parse_statement:
 .do_color:
     call basix_lex_next
     call basix_parse_color
+    jmp .out
+.do_drawpng:
+    call basix_lex_next
+    call basix_parse_drawpng
     jmp .out
 
 .do_ident_stmt:
@@ -3311,6 +3445,8 @@ basix_heap_init:
     mov rcx, BASIX_FILE_SCRATCH_SIZE
     call kmalloc_large
     mov [rel basix_file_scratch_ptr], rax
+
+    call png_heap_init
     pop rcx
     ret
 

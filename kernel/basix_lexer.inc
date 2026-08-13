@@ -121,6 +121,15 @@ TOK_FLOAD   equ 94
 TOK_TEXTCOLS equ 95
 TOK_TEXTROWS equ 96
 TOK_COLOR    equ 97
+TOK_LOADPNG  equ 98
+TOK_DRAWPNG  equ 99
+TOK_PNGWIDTH equ 100
+TOK_PNGHEIGHT equ 101
+TOK_PNGDEBUG equ 102   ; TEMP: remove once LOADPNG is verified working
+TOK_PNGDEBUG2 equ 103  ; TEMP: remove once LOADPNG is verified working
+TOK_PNGPEEKPIXEL equ 104  ; TEMP: remove once LOADPNG is verified working
+TOK_PNGPEEKINFL equ 105   ; TEMP: remove once LOADPNG is verified working
+TOK_PNGPEEKABC equ 106    ; TEMP: remove once LOADPNG is verified working
 
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
@@ -1163,5 +1172,41 @@ basix_keywords:
     db 5
     dd TOK_COLOR
     db 'COLOR', 0,0,0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_LOADPNG
+    db 'LOADPNG', 0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_DRAWPNG
+    db 'DRAWPNG', 0,0,0,0,0,0,0,0,0
+
+    db 8
+    dd TOK_PNGWIDTH
+    db 'PNGWIDTH', 0,0,0,0,0,0,0,0
+
+    db 9
+    dd TOK_PNGHEIGHT
+    db 'PNGHEIGHT', 0,0,0,0,0,0,0
+
+    db 8
+    dd TOK_PNGDEBUG
+    db 'PNGDEBUG', 0,0,0,0,0,0,0,0
+
+    db 9
+    dd TOK_PNGDEBUG2
+    db 'PNGDEBUG2', 0,0,0,0,0,0,0
+
+    db 12
+    dd TOK_PNGPEEKPIXEL
+    db 'PNGPEEKPIXEL', 0,0,0,0
+
+    db 11
+    dd TOK_PNGPEEKINFL
+    db 'PNGPEEKINFL', 0,0,0,0,0
+
+    db 10
+    dd TOK_PNGPEEKABC
+    db 'PNGPEEKABC', 0,0,0,0,0,0
 
     db 0                                 ; end of table
