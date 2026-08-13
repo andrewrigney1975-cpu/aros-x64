@@ -73,7 +73,11 @@ LET k = GETKEY
 
 IF k = 136 THEN
   GOSUB do_menu
-  IF exitreq = 1 THEN END
+  IF exitreq = 1 THEN
+    GOSUB clear_all
+    LOCATE 0, 0
+    END
+  ENDIF
   GOTO main_loop
 ENDIF
 
@@ -148,24 +152,34 @@ WEND
 RETURN
 
 ' -----------------------------------------------------------------------
-' redraw: row 0 = filename/modified status (always fixed), rows
-' 1..rows-2 = a SCROLLING window onto buffer content, row rows-1 = key
-' hints (always fixed). scrolltop is the buffer index of the first
-' visible line's start; before drawing, it's adjusted just enough to
-' keep the cursor's own line inside the visible window (scroll up
-' instantly if the cursor moved above it, scroll down one line at a
-' time if it moved below it) -- the same approach a simple pager uses.
-' Content is scanned starting from scrolltop rather than 0, so rows
-' 0 and rows-1 are never touched by file content regardless of file
-' length. The cursor's own screen cell is overdrawn with an underscore
-' as the last drawing step, since LOCATE alone (unlike real hardware
-' text mode) has no visible caret of its own -- see shell_cursor_to's
-' comment for the same convention used by the shell's own line editor.
+' redraw: everything that isn't file content is pinned to the TOP of the
+' screen now -- row 0 = the Load/Save/Save As/Exit menu bar (always
+' fixed -- see do_menu, which still gates the actual keys behind ESC so
+' L/S/A/X keep working as normal typing outside menu mode), row 1 =
+' filename/modified status (always fixed), row 2 = key hints (always
+' fixed), row 3 = a full-width '=' divider bar (TUI-style separator
+' between the fixed header and the document), row 4 = a blank spacer
+' row, rows 5..rows-1 = a SCROLLING window onto buffer content running
+' all the way to the bottom of the screen. scrolltop is the buffer
+' index of the first visible line's start; before drawing, it's
+' adjusted just enough to keep the cursor's own line inside the visible
+' window (scroll up instantly if the cursor moved above it, scroll down
+' one line at a time if it moved below it) -- the same approach a
+' simple pager uses. Content is scanned starting from scrolltop rather
+' than 0, so rows 0-4 are never touched by file content regardless of
+' file length. The cursor's own screen cell is overdrawn with an
+' underscore as the last drawing step, since LOCATE alone (unlike real
+' hardware text mode) has no visible caret of its own -- see
+' shell_cursor_to's comment for the same convention used by the shell's
+' own line editor.
 ' -----------------------------------------------------------------------
 redraw:
 GOSUB clear_all
 
 LOCATE 0, 0
+PRINT "ESC=Menu  L=Load  S=Save  A=Save As  X=Exit"
+
+LOCATE 1, 0
 LET i = 0
 WHILE i < fnamelen
   LET ch = fname[i]
@@ -181,8 +195,15 @@ ELSE
   ENDIF
 ENDIF
 
-LOCATE rows - 1, 0
-PRINT "ESC=Menu  Arrows=Move  Enter=NewLine  Backspace/Del=Delete"
+LOCATE 2, 0
+PRINT "Arrows=Move  Enter=NewLine  Backspace/Del=Delete"
+
+LOCATE 3, 0
+LET i = 0
+WHILE i < cols
+  PUTCHAR 61
+  LET i = i + 1
+WEND
 
 LET lsq = cur
 GOSUB find_line_start
@@ -193,7 +214,7 @@ scroll_check:
 LET wp = scrolltop
 LET wi = 0
 scroll_count_loop:
-IF wi >= rows - 2 THEN GOTO scroll_count_done
+IF wi >= rows - 5 THEN GOTO scroll_count_done
 LET leq = wp
 GOSUB find_line_end
 IF ler >= buflen THEN GOTO scroll_count_done
@@ -208,11 +229,11 @@ LET scrolltop = ler + 1
 GOTO scroll_check
 scroll_done:
 
-LET row = 1
+LET row = 5
 LET col = 0
 LOCATE row, col
 LET p = scrolltop
-LET curow = 1
+LET curow = 5
 LET cucol = 0
 redraw_scan:
 IF p >= buflen THEN GOTO redraw_after_scan
@@ -224,7 +245,7 @@ LET ch = buf[p]
 IF ch = 10 THEN
   LET row = row + 1
   LET col = 0
-  IF row > rows - 2 THEN GOTO redraw_done
+  IF row > rows - 1 THEN GOTO redraw_done
   LOCATE row, col
 ELSE
   IF col < cols THEN
@@ -354,15 +375,15 @@ RETURN
 ' (the caller is expected to check pfcancel before using the result).
 ' -----------------------------------------------------------------------
 prompt_filename:
-LOCATE rows - 1, 0
+LOCATE 0, 0
 LET i = 0
 WHILE i < cols
   PUTCHAR 32
   LET i = i + 1
 WEND
-LOCATE rows - 1, 0
+LOCATE 0, 0
 PRINT "Filename: "
-LOCATE rows - 1, 10
+LOCATE 0, 10
 LET fnamelen = 0
 LET pfcancel = 0
 pf_loop:
@@ -375,9 +396,9 @@ ENDIF
 IF k2 = 8 THEN
   IF fnamelen > 0 THEN
     LET fnamelen = fnamelen - 1
-    LOCATE rows - 1, 10 + fnamelen
+    LOCATE 0, 10 + fnamelen
     PUTCHAR 32
-    LOCATE rows - 1, 10 + fnamelen
+    LOCATE 0, 10 + fnamelen
   ENDIF
   GOTO pf_loop
 ENDIF
@@ -399,13 +420,13 @@ RETURN
 ' top-level main_loop once do_menu has returned.
 ' -----------------------------------------------------------------------
 do_menu:
-LOCATE rows - 1, 0
+LOCATE 0, 0
 LET i = 0
 WHILE i < cols
   PUTCHAR 32
   LET i = i + 1
 WEND
-LOCATE rows - 1, 0
+LOCATE 0, 0
 PRINT "L=Load  S=Save  A=Save As  X=Exit  ESC=Cancel"
 LET k2 = GETKEY
 

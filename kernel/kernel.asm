@@ -3765,9 +3765,12 @@ shell_dir_collect:
 
 ; -------------------------------------------------------------------------
 ; shell_dir_format_entry: ECX = depth, EDX = index within that depth's
-; collected entries. Formats that entry's display text ("<DIR>  name"
-; or "size  name", matching the old single-column DIR's own formatting)
-; into shell_dir_col_text[depth][index] (NUL-terminated, via
+; collected entries. Formats that entry's display text -- "<DIR>" or the
+; decimal size, space-padded to DIR_TAG_FIELD_WIDTH (7) characters, then
+; a 2-character gutter, then the name -- so names always start in the
+; same column regardless of tag/digit-count length, e.g. "<DIR>    name"
+; / "137      name" both line up. Written into
+; shell_dir_col_text[depth][index] (NUL-terminated, via
 ; shell_strcpy's own copy-including-NUL behavior on the final append)
 ; and records its length (excluding NUL) into
 ; shell_dir_col_textlen[depth][index].
@@ -3806,7 +3809,7 @@ shell_dir_format_entry:
     lea rdx, [rel msg_shell_dir_tag]
     call shell_strcpy
     mov r8d, eax
-    jmp .fe_append_name
+    jmp .fe_pad_field
 
 .fe_file:
     lea rsi, [rel shell_dir_col_sizes]
@@ -3814,6 +3817,17 @@ shell_dir_format_entry:
     mov rdx, r15
     call shell_format_dec
     mov r8d, eax
+
+.fe_pad_field:
+    ; space-pad the <DIR>/size field to DIR_TAG_FIELD_WIDTH so names start
+    ; in the same column regardless of tag/digit-count length
+.fe_pad_loop:
+    cmp r8d, DIR_TAG_FIELD_WIDTH
+    jge .fe_pad_done
+    mov byte [r15 + r8], ' '
+    inc r8d
+    jmp .fe_pad_loop
+.fe_pad_done:
 
     lea rcx, [r15 + r8]
     lea rdx, [rel msg_shell_dir_sep]
@@ -4366,7 +4380,7 @@ msg_shell_append_fail:  db 'Append failed (file may not exist).', 13, 10, 0
 msg_shell_truncate_usage: db 'Usage: TRUNCATE <filename> <newsize>', 13, 10, 0
 msg_shell_truncate_ok:    db 'File truncated.', 13, 10, 0
 msg_shell_truncate_fail:  db 'Truncate failed (file may not exist, or newsize > current size).', 13, 10, 0
-msg_shell_dir_tag:        db '<DIR>  ', 0
+msg_shell_dir_tag:        db '<DIR>', 0
 msg_shell_dir_sep:        db '  ', 0
 msg_shell_isdir:          db 'Cannot TYPE a directory.', 13, 10, 0
 msg_shell_mkdir_usage:    db 'Usage: MKDIR <name>', 13, 10, 0
@@ -4412,6 +4426,8 @@ DIR_NAME_SLOT_LEN     equ 256           ; matches exfat_dir_list_next's own
                                          ; "256-byte buffer recommended" doc
 DIR_TEXT_SLOT_LEN     equ 320           ; name slot + room for the widest
                                          ; possible "<DIR>  "/size prefix
+DIR_TAG_FIELD_WIDTH   equ 7             ; <DIR>/filesize field, space-padded
+                                         ; to this width so names line up
 DIR_GUTTER            equ 5
 ; TIMES needs its count resolved at the point it's assembled, which
 ; EXFAT_CWD_MAX_DEPTH (defined in exfat.inc, %included after this data
