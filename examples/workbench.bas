@@ -167,6 +167,18 @@ WHILE 1
       IF my >= winY THEN
       IF my < winY + titleH THEN
         IF mx >= winX + winW - closeW THEN
+          ' Closing must bring the REAL exFAT cwd back to root, not
+          ' just reset navDepth to 0 -- DIRCD pushed onto
+          ' exfat_cwd_cluster/exfat_cwd_stack each level down; leaving
+          ' those untouched while navDepth resets to 0 desyncs the
+          ' tracked depth (so no ".." shows) from where DIROPEN/DIRNEXT
+          ' actually still reads (still the deep folder), which is
+          ' exactly what made reopening land back in a deep folder
+          ' with no way to navigate up.
+          WHILE navDepth > 0
+            DIRUP
+            LET navDepth = navDepth - 1
+          WEND
           LET winOpen = 0
         ELSE
           LET dragging = 1
