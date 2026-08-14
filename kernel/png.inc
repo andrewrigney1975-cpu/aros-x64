@@ -1674,33 +1674,3 @@ basix_rt_png_debug:
 basix_rt_png_debug2:
     mov eax, [rel png_debug_inflate_len]
     ret
-
-; TEMP: basix_rt_png_peek_pixel: RCX=x, RDX=y. Returns the raw native-
-; order pixel at png_pixels_ptr[y*width+x], for direct inspection
-; bypassing DRAWPNG/FLIP/screendump entirely.
-basix_rt_png_peek_pixel:
-    push rbx
-    push rsi
-    mov eax, edx
-    imul eax, [rel png_width]
-    add eax, ecx
-    mov rbx, [rel png_pixels_ptr]
-    mov eax, [rbx + rax*4]
-    pop rsi
-    pop rbx
-    ret
-
-; TEMP: basix_rt_png_peek_infl: RCX = byte offset into png_infl_buf_ptr.
-; Returns that byte (0-255), for inspecting the unfiltered scanline
-; buffer directly.
-basix_rt_png_peek_infl:
-    mov rax, [rel png_infl_buf_ptr]
-    movzx eax, byte [rax + rcx]
-    ret
-
-; TEMP: basix_rt_png_peek_abc: RCX = index (0=a,1=b,2=c,3=predictor).
-basix_rt_png_peek_abc:
-    mov ecx, ecx
-    lea rax, [rel png_debug_abc]
-    mov eax, [rax + rcx*4]
-    ret

@@ -1480,12 +1480,6 @@ basix_parse_primary:
     je .do_pngdebug
     cmp eax, TOK_PNGDEBUG2
     je .do_pngdebug2
-    cmp eax, TOK_PNGPEEKPIXEL
-    je .do_pngpeekpixel
-    cmp eax, TOK_PNGPEEKINFL
-    je .do_pngpeekinfl
-    cmp eax, TOK_PNGPEEKABC
-    je .do_pngpeekabc
     cmp eax, TOK_PEEK
     je .do_peek
 
@@ -1607,53 +1601,10 @@ basix_parse_primary:
     xor r11d, r11d                       ; result type = int
     ret
 
-.do_pngpeekpixel:
-    call basix_lex_next
-    mov eax, TOK_LPAREN
-    call basix_expect
-    call basix_parse_int_arg_push        ; x
-    mov eax, TOK_COMMA
-    call basix_expect
-    call basix_parse_int_arg_push        ; y
-    mov eax, TOK_RPAREN
-    call basix_expect
-    call basix_emit_pop_rdx              ; y
-    call basix_emit_pop_rcx              ; x
-    lea rcx, [rel basix_rt_png_peek_pixel]
-    call basix_emit_call_to
-    xor r11d, r11d
-    ret
-
-.do_pngpeekinfl:
-    call basix_lex_next
-    mov eax, TOK_LPAREN
-    call basix_expect
-    call basix_parse_int_arg_push        ; offset
-    mov eax, TOK_RPAREN
-    call basix_expect
-    call basix_emit_pop_rcx              ; offset
-    lea rcx, [rel basix_rt_png_peek_infl]
-    call basix_emit_call_to
-    xor r11d, r11d
-    ret
-
-.do_pngpeekabc:
-    call basix_lex_next
-    mov eax, TOK_LPAREN
-    call basix_expect
-    call basix_parse_int_arg_push        ; index
-    mov eax, TOK_RPAREN
-    call basix_expect
-    call basix_emit_pop_rcx              ; index
-    lea rcx, [rel basix_rt_png_peek_abc]
-    call basix_emit_call_to
-    xor r11d, r11d
-    ret
-
 ; -------------------------------------------------------------------------
 ; PEEK(addr) -- reads one byte from raw memory at addr (any 64-bit
-; address; caller's responsibility that it's mapped). Same one-arg,
-; parenthesized shape as PNGPEEKINFL.
+; address; caller's responsibility that it's mapped). One-arg,
+; parenthesized function shape.
 ; -------------------------------------------------------------------------
 .do_peek:
     call basix_lex_next

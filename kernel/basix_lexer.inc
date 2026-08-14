@@ -127,12 +127,8 @@ TOK_PNGWIDTH equ 100
 TOK_PNGHEIGHT equ 101
 TOK_PNGDEBUG equ 102   ; TEMP: remove once LOADPNG is verified working
 TOK_PNGDEBUG2 equ 103  ; TEMP: remove once LOADPNG is verified working
-TOK_PNGPEEKPIXEL equ 104  ; TEMP: remove once LOADPNG is verified working
-TOK_PNGPEEKINFL equ 105   ; TEMP: remove once LOADPNG is verified working
-TOK_PNGPEEKABC equ 106    ; TEMP: remove once LOADPNG is verified working
-
 ; Raw memory access (expression-level PEEK(addr), statement-level
-; POKE addr, value -- byte granularity, same shape as PNGPEEKINFL/LOCATE)
+; POKE addr, value -- byte granularity, same shape as LOCATE)
 TOK_PEEK    equ 107
 TOK_POKE    equ 108
 
@@ -1201,18 +1197,6 @@ basix_keywords:
     db 9
     dd TOK_PNGDEBUG2
     db 'PNGDEBUG2', 0,0,0,0,0,0,0
-
-    db 12
-    dd TOK_PNGPEEKPIXEL
-    db 'PNGPEEKPIXEL', 0,0,0,0
-
-    db 11
-    dd TOK_PNGPEEKINFL
-    db 'PNGPEEKINFL', 0,0,0,0,0
-
-    db 10
-    dd TOK_PNGPEEKABC
-    db 'PNGPEEKABC', 0,0,0,0,0,0
 
     db 4
     dd TOK_PEEK
