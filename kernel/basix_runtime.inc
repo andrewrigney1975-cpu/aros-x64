@@ -1362,6 +1362,99 @@ basix_rt_keyhit:
     ret
 
 ; -------------------------------------------------------------------------
+; DIROPEN/DIRNEXT/DIRISDIR/DIRNAMELEN/DIRNAMECHAR: directory browsing
+; for a GUI file-manager window. Thin BASIX64 wrappers over exfat.inc's
+; exfat_dir_list_start/exfat_dir_list_next -- DIRNEXT's name/attributes
+; land in basix_dirent_name_buf/basix_dirent_struct, which the other
+; three then read. Same "no string type" shape as ARGLEN/ARGCHAR:
+; DIRNAMELEN is a strlen over the NUL-terminated name buffer (computed
+; fresh each call rather than cached, since it's cheap and keeps this
+; stateless beyond "which entry was last fetched").
+; -------------------------------------------------------------------------
+basix_rt_diropen:
+    call exfat_dir_list_start
+    ret
+
+basix_rt_dirnext:
+    push rcx
+    push rdx
+    lea rcx, [rel basix_dirent_name_buf]
+    lea rdx, [rel basix_dirent_struct]
+    call exfat_dir_list_next
+    pop rdx
+    pop rcx
+    ret
+
+basix_rt_dirisdir:
+    movzx eax, byte [rel basix_dirent_struct+4]
+    and eax, ATTR_DIRECTORY
+    test eax, eax
+    jz .no
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+
+basix_rt_dirnamelen:
+    push rsi
+    lea rsi, [rel basix_dirent_name_buf]
+    xor eax, eax
+.scan:
+    cmp byte [rsi+rax], 0
+    je .done
+    inc eax
+    jmp .scan
+.done:
+    pop rsi
+    ret
+
+basix_rt_dirnamechar:
+    lea rax, [rel basix_dirent_name_buf]
+    movzx eax, byte [rax+rcx]
+    ret
+
+; -------------------------------------------------------------------------
+; DIRCD namearr, namelen: descends into a subdirectory of the current
+; one (exfat_cd_into, exfat.inc) -- shares exfat_cwd_cluster with the
+; shell's OPEN/UP/RUN/COMPILE, not a separate GUI-side cwd. Silent no-
+; op on failure (not found / not a directory / too deep), same "the
+; caller decides how to react" philosophy as LAUNCH -- a GUI caller can
+; check DIRISDIR on the entry it's about to DIRCD into before calling,
+; same as it would check any other precondition.
+; -------------------------------------------------------------------------
+basix_rt_dircd:
+    push rsi
+    push rdi
+
+    cmp edx, BASIX_DIRCD_NAME_BUF_SIZE - 1
+    jbe .len_ok
+    mov edx, BASIX_DIRCD_NAME_BUF_SIZE - 1
+.len_ok:
+    lea rdi, [rel basix_dircd_name_buf]
+    xor esi, esi
+.copy:
+    cmp esi, edx
+    jge .done
+    mov rax, [rcx + rsi*8]
+    mov [rdi + rsi], al
+    inc esi
+    jmp .copy
+.done:
+    mov byte [rdi + rsi], 0
+
+    lea rcx, [rel basix_dircd_name_buf]
+    call exfat_cd_into
+
+    pop rdi
+    pop rsi
+    ret
+
+basix_rt_dirup:
+    call exfat_cd_up
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_rt_drawtext: RCX = string ptr, RDX = string length, R8 = color
 ; (packed 32-bit pixel). x/y come from basix_drawtext_x/y (parser-
 ; stashed globals -- DRAWTEXT takes four values plus the string, one
@@ -1376,11 +1469,8 @@ basix_rt_keyhit:
 ; -------------------------------------------------------------------------
 basix_rt_drawtext:
     push rax
-    push rbx
     push rcx
     push rdx
-    push rsi
-    push rdi
     push r8
     push r9
     push r10
@@ -1388,7 +1478,6 @@ basix_rt_drawtext:
     push r12
     push r13
     push r14
-    push r15
 
     call basix_rt_ensure_backbuf
     cmp qword [rel basix_backbuf_ptr], 0
@@ -1406,9 +1495,80 @@ basix_rt_drawtext:
     jge .out
 
     movzx eax, byte [r13 + r12]
+    call basix_draw_glyph                ; AL=char, R9D=x, R10D=y, R11D=color
+    add r9d, 8                           ; advance to the next glyph column
+    inc r12d
+    jmp .char_loop
+
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_drawchar: RCX = char code, RDX = color. x/y come from
+; basix_drawtext_x/y, same as DRAWTEXT (and set the same way, via
+; basix_parse_int_arg_store) -- the single-glyph sibling of DRAWTEXT,
+; for callers building up text from characters they only have at
+; runtime (DIRNAMECHAR's directory-entry names, ARGCHAR's launch
+; argument) rather than a compile-time string literal.
+; -------------------------------------------------------------------------
+basix_rt_drawchar:
+    push rax
+    push r9
+    push r10
+    push r11
+
+    call basix_rt_ensure_backbuf
+    cmp qword [rel basix_backbuf_ptr], 0
+    je .out
+
+    mov eax, ecx                         ; char code
+    mov r11d, edx                        ; color
+    mov r9d, [rel basix_drawtext_x]
+    mov r10d, [rel basix_drawtext_y]
+    call basix_draw_glyph
+
+.out:
+    pop r11
+    pop r10
+    pop r9
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_draw_glyph: internal helper shared by DRAWTEXT/DRAWCHAR -- not
+; exposed to BASIX64 directly, and NOT bounds-checked against
+; basix_backbuf_ptr itself (callers already did that). AL = char code,
+; R9D = pixel x origin, R10D = pixel y origin, R11D = color (packed
+; 32-bit pixel). Draws one 8x16 glyph (font8x16, the same table the
+; text console uses) into the back buffer, painting only its SET
+; pixels -- unlike fb_draw_char's console-cell text (which paints both
+; set AND clear pixels, replacing the whole cell), this leaves
+; everything else alone, so a label drawn over a colored background/
+; icon doesn't punch an opaque box around itself. Clobbers RAX/RBX/RCX/
+; RDX/RSI/RDI/R8/R15; preserves R9D/R10D/R11D (its own inputs).
+; -------------------------------------------------------------------------
+basix_draw_glyph:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r15
+
     sub eax, 32
     cmp eax, 95                          ; 95 printable glyphs (32..126)
-    jae .next_char                       ; unprintable -- skip, no box drawn
+    jae .out                             ; unprintable -- skip, no box drawn
     shl eax, 4                           ; * 16 bytes per glyph
     lea rsi, [rel font8x16]
     add rsi, rax                         ; rsi = this glyph's 16 scanline bytes
@@ -1416,7 +1576,7 @@ basix_rt_drawtext:
     xor ecx, ecx                         ; ecx = glyph row 0..15
 .row_loop:
     cmp ecx, 16
-    jge .next_char
+    jge .out
     movzx ebx, byte [rsi + rcx]          ; row bits, bit7 = leftmost pixel
     mov edi, r10d
     add edi, ecx                         ; edi = pixel y
@@ -1454,26 +1614,14 @@ basix_rt_drawtext:
     inc ecx
     jmp .row_loop
 
-.next_char:
-    add r9d, 8                           ; advance to the next glyph column
-    inc r12d
-    jmp .char_loop
-
 .out:
     pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
     pop r8
     pop rdi
     pop rsi
     pop rdx
     pop rcx
     pop rbx
-    pop rax
     ret
 
 ; -------------------------------------------------------------------------
@@ -2105,3 +2253,15 @@ basix_rt_argchar:
 .oob:
     xor eax, eax
     ret
+
+; -------------------------------------------------------------------------
+; Directory-browsing scratch (see DIROPEN/DIRNEXT/.../DIRCD above).
+; basix_dirent_struct layout matches exfat_dir_list_next's: [0]=
+; FirstCluster(dd), [4]=FileAttributes(dd), [8]=DataLength(dq).
+; -------------------------------------------------------------------------
+BASIX_DIRCD_NAME_BUF_SIZE equ 64
+
+basix_dirent_name_buf: times 256 db 0
+align 8
+basix_dirent_struct:   times 16 db 0
+basix_dircd_name_buf:  times BASIX_DIRCD_NAME_BUF_SIZE db 0

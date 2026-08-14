@@ -146,6 +146,21 @@ TOK_ARGLEN   equ 115
 TOK_ARGCHAR  equ 116
 TOK_KEYHIT   equ 117
 
+; GUI phase 3 primitives: directory browsing, built on exfat_cd_into/
+; exfat_cd_up/exfat_dir_list_start/exfat_dir_list_next (see exfat.inc
+; and basix_runtime.inc). DIROPEN/DIRNEXT are statements/functions for
+; iterating the current directory's entries; DIRCD/DIRUP navigate it
+; (the same exfat_cwd_cluster the shell's OPEN/UP/RUN/COMPILE all
+; share -- no separate GUI-side cwd concept).
+TOK_DIROPEN    equ 118
+TOK_DIRNEXT    equ 119
+TOK_DIRISDIR   equ 120
+TOK_DIRNAMELEN equ 121
+TOK_DIRNAMECHAR equ 122
+TOK_DIRCD      equ 123
+TOK_DIRUP      equ 124
+TOK_DRAWCHAR   equ 125
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -1255,5 +1270,37 @@ basix_keywords:
     db 6
     dd TOK_KEYHIT
     db 'KEYHIT', 0,0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_DIROPEN
+    db 'DIROPEN', 0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_DIRNEXT
+    db 'DIRNEXT', 0,0,0,0,0,0,0,0,0
+
+    db 8
+    dd TOK_DIRISDIR
+    db 'DIRISDIR', 0,0,0,0,0,0,0,0
+
+    db 10
+    dd TOK_DIRNAMELEN
+    db 'DIRNAMELEN', 0,0,0,0,0,0
+
+    db 11
+    dd TOK_DIRNAMECHAR
+    db 'DIRNAMECHAR', 0,0,0,0,0
+
+    db 5
+    dd TOK_DIRCD
+    db 'DIRCD', 0,0,0,0,0,0,0,0,0,0,0
+
+    db 5
+    dd TOK_DIRUP
+    db 'DIRUP', 0,0,0,0,0,0,0,0,0,0,0
+
+    db 8
+    dd TOK_DRAWCHAR
+    db 'DRAWCHAR', 0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table

@@ -518,6 +518,103 @@ exfat_dir_list_next:
     ret
 
 ; -------------------------------------------------------------------------
+; exfat_cd_into: descends exfat_cwd_cluster into a named subdirectory of
+; the current directory, pushing the old cluster onto exfat_cwd_stack
+; (and its name onto exfat_cwd_name_stack, for anything that wants a
+; breadcrumb) exactly like the shell's OPEN command -- factored out
+; here so BASIX64's DIRCD can share the same navigation state, instead
+; of inventing a second cwd concept. RCX = NUL-terminated name (a
+; single component, no '/' -- same as exfat_find_root_file).
+; Returns EAX = status: 0=ok, 1=not found, 2=not a directory, 3=already
+; at EXFAT_CWD_MAX_DEPTH.
+; -------------------------------------------------------------------------
+exfat_cd_into:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+
+    mov rbx, rcx                        ; rbx = name ptr (needed twice)
+
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jz .notfound
+    test byte [rel exfat_find_result+32], ATTR_DIRECTORY
+    jz .notadir
+
+    mov eax, [rel exfat_cwd_depth]
+    cmp eax, EXFAT_CWD_MAX_DEPTH
+    jge .toodeep
+
+    mov ecx, [rel exfat_cwd_cluster]
+    lea rdx, [rel exfat_cwd_stack]
+    mov [rdx+rax*4], ecx
+
+    push rax
+    mov ecx, eax
+    imul ecx, EXFAT_CWD_NAME_LEN
+    lea rdi, [rel exfat_cwd_name_stack]
+    add rdi, rcx
+    mov rsi, rbx
+    mov ecx, EXFAT_CWD_NAME_LEN
+    cld
+    rep movsb
+    pop rax
+
+    inc eax
+    mov [rel exfat_cwd_depth], eax
+
+    mov eax, [rel exfat_find_result+0]  ; target's FirstCluster
+    mov [rel exfat_cwd_cluster], eax
+    xor eax, eax
+    jmp .out
+
+.notfound:
+    mov eax, 1
+    jmp .out
+.notadir:
+    mov eax, 2
+    jmp .out
+.toodeep:
+    mov eax, 3
+.out:
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_cd_up: pops exfat_cwd_cluster back to its parent, exactly like
+; the shell's UP command. Returns EAX = status: 0=ok, 1=already at root.
+; -------------------------------------------------------------------------
+exfat_cd_up:
+    push rcx
+    push rdx
+
+    mov eax, [rel exfat_cwd_depth]
+    test eax, eax
+    jz .atroot
+    dec eax
+    mov [rel exfat_cwd_depth], eax
+    lea rdx, [rel exfat_cwd_stack]
+    mov ecx, [rdx+rax*4]
+    mov [rel exfat_cwd_cluster], ecx
+    xor eax, eax
+    jmp .out
+.atroot:
+    mov eax, 1
+.out:
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
 ; exfat_bitmap_mount: locates the volume's Allocation Bitmap directory
 ; entry (EntryType 0x81) in the root directory and records its first
 ; cluster + length. Must be called after a successful exfat_mount.

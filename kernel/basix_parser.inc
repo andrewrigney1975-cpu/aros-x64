@@ -1490,6 +1490,35 @@ basix_parse_drawtext:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_parse_drawchar: "DRAWCHAR x, y, charcode, color" -- the single-
+; glyph sibling of DRAWTEXT (basix_rt_drawchar), for text built up from
+; runtime char codes (DIRNAMECHAR, ARGCHAR) rather than a compile-time
+; string literal. x/y stash to the same basix_drawtext_x/y globals
+; DRAWTEXT uses; charcode/color are plain int args, fitting in
+; RCX/RDX with no register pressure.
+; -------------------------------------------------------------------------
+basix_parse_drawchar:
+    lea rax, [rel basix_drawtext_x]
+    call basix_parse_int_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+    lea rax, [rel basix_drawtext_y]
+    call basix_parse_int_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+
+    call basix_parse_int_arg_push        ; charcode
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; color
+
+    call basix_emit_pop_rdx              ; color
+    call basix_emit_pop_rcx              ; charcode
+    lea rcx, [rel basix_rt_drawchar]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_parse_launch: "LAUNCH namearr, namelen, argarr, arglen" -- loads
 ; and jumps into another program the same way RUN does (deep paths and
 ; precompiled .axb included; see basix_rt_launch/basix_load_program),
@@ -1516,6 +1545,24 @@ basix_parse_launch:
     call basix_emit_pop_rdx              ; namelen
     call basix_emit_pop_rcx              ; namearr
     lea rcx, [rel basix_rt_launch]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_dircd: "DIRCD namearr, namelen" -- descends into a
+; subdirectory of the current one (basix_rt_dircd/exfat_cd_into). Same
+; bare-int-array shape as LAUNCH's namearr, just two args instead of
+; four.
+; -------------------------------------------------------------------------
+basix_parse_dircd:
+    call basix_parse_int_arg_push        ; namearr (base ptr)
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; namelen
+
+    call basix_emit_pop_rdx              ; namelen
+    call basix_emit_pop_rcx              ; namearr
+    lea rcx, [rel basix_rt_dircd]
     call basix_emit_call_to
     ret
 
@@ -1640,6 +1687,14 @@ basix_parse_primary:
     je .do_argchar
     cmp eax, TOK_KEYHIT
     je .do_keyhit
+    cmp eax, TOK_DIRNEXT
+    je .do_dirnext
+    cmp eax, TOK_DIRISDIR
+    je .do_dirisdir
+    cmp eax, TOK_DIRNAMELEN
+    je .do_dirnamelen
+    cmp eax, TOK_DIRNAMECHAR
+    je .do_dirnamechar
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
@@ -1816,6 +1871,36 @@ basix_parse_primary:
 .do_keyhit:
     call basix_lex_next                  ; bare keyword, no parens/args
     lea rcx, [rel basix_rt_keyhit]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_dirnext:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_dirnext]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_dirisdir:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_dirisdir]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_dirnamelen:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_dirnamelen]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_dirnamechar:
+    call basix_lex_next
+    mov eax, TOK_LPAREN
+    call basix_expect
+    call basix_parse_int_arg_push        ; index
+    mov eax, TOK_RPAREN
+    call basix_expect
+    call basix_emit_pop_rcx              ; index
+    lea rcx, [rel basix_rt_dirnamechar]
     call basix_emit_call_to
     xor r11d, r11d                       ; result type = int
     ret
@@ -3340,6 +3425,14 @@ basix_parse_statement:
     je .do_drawtext
     cmp r15d, TOK_LAUNCH
     je .do_launch
+    cmp r15d, TOK_DIROPEN
+    je .do_diropen
+    cmp r15d, TOK_DIRCD
+    je .do_dircd
+    cmp r15d, TOK_DIRUP
+    je .do_dirup
+    cmp r15d, TOK_DRAWCHAR
+    je .do_drawchar
     cmp r15d, TOK_IDENT
     je .do_ident_stmt
 
@@ -3452,6 +3545,25 @@ basix_parse_statement:
 .do_launch:
     call basix_lex_next
     call basix_parse_launch
+    jmp .out
+
+.do_diropen:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_diropen]
+    call basix_emit_call_to
+    jmp .out
+.do_dircd:
+    call basix_lex_next
+    call basix_parse_dircd
+    jmp .out
+.do_dirup:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_dirup]
+    call basix_emit_call_to
+    jmp .out
+.do_drawchar:
+    call basix_lex_next
+    call basix_parse_drawchar
     jmp .out
 
 .do_ident_stmt:
