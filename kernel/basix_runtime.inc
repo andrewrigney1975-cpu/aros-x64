@@ -1361,18 +1361,6 @@ basix_rt_keyhit:
     call kbd_has_char
     ret
 
-; TEMP debug accessors for mouse.inc's bring-up counters -- remove once
-; real mouse input is verified working end to end.
-basix_rt_mirqcnt:
-    mov eax, [rel mouse_irq_count]
-    ret
-basix_rt_mpktcnt:
-    mov eax, [rel mouse_packet_count]
-    ret
-basix_rt_mdropcnt:
-    mov eax, [rel mouse_resync_drops]
-    ret
-
 ; -------------------------------------------------------------------------
 ; basix_rt_drawtext: RCX = string ptr, RDX = string length, R8 = color
 ; (packed 32-bit pixel). x/y come from basix_drawtext_x/y (parser-

@@ -161,24 +161,17 @@ mouse_irq_stub:
     push rcx
     push rdx
 
-    inc dword [rel mouse_irq_count]       ; TEMP debug counters, see the
-                                           ; comment on mouse_irq_count
-
     in al, 0x60
     movzx ecx, byte [rel mouse_packet_idx]
     test ecx, ecx
     jnz .not_first_byte
     test al, 0x08                        ; byte 0's sync bit must be set --
-    jz .resync_drop                      ; otherwise we're out of alignment
+    jz .eoi                              ; otherwise we're out of alignment
                                           ; (e.g. after a dropped IRQ); drop
                                           ; this byte and wait for a real
                                           ; first byte instead of ever
                                           ; decoding a permanently-desynced
                                           ; stream
-    jmp .not_first_byte
-.resync_drop:
-    inc dword [rel mouse_resync_drops]
-    jmp .eoi
 .not_first_byte:
     lea rdx, [rel mouse_packet]
     mov [rdx+rcx], al
@@ -231,7 +224,6 @@ mouse_irq_stub:
 .y_ok:
     mov [rel mouse_y], edx
 
-    inc dword [rel mouse_packet_count]
     xor ecx, ecx
 .store_idx:
     mov [rel mouse_packet_idx], ecx
@@ -257,13 +249,3 @@ mouse_fb_width:    dd 0
 mouse_fb_height:   dd 0
 mouse_packet:      times 3 db 0
 mouse_packet_idx:  dd 0
-
-; TEMP debug counters, bring-up only -- remove once real mouse input is
-; verified working end to end. mouse_irq_count: total IRQ12 firings.
-; mouse_packet_count: full 3-byte packets successfully decoded.
-; mouse_resync_drops: bytes dropped because byte 0's sync bit (0x08)
-; wasn't set -- if this tracks mouse_irq_count closely, the byte stream
-; is arriving out of alignment with what this driver expects.
-mouse_irq_count:     dd 0
-mouse_packet_count:  dd 0
-mouse_resync_drops:  dd 0

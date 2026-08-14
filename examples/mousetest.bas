@@ -13,11 +13,5 @@ WHILE 1
   PRINT "Y: ", MOUSEY, "        "
   LOCATE 6, 2
   PRINT "BTN: ", MOUSEBTN, "        "
-  LOCATE 7, 2
-  PRINT "IRQ COUNT:  ", MIRQCNT, "        "
-  LOCATE 8, 2
-  PRINT "PKT COUNT:  ", MPKTCNT, "        "
-  LOCATE 9, 2
-  PRINT "SYNC DROPS: ", MDROPCNT, "        "
   WAIT 5
 WEND

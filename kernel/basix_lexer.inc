@@ -145,10 +145,6 @@ TOK_LAUNCH   equ 114
 TOK_ARGLEN   equ 115
 TOK_ARGCHAR  equ 116
 TOK_KEYHIT   equ 117
-; TEMP: remove once real mouse input is verified working end to end
-TOK_MIRQCNT  equ 118
-TOK_MPKTCNT  equ 119
-TOK_MDROPCNT equ 120
 
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
@@ -1259,17 +1255,5 @@ basix_keywords:
     db 6
     dd TOK_KEYHIT
     db 'KEYHIT', 0,0,0,0,0,0,0,0,0,0
-
-    db 7
-    dd TOK_MIRQCNT
-    db 'MIRQCNT', 0,0,0,0,0,0,0,0,0
-
-    db 7
-    dd TOK_MPKTCNT
-    db 'MPKTCNT', 0,0,0,0,0,0,0,0,0
-
-    db 8
-    dd TOK_MDROPCNT
-    db 'MDROPCNT', 0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table
