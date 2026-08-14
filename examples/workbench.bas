@@ -3,6 +3,15 @@
 ' desktop is redrawn every frame (no dirty-rect tracking yet -- fine at
 ' this resolution/complexity; revisit if it's ever too slow). Press
 ' Escape to exit back to the text shell.
+'
+' WAIT 2 (~50fps cap) below is deliberate, not just pacing: an
+' uncapped CLS/RECT/DRAWTEXT/FLIP loop is the heaviest sustained
+' interrupt/stack load anything in this codebase has produced so far,
+' and it's been observed to eventually wedge the master PIC (a stuck
+' IRQ0 in-service bit that blocks IRQ1/keyboard -- a real, still-
+' unfixed kernel bug, not specific to this program). Capping the frame
+' rate is a mitigation, not a fix -- remove it once the underlying
+' interrupt-handling bug is actually root-caused.
 
 LET sw = SCREENW
 LET sh = SCREENH
@@ -37,4 +46,5 @@ WHILE 1
   RECT mx - 3, my - 3, 6, 6, 16777215
 
   FLIP
+  WAIT 2
 WEND
