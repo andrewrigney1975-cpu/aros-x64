@@ -113,6 +113,24 @@ mouse_install:
 
     mov dword [rel mouse_packet_idx], 0
 
+    ; Cache the framebuffer dimensions now, while RBX is guaranteed to
+    ; be boot_info* (mouse_install runs from the kernel's main boot
+    ; flow, which never clobbers it -- see entry's header comment in
+    ; kernel.asm). mouse_irq_stub reads these cached globals instead of
+    ; [rbx+FB_WIDTH]/[rbx+FB_HEIGHT] directly: RBX is NOT reliably
+    ; boot_info* at interrupt time in general -- IRQ12 can preempt any
+    ; currently-running code, including the scheduler's background
+    ; test tasks, which use RBX for their own purposes with no
+    ; obligation to keep it pointed at boot_info. Reading a stale/
+    ; unrelated RBX there previously made FB_WIDTH/FB_HEIGHT read as
+    ; ~0, which made the clamp-to-max branch permanently collapse
+    ; mouse_x/mouse_y to 0-1 (0xFFFFFFFF) on the first packet that hit
+    ; it.
+    mov eax, [rbx+FB_WIDTH]
+    mov [rel mouse_fb_width], eax
+    mov eax, [rbx+FB_HEIGHT]
+    mov [rel mouse_fb_height], eax
+
     mov rcx, 44                         ; vector 32 + IRQ12
     lea rdx, [rel mouse_irq_stub]
     call idt_set_gate
@@ -129,11 +147,13 @@ mouse_install:
 ; -------------------------------------------------------------------------
 ; mouse_irq_stub: IRQ12 handler. Accumulates one 3-byte packet
 ; (buttons+sign flags, delta-X, delta-Y), then on the 3rd byte decodes
-; the signed deltas, updates mouse_x/mouse_y (clamped to the real
-; framebuffer's dimensions -- rbx holds boot_info for the whole kernel's
-; lifetime, safe to read here) and mouse_btn, and resets for the next
-; packet. Y is inverted (PS/2 reports +Y as "up"; screen/framebuffer +Y
-; is "down").
+; the signed deltas, updates mouse_x/mouse_y (clamped to
+; mouse_fb_width/mouse_fb_height -- cached copies of the framebuffer's
+; dimensions, NOT read from RBX/boot_info here; RBX is only reliably
+; boot_info* in the kernel's main flow, not at arbitrary interrupt time
+; -- see mouse_install's comment) and mouse_btn, and resets for the
+; next packet. Y is inverted (PS/2 reports +Y as "up"; screen/
+; framebuffer +Y is "down").
 ; -------------------------------------------------------------------------
 mouse_irq_stub:
     push rax
@@ -141,17 +161,24 @@ mouse_irq_stub:
     push rcx
     push rdx
 
+    inc dword [rel mouse_irq_count]       ; TEMP debug counters, see the
+                                           ; comment on mouse_irq_count
+
     in al, 0x60
     movzx ecx, byte [rel mouse_packet_idx]
     test ecx, ecx
     jnz .not_first_byte
     test al, 0x08                        ; byte 0's sync bit must be set --
-    jz .eoi                              ; otherwise we're out of alignment
+    jz .resync_drop                      ; otherwise we're out of alignment
                                           ; (e.g. after a dropped IRQ); drop
                                           ; this byte and wait for a real
                                           ; first byte instead of ever
                                           ; decoding a permanently-desynced
                                           ; stream
+    jmp .not_first_byte
+.resync_drop:
+    inc dword [rel mouse_resync_drops]
+    jmp .eoi
 .not_first_byte:
     lea rdx, [rel mouse_packet]
     mov [rdx+rcx], al
@@ -162,7 +189,11 @@ mouse_irq_stub:
     ; full packet: decode
     xor ecx, ecx
     movzx eax, byte [rdx+0]              ; flags byte
-    mov [rel mouse_btn], al
+    mov ebx, eax
+    and ebx, MOUSE_PKT_LBTN | MOUSE_PKT_RBTN | MOUSE_PKT_MBTN
+    mov [rel mouse_btn], ebx             ; button bits only -- the raw
+                                          ; flags byte always has bit3
+                                          ; (the sync bit) set too
 
     movzx ecx, byte [rdx+1]              ; raw dx (0-255)
     test al, MOUSE_PKT_XSIGN
@@ -181,9 +212,9 @@ mouse_irq_stub:
     jns .x_nonneg
     xor edx, edx
 .x_nonneg:
-    cmp edx, [rbx+FB_WIDTH]
+    cmp edx, [rel mouse_fb_width]
     jl .x_ok
-    mov edx, [rbx+FB_WIDTH]
+    mov edx, [rel mouse_fb_width]
     dec edx
 .x_ok:
     mov [rel mouse_x], edx
@@ -193,13 +224,14 @@ mouse_irq_stub:
     jns .y_nonneg
     xor edx, edx
 .y_nonneg:
-    cmp edx, [rbx+FB_HEIGHT]
+    cmp edx, [rel mouse_fb_height]
     jl .y_ok
-    mov edx, [rbx+FB_HEIGHT]
+    mov edx, [rel mouse_fb_height]
     dec edx
 .y_ok:
     mov [rel mouse_y], edx
 
+    inc dword [rel mouse_packet_count]
     xor ecx, ecx
 .store_idx:
     mov [rel mouse_packet_idx], ecx
@@ -221,5 +253,17 @@ mouse_irq_stub:
 mouse_x:           dd 0
 mouse_y:           dd 0
 mouse_btn:         dd 0
+mouse_fb_width:    dd 0
+mouse_fb_height:   dd 0
 mouse_packet:      times 3 db 0
 mouse_packet_idx:  dd 0
+
+; TEMP debug counters, bring-up only -- remove once real mouse input is
+; verified working end to end. mouse_irq_count: total IRQ12 firings.
+; mouse_packet_count: full 3-byte packets successfully decoded.
+; mouse_resync_drops: bytes dropped because byte 0's sync bit (0x08)
+; wasn't set -- if this tracks mouse_irq_count closely, the byte stream
+; is arriving out of alignment with what this driver expects.
+mouse_irq_count:     dd 0
+mouse_packet_count:  dd 0
+mouse_resync_drops:  dd 0

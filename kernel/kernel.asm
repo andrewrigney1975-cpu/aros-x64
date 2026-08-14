@@ -3091,6 +3091,12 @@ shell_dispatch:
     jnz .do_compile
 
     lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_gui]
+    call shell_streq
+    test eax, eax
+    jnz .do_gui
+
+    lea rcx, [rel shell_cmd_buf]
     lea rdx, [rel shell_str_del]
     call shell_streq
     test eax, eax
@@ -3477,6 +3483,34 @@ shell_dispatch:
 .compile_writefail:
     mov [rel exfat_cwd_cluster], r14d
     lea rcx, [rel msg_shell_compile_writefail]
+    call console_puts
+    jmp .out
+
+; -------------------------------------------------------------------------
+; GUI -- launches WORKBENCH.BAS (the desktop shell) exactly like RUN,
+; via the shared basix_load_program. When it exits (its own END, e.g.
+; on Escape), the screen is left showing whatever the GUI last drew
+; (drawn straight to the visible framebuffer via FLIP, bypassing the
+; text console entirely) -- fb_clear it and reset the console cursor
+; so the shell prompt reappears on a clean screen instead of on top of
+; stale desktop pixels.
+; -------------------------------------------------------------------------
+.do_gui:
+    lea rcx, [rel gui_program_name]
+    call basix_load_program
+    test eax, eax
+    jnz .gui_load_failed
+
+    call basix_code_buf
+    mov dword [rel fb_text_color], 0xFFFFFFFF
+
+    call fb_clear
+    mov dword [rel console_row], 0
+    mov dword [rel console_col], 0
+    jmp .out
+
+.gui_load_failed:
+    lea rcx, [rel msg_shell_gui_notfound]
     call console_puts
     jmp .out
 
@@ -4588,6 +4622,7 @@ shell_str_type:  db 'type', 0
 shell_str_write: db 'write', 0
 shell_str_run:   db 'run', 0
 shell_str_compile: db 'compile', 0
+shell_str_gui:      db 'gui', 0
 
 apps_dirname: db 'APPS', 0
 shell_str_del:      db 'del', 0
@@ -4605,7 +4640,7 @@ msg_shell_banner:      db 'arOS-X64 shell. Type HELP for commands.', 13, 10, 0
 msg_shell_prompt:      db ' > : ', 0
 msg_shell_help:        db 'Commands: HELP  DIR  TREE  TYPE <file>  WRITE <file> <text>  APPEND <file> <text>', 13, 10
                        db '  DEL <file>  RENAME <old> <new>  TRUNCATE <file> <size>  CLEAR', 13, 10
-                       db '  RUN <file.bas|file.axb>  COMPILE <source.bas> <output.axb>', 13, 10
+                       db '  RUN <file.bas|file.axb>  COMPILE <source.bas> <output.axb>  GUI', 13, 10
                        db '  MKDIR <name>  RMDIR <name>  OPEN <name>  UP  MOVE <file> <folder>', 13, 10, 0
 msg_shell_unknown:     db 'Unknown command. Type HELP for a list.', 13, 10, 0
 msg_shell_nl:          db 13, 10, 0
@@ -4628,6 +4663,9 @@ msg_shell_compile_usage:      db 'Usage: COMPILE <source.bas> <output.axb>', 13,
 msg_shell_compile_ok:         db 'Compiled.', 13, 10, 0
 msg_shell_compile_badpath:    db 'Bad path (a component is missing or not a directory).', 13, 10, 0
 msg_shell_compile_writefail:  db 'Write failed (name may already exist).', 13, 10, 0
+msg_shell_gui_notfound:       db 'WORKBENCH.BAS not found (or failed to compile).', 13, 10, 0
+
+gui_program_name: db 'WORKBENCH.BAS', 0
 msg_shell_del_usage:  db 'Usage: DEL <filename>', 13, 10, 0
 msg_shell_del_ok:     db 'File deleted.', 13, 10, 0
 msg_shell_del_fail:   db 'Delete failed (file may not exist).', 13, 10, 0

@@ -1351,6 +1351,29 @@ basix_rt_mousebtn:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_rt_keyhit: no arguments. Returns 1 if a decoded keystroke is
+; waiting (kbd_has_char, keyboard.inc), else 0 -- never blocks, unlike
+; GETKEY, so a GUI main loop can check for an exit key without stalling
+; mouse polling/redraw. Safe to follow with an unconditional GETKEY once
+; this returns 1: that GETKEY is then guaranteed not to block either.
+; -------------------------------------------------------------------------
+basix_rt_keyhit:
+    call kbd_has_char
+    ret
+
+; TEMP debug accessors for mouse.inc's bring-up counters -- remove once
+; real mouse input is verified working end to end.
+basix_rt_mirqcnt:
+    mov eax, [rel mouse_irq_count]
+    ret
+basix_rt_mpktcnt:
+    mov eax, [rel mouse_packet_count]
+    ret
+basix_rt_mdropcnt:
+    mov eax, [rel mouse_resync_drops]
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_rt_drawtext: RCX = string ptr, RDX = string length, R8 = color
 ; (packed 32-bit pixel). x/y come from basix_drawtext_x/y (parser-
 ; stashed globals -- DRAWTEXT takes four values plus the string, one

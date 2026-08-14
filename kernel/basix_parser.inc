@@ -1638,6 +1638,14 @@ basix_parse_primary:
     je .do_arglen
     cmp eax, TOK_ARGCHAR
     je .do_argchar
+    cmp eax, TOK_KEYHIT
+    je .do_keyhit
+    cmp eax, TOK_MIRQCNT
+    je .do_mirqcnt
+    cmp eax, TOK_MPKTCNT
+    je .do_mpktcnt
+    cmp eax, TOK_MDROPCNT
+    je .do_mdropcnt
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
@@ -1808,6 +1816,30 @@ basix_parse_primary:
     call basix_expect
     call basix_emit_pop_rcx              ; index
     lea rcx, [rel basix_rt_argchar]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_keyhit:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_keyhit]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_mirqcnt:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_mirqcnt]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_mpktcnt:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_mpktcnt]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_mdropcnt:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_mdropcnt]
     call basix_emit_call_to
     xor r11d, r11d                       ; result type = int
     ret
