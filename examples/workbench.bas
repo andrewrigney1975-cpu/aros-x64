@@ -8,6 +8,10 @@
 ' to go back up. Navigation shares exfat_cwd_cluster with the text
 ' shell's OPEN/UP/RUN/COMPILE -- DIRCD/DIRUP are not a separate GUI-
 ' side concept.
+' Phase 4: double-click a file entry to open it -- .BAS launches
+' EDITOR.BAS, .PNG launches VIEWER.BAS (both passed this file's name
+' as their LAUNCH argument, which they read via ARGLEN/ARGCHAR), .AXB
+' launches straight into the compiled binary itself.
 '
 ' WAIT 2 (~50fps cap) below is deliberate, not just pacing: an
 ' uncapped CLS/RECT/DRAWTEXT/FLIP loop is the heaviest sustained
@@ -23,10 +27,18 @@
 ' time (this is a single-pass compiler), not at runtime, so a GOTO
 ' skipping past RESCAN below does NOT help if RESCAN's body were
 ' parsed before these DIMs. Keep all DIMs first.
+' entChars stores each entry's FULL name (up to 32 chars) even though
+' only the first 12 are ever drawn (see the render loop's dispLen) --
+' truncating storage itself to the display cap would chop off longer
+' filenames' extensions (e.g. "CUBE_ROTATE_2AXIS.BAS" -> 12 chars is
+' just "CUBE_ROTATE_"), breaking the double-click file-type check
+' below, which looks at the last 4 characters of the FULL name.
 DIM entIsDir(40) AS INTEGER
-DIM entChars(480) AS INTEGER
+DIM entChars(1280) AS INTEGER
 DIM entNameLen(40) AS INTEGER
-DIM navName(16) AS INTEGER
+DIM nameBuf(32) AS INTEGER
+DIM editorProgName(16) AS INTEGER
+DIM viewerProgName(16) AS INTEGER
 
 GOTO START
 
@@ -40,10 +52,10 @@ RESCAN:
     IF entCount < 40 THEN
       LET entIsDir[entCount] = DIRISDIR
       LET nlen = DIRNAMELEN
-      IF nlen > 12 THEN LET nlen = 12
+      IF nlen > 32 THEN LET nlen = 32
       LET j = 0
       WHILE j < nlen
-        LET entChars[entCount * 12 + j] = DIRNAMECHAR(j)
+        LET entChars[entCount * 32 + j] = DIRNAMECHAR(j)
         LET j = j + 1
       WEND
       LET entNameLen[entCount] = nlen
@@ -53,6 +65,33 @@ RESCAN:
   RETURN
 
 START:
+
+' "/EDITOR.BAS" and "/VIEWER.BAS" -- leading slash forces root-relative
+' resolution (exfat_resolve_path) regardless of how deep DIRCD has
+' navigated, since both programs live at the disk's root.
+LET editorProgName[0] = 47
+LET editorProgName[1] = 69
+LET editorProgName[2] = 68
+LET editorProgName[3] = 73
+LET editorProgName[4] = 84
+LET editorProgName[5] = 79
+LET editorProgName[6] = 82
+LET editorProgName[7] = 46
+LET editorProgName[8] = 66
+LET editorProgName[9] = 65
+LET editorProgName[10] = 83
+
+LET viewerProgName[0] = 47
+LET viewerProgName[1] = 86
+LET viewerProgName[2] = 73
+LET viewerProgName[3] = 69
+LET viewerProgName[4] = 87
+LET viewerProgName[5] = 69
+LET viewerProgName[6] = 82
+LET viewerProgName[7] = 46
+LET viewerProgName[8] = 66
+LET viewerProgName[9] = 65
+LET viewerProgName[10] = 83
 
 LET sw = SCREENW
 LET sh = SCREENH
@@ -174,15 +213,63 @@ WHILE 1
               IF cidx >= first THEN
                 LET ei = cidx - first
                 IF ei < entCount THEN
+                  LET p = 0
+                  WHILE p < entNameLen[ei]
+                    LET nameBuf[p] = entChars[ei * 32 + p]
+                    LET p = p + 1
+                  WEND
+
                   IF entIsDir[ei] = 1 THEN
-                    LET p = 0
-                    WHILE p < entNameLen[ei]
-                      LET navName[p] = entChars[ei * 12 + p]
-                      LET p = p + 1
-                    WEND
-                    DIRCD navName, entNameLen[ei]
+                    DIRCD nameBuf, entNameLen[ei]
                     LET navDepth = navDepth + 1
                     GOSUB RESCAN
+                  ELSE
+                    ' File: figure out its type from the last 4 chars
+                    ' of its full name (".BAS"/".AXB"/".PNG",
+                    ' case-insensitive) and LAUNCH the right viewer,
+                    ' passing this file's own name as its argument --
+                    ' both resolve relative to the current directory
+                    ' (exfat_cwd_cluster), which LAUNCH never changes.
+                    LET isBas = 0
+                    LET isAxb = 0
+                    LET isPng = 0
+                    LET nl = entNameLen[ei]
+                    IF nl >= 4 THEN
+                      LET c0 = entChars[ei * 32 + nl - 4]
+                      LET c1 = entChars[ei * 32 + nl - 3]
+                      LET c2 = entChars[ei * 32 + nl - 2]
+                      LET c3 = entChars[ei * 32 + nl - 1]
+                      IF c1 >= 97 THEN
+                      IF c1 <= 122 THEN LET c1 = c1 - 32
+                      ENDIF
+                      IF c2 >= 97 THEN
+                      IF c2 <= 122 THEN LET c2 = c2 - 32
+                      ENDIF
+                      IF c3 >= 97 THEN
+                      IF c3 <= 122 THEN LET c3 = c3 - 32
+                      ENDIF
+                      IF c0 = 46 THEN
+                        IF c1 = 66 THEN
+                        IF c2 = 65 THEN
+                        IF c3 = 83 THEN LET isBas = 1
+                        ENDIF
+                        ENDIF
+                        IF c1 = 65 THEN
+                        IF c2 = 88 THEN
+                        IF c3 = 66 THEN LET isAxb = 1
+                        ENDIF
+                        ENDIF
+                        IF c1 = 80 THEN
+                        IF c2 = 78 THEN
+                        IF c3 = 71 THEN LET isPng = 1
+                        ENDIF
+                        ENDIF
+                      ENDIF
+                    ENDIF
+
+                    IF isBas = 1 THEN LAUNCH editorProgName, 11, nameBuf, entNameLen[ei]
+                    IF isPng = 1 THEN LAUNCH viewerProgName, 11, nameBuf, entNameLen[ei]
+                    IF isAxb = 1 THEN LAUNCH nameBuf, entNameLen[ei], nameBuf, 0
                   ENDIF
                 ENDIF
               ENDIF
@@ -288,9 +375,11 @@ WHILE 1
         RECT ex, ey, 2, iconBoxH, 0
         RECT ex + iconBoxW - 2, ey, 2, iconBoxH, 0
 
+        LET dispLen = entNameLen[ei]
+        IF dispLen > 12 THEN LET dispLen = 12
         LET nk = 0
-        WHILE nk < entNameLen[ei]
-          DRAWCHAR ex + nk * 6, ey + iconBoxH + 4, entChars[ei * 12 + nk], 0
+        WHILE nk < dispLen
+          DRAWCHAR ex + nk * 6, ey + iconBoxH + 4, entChars[ei * 32 + nk], 0
           LET nk = nk + 1
         WEND
       ENDIF

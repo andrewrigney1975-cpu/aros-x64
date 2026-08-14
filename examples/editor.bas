@@ -96,6 +96,25 @@ LET COL_ORANGE = 14251863
 
 GOSUB clear_all
 
+' If launched with an argument (e.g. Workbench double-clicking a .BAS
+' icon -- see LAUNCH/ARGLEN/ARGCHAR), treat it as a filename to open
+' immediately, same FLOAD call the L=Load menu action uses. ARGLEN is 0
+' when started via plain RUN, so this is a no-op then.
+IF ARGLEN > 0 THEN
+  LET fnamelen = ARGLEN
+  IF fnamelen > 64 THEN LET fnamelen = 64
+  LET i = 0
+  WHILE i < fnamelen
+    LET fname[i] = ARGCHAR(i)
+    LET i = i + 1
+  WEND
+  LET readn = FLOAD(fname, fnamelen, buf, 1048576)
+  LET buflen = readn
+  LET cur = 0
+  LET scrolltop = 0
+  LET modified = 0
+ENDIF
+
 main_loop:
 GOSUB redraw
 LET k = GETKEY

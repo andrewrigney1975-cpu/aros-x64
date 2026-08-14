@@ -51,6 +51,26 @@ LET CONTENT_Y = 5 * CHAR_H
 
 GOSUB clear_all
 
+' If launched with an argument (e.g. Workbench double-clicking a .PNG
+' icon -- see LAUNCH/ARGLEN/ARGCHAR), treat it as a filename to open
+' immediately, same LOADPNG call the L=Load menu action uses. ARGLEN
+' is 0 when started via plain RUN, so this is a no-op then.
+IF ARGLEN > 0 THEN
+  LET fnamelen = ARGLEN
+  IF fnamelen > 64 THEN LET fnamelen = 64
+  LET i = 0
+  WHILE i < fnamelen
+    LET fname[i] = ARGCHAR(i)
+    LET i = i + 1
+  WEND
+  LET loadok = LOADPNG(fname, fnamelen)
+  IF loadok = 1 THEN
+    LET loaded = 1
+    LET imgw = PNGWIDTH
+    LET imgh = PNGHEIGHT
+  ENDIF
+ENDIF
+
 main_loop:
 GOSUB redraw
 LET k = GETKEY
