@@ -3466,6 +3466,14 @@ shell_dispatch:
                                          ; changed as a side effect
     mov [rel exfat_cwd_cluster], r12d
 
+    ; basix_axb_header_buf is shared with RUN/LAUNCH's .axb-loading
+    ; path, which overwrites it with whatever kernel_id an OLD file on
+    ; disk claims (to compare it against this build's real one) -- if
+    ; that ever ran earlier in this session, bytes 4-7 here no longer
+    ; hold this build's true BASIX_AXB_KERNEL_ID. Always write the real
+    ; constant explicitly rather than trusting it "still" holds the
+    ; value it was statically initialized with.
+    mov dword [rel basix_axb_header_buf+4], BASIX_AXB_KERNEL_ID
     mov eax, [rel basix_code_pos]
     mov [rel basix_axb_header_buf+8], eax  ; code_size
 

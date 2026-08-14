@@ -653,12 +653,18 @@ basix_code_buf: times BASIX_CODE_BUF_SIZE db 0
 ; relocation table (a real one would need codegen to record every such
 ; patch site instead of just applying it -- not built here).
 ; BASIX_AXB_KERNEL_ID is the guard against the mismatch that would
-; otherwise cause: bump it by hand whenever a kernel rebuild changes
-; anything an already-compiled .AXB's absolute-patched CALLs depend on
-; (basix_rt_* functions added/removed/reordered, basix_code_buf's
-; address, etc.) -- RUN refuses to load an .AXB whose stamped ID
+; otherwise cause -- RUN/LAUNCH refuse to load an .AXB whose stamped ID
 ; doesn't match this build's, rather than jumping into addresses that
-; may no longer mean what they meant at compile time.
+; may no longer mean what they meant at compile time. scripts/build.sh
+; passes a fresh value (`date +%s`) on every build via `-D
+; BASIX_AXB_KERNEL_ID=...`, so ANY kernel rebuild automatically
+; invalidates old .AXBs -- this used to be a hand-maintained constant
+; someone had to remember to bump whenever basix_rt_* functions moved,
+; and predictably went un-bumped across many rebuilds in one dev
+; session: an hours-old .AXB loaded fine (kernel_id "matched" the
+; never-changed default) and froze the moment it called a runtime
+; function whose address had since shifted. The %ifndef below is only
+; a fallback for assembling outside scripts/build.sh (e.g. by hand).
 ;
 ; Layout (16-byte header + raw code bytes, code_size of them):
 ;   +0  magic       db 'AXB1'
@@ -666,7 +672,9 @@ basix_code_buf: times BASIX_CODE_BUF_SIZE db 0
 ;   +8  code_size   dd  bytes following the header
 ;   +12 reserved    dd  0
 ; =========================================================================
+%ifndef BASIX_AXB_KERNEL_ID
 BASIX_AXB_KERNEL_ID equ 1
+%endif
 
 basix_axb_header_buf:
     db 'AXB1'
