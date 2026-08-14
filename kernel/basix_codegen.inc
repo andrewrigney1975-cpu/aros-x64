@@ -641,3 +641,35 @@ basix_code_pos: dd 0
 
 align 16
 basix_code_buf: times BASIX_CODE_BUF_SIZE db 0
+
+; =========================================================================
+; .AXB (arOS eXecutable Binary): COMPILE's output format and RUN's fast
+; -load path for it. basix_code_buf is a fixed, non-relocatable address
+; baked into this specific KERNEL.BIN (see this file's top comment) --
+; basix_emit_call_to patches CALLs to basix_rt_* runtime helpers as
+; rel32 offsets computed against wherever the code actually ends up in
+; basix_code_buf, so an .AXB is only ever valid when copied back into
+; that exact same buffer under the exact same kernel build. There is no
+; relocation table (a real one would need codegen to record every such
+; patch site instead of just applying it -- not built here).
+; BASIX_AXB_KERNEL_ID is the guard against the mismatch that would
+; otherwise cause: bump it by hand whenever a kernel rebuild changes
+; anything an already-compiled .AXB's absolute-patched CALLs depend on
+; (basix_rt_* functions added/removed/reordered, basix_code_buf's
+; address, etc.) -- RUN refuses to load an .AXB whose stamped ID
+; doesn't match this build's, rather than jumping into addresses that
+; may no longer mean what they meant at compile time.
+;
+; Layout (16-byte header + raw code bytes, code_size of them):
+;   +0  magic       db 'AXB1'
+;   +4  kernel_id   dd  BASIX_AXB_KERNEL_ID
+;   +8  code_size   dd  bytes following the header
+;   +12 reserved    dd  0
+; =========================================================================
+BASIX_AXB_KERNEL_ID equ 1
+
+basix_axb_header_buf:
+    db 'AXB1'
+    dd BASIX_AXB_KERNEL_ID
+    dd 0                                  ; code_size -- patched per COMPILE
+    dd 0                                  ; reserved

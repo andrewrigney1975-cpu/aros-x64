@@ -3445,17 +3445,17 @@ basix_heap_init:
     ret
 
 ; -------------------------------------------------------------------------
-; basix_compile_reset_state: shared by basix_compile/basix_compile_file
-; -- clears every piece of per-compile state (variables, labels,
-; fixups, FOR nesting, the array arena, the emitted-code position, and
-; the overall ok flag) before a fresh compile begins. Touches no
-; registers beyond EAX-free `mov [mem], imm` forms, so it's safe to
-; call before either entry point has finished unpacking its own
-; incoming arguments out of RCX/RDX/R8.
+; basix_runtime_reset_state: clears every piece of per-run state that
+; isn't the emitted code itself or the ok flag -- variables, labels,
+; fixups, FOR nesting, the array arena, the string-literal pool. Split
+; out of basix_compile_reset_state so RUN's AXB fast-load path (which
+; supplies basix_code_buf/basix_code_pos itself, by copying a
+; precompiled binary straight off disk instead of running the
+; lexer/parser/codegen) can still get a clean runtime without re-doing
+; compile-only bookkeeping. Touches no registers beyond EAX-free
+; `mov [mem], imm` forms.
 ; -------------------------------------------------------------------------
-basix_compile_reset_state:
-    mov dword [rel basix_compile_ok], 1
-    mov dword [rel basix_code_pos], 0
+basix_runtime_reset_state:
     mov dword [rel basix_var_count], 0
     mov dword [rel basix_label_count], 0
     mov dword [rel basix_fixup_count], 0
@@ -3463,6 +3463,18 @@ basix_compile_reset_state:
     mov dword [rel basix_array_arena_pos], 0
     mov dword [rel basix_strlit_pool_pos], 0
     ret
+
+; -------------------------------------------------------------------------
+; basix_compile_reset_state: shared by basix_compile/basix_compile_file
+; -- on top of basix_runtime_reset_state, also resets the emitted-code
+; position and the overall ok flag before a fresh compile begins. Safe
+; to call before either entry point has finished unpacking its own
+; incoming arguments out of RCX/RDX/R8.
+; -------------------------------------------------------------------------
+basix_compile_reset_state:
+    mov dword [rel basix_compile_ok], 1
+    mov dword [rel basix_code_pos], 0
+    jmp basix_runtime_reset_state
 
 ; -------------------------------------------------------------------------
 ; basix_compile: RCX = ptr to a NUL-terminated BASIX64 source buffer

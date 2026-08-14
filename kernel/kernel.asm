@@ -1148,6 +1148,20 @@ entry:
     call serial_puts
 .basixtest_done:
 
+    ; Ensure APPS/ exists at exFAT root -- COMPILE's default landing
+    ; spot for .axb output, so it's always there without the user
+    ; having to MKDIR it by hand first. Idempotent: exfat_cwd_cluster
+    ; is still root here (nothing before this point OPENs into a
+    ; subdirectory), so a plain root-relative find/create is enough.
+    lea rcx, [rel apps_dirname]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .apps_dir_ready
+    lea rcx, [rel apps_dirname]
+    call exfat_create_dir
+.apps_dir_ready:
+
     call shell_main                     ; never returns
 
 .hang:
@@ -2973,6 +2987,12 @@ shell_dispatch:
     jnz .do_run
 
     lea rcx, [rel shell_cmd_buf]
+    lea rdx, [rel shell_str_compile]
+    call shell_streq
+    test eax, eax
+    jnz .do_compile
+
+    lea rcx, [rel shell_cmd_buf]
     lea rdx, [rel shell_str_del]
     call shell_streq
     test eax, eax
@@ -3200,12 +3220,61 @@ shell_dispatch:
     test ecx, ecx
     jz .run_usage
 
+    ; exfat_resolve_path (not exfat_find_root_file) so a deep path like
+    ; "GRAPHICS/cube.bas" or "/APPS/foo.axb" works directly, the same
+    ; way editor/viewer's OPEN-then-bare-name navigation does, but
+    ; without needing an OPEN first and without touching cwd.
     lea rcx, [rel shell_arg_buf]
     lea r8, [rel exfat_find_result]
-    call exfat_find_root_file
+    call exfat_resolve_path
     test eax, eax
     jz .run_notfound
 
+    ; Sniff the first 4 bytes for the "AXB1" magic (COMPILE's output --
+    ; see basix_codegen.inc's .AXB format comment) before deciding how
+    ; to get a program into basix_code_buf: a precompiled binary is
+    ; copied straight in (no lex/parse/codegen at all -- the whole
+    ; point), anything else stream-compiles from source exactly as RUN
+    ; always has.
+    cmp qword [rel exfat_find_result+8], 4   ; DataLength >= 4?
+    jb .run_source
+
+    mov ecx, [rel exfat_find_result+0]  ; FirstCluster
+    xor edx, edx                        ; offset 0
+    mov r8d, 16
+    lea r9, [rel basix_axb_header_buf]
+    mov r10d, [rel exfat_find_result+16] ; NoFatChain
+    call exfat_read_file_at             ; preserves RCX/R10 across the
+                                         ; call -- both still hold
+                                         ; FirstCluster/NoFatChain below
+    test eax, eax
+    jz .run_source                      ; header read failed -- fall back
+
+    mov eax, [rel basix_axb_header_buf+0]
+    cmp eax, 0x31425841                 ; 'A','X','B','1' little-endian
+    jne .run_source
+
+    mov eax, [rel basix_axb_header_buf+4]  ; kernel_id
+    cmp eax, BASIX_AXB_KERNEL_ID
+    jne .run_axb_stale
+
+    mov r11d, [rel basix_axb_header_buf+8] ; code_size
+    cmp r11d, BASIX_CODE_BUF_SIZE
+    ja .run_axb_stale                   ; too big to be a real match -- refuse
+
+    mov edx, 16                         ; code bytes start right after the header
+    mov r8d, r11d
+    lea r9, [rel basix_code_buf]
+    call exfat_read_file_at
+    test eax, eax
+    jz .run_axb_stale
+
+    mov [rel basix_code_pos], r11d
+    mov dword [rel basix_compile_ok], 1
+    call basix_runtime_reset_state
+    jmp .run_go
+
+.run_source:
     ; Stream-compile straight from exFAT (basix_compile_file /
     ; basix_lex_init_stream) instead of reading the whole program into
     ; one buffer first -- program size is no longer bounded by
@@ -3219,6 +3288,7 @@ shell_dispatch:
     test eax, eax
     jz .run_compilefail
 
+.run_go:
     call basix_code_buf
     mov dword [rel fb_text_color], 0xFFFFFFFF  ; a program may leave COLOR
                                                 ; set to something other than
@@ -3235,6 +3305,136 @@ shell_dispatch:
     jmp .out
 .run_compilefail:
     lea rcx, [rel msg_shell_run_compilefail]
+    call console_puts
+    jmp .out
+.run_axb_stale:
+    lea rcx, [rel msg_shell_run_axb_stale]
+    call console_puts
+    jmp .out
+
+; -------------------------------------------------------------------------
+; COMPILE <source.bas> <output.axb> -- runs the same basix_compile_file
+; pipeline RUN uses, but instead of jumping into the result, serializes
+; basix_code_buf to disk as an .AXB (see basix_codegen.inc's format
+; comment) so it can be loaded straight back by RUN's fast path later
+; without re-running the lexer/parser/codegen at all. Both filename
+; arguments accept deep paths ("GRAPHICS/cube.bas", "APPS/foo.axb");
+; the destination's parent directory must already exist (APPS/ is
+; created once at boot -- see the mount sequence).
+; -------------------------------------------------------------------------
+.do_compile:
+    lea rdi, [rel shell_arg_buf]
+    xor ecx, ecx
+.compile_copy1:
+    mov al, [rsi]
+    test al, al
+    jz .compile_arg1_done
+    cmp al, ' '
+    je .compile_arg1_done
+    cmp ecx, 63
+    jge .compile_arg1_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .compile_copy1
+.compile_arg1_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .compile_usage
+
+.compile_skip_sp:
+    cmp byte [rsi], ' '
+    jne .compile_copy2_start
+    inc rsi
+    jmp .compile_skip_sp
+.compile_copy2_start:
+    lea rdi, [rel shell_arg_buf2]
+    xor ecx, ecx
+.compile_copy2:
+    mov al, [rsi]
+    test al, al
+    jz .compile_arg2_done
+    cmp al, ' '
+    je .compile_arg2_done
+    cmp ecx, 63
+    jge .compile_arg2_done
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .compile_copy2
+.compile_arg2_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .compile_usage
+
+    lea rcx, [rel shell_arg_buf]
+    lea r8, [rel exfat_find_result]
+    call exfat_resolve_path
+    test eax, eax
+    jz .compile_notfound
+
+    mov ecx, [rel exfat_find_result+0]  ; FirstCluster
+    mov rdx, [rel exfat_find_result+8]  ; DataLength
+    mov r8d, [rel exfat_find_result+16] ; NoFatChain
+    call basix_compile_file
+    test eax, eax
+    jz .compile_compilefail
+
+    lea rcx, [rel shell_arg_buf2]
+    call exfat_resolve_parent_dir
+    test eax, eax
+    jz .compile_badpath
+    mov r12d, ecx                       ; r12d = destination parent cluster
+    mov r13, rdx                        ; r13 = ptr to final filename component
+
+    mov r14d, [rel exfat_cwd_cluster]   ; save cwd -- exfat_write_file/
+                                         ; exfat_append_file both operate
+                                         ; against it, and COMPILE must
+                                         ; not leave the shell's cwd
+                                         ; changed as a side effect
+    mov [rel exfat_cwd_cluster], r12d
+
+    mov eax, [rel basix_code_pos]
+    mov [rel basix_axb_header_buf+8], eax  ; code_size
+
+    mov rcx, r13
+    lea r8, [rel basix_axb_header_buf]
+    mov r9, 16
+    call exfat_write_file
+    test eax, eax
+    jz .compile_writefail
+
+    mov rcx, r13
+    lea r8, [rel basix_code_buf]
+    mov r9d, [rel basix_code_pos]
+    call exfat_append_file
+    test eax, eax
+    jz .compile_writefail
+
+    mov [rel exfat_cwd_cluster], r14d
+    lea rcx, [rel msg_shell_compile_ok]
+    call console_puts
+    jmp .out
+
+.compile_usage:
+    lea rcx, [rel msg_shell_compile_usage]
+    call console_puts
+    jmp .out
+.compile_notfound:
+    lea rcx, [rel msg_shell_notfound]
+    call console_puts
+    jmp .out
+.compile_compilefail:
+    lea rcx, [rel msg_shell_run_compilefail]
+    call console_puts
+    jmp .out
+.compile_badpath:
+    lea rcx, [rel msg_shell_compile_badpath]
+    call console_puts
+    jmp .out
+.compile_writefail:
+    mov [rel exfat_cwd_cluster], r14d
+    lea rcx, [rel msg_shell_compile_writefail]
     call console_puts
     jmp .out
 
@@ -4345,6 +4545,9 @@ shell_str_clear: db 'clear', 0
 shell_str_type:  db 'type', 0
 shell_str_write: db 'write', 0
 shell_str_run:   db 'run', 0
+shell_str_compile: db 'compile', 0
+
+apps_dirname: db 'APPS', 0
 shell_str_del:      db 'del', 0
 shell_str_rename:   db 'rename', 0
 shell_str_append:   db 'append', 0
@@ -4359,7 +4562,8 @@ shell_str_rmdir:      db 'rmdir', 0
 msg_shell_banner:      db 'arOS-X64 shell. Type HELP for commands.', 13, 10, 0
 msg_shell_prompt:      db ' > : ', 0
 msg_shell_help:        db 'Commands: HELP  DIR  TREE  TYPE <file>  WRITE <file> <text>  APPEND <file> <text>', 13, 10
-                       db '  DEL <file>  RENAME <old> <new>  TRUNCATE <file> <size>  RUN <file.bas>  CLEAR', 13, 10
+                       db '  DEL <file>  RENAME <old> <new>  TRUNCATE <file> <size>  CLEAR', 13, 10
+                       db '  RUN <file.bas|file.axb>  COMPILE <source.bas> <output.axb>', 13, 10
                        db '  MKDIR <name>  RMDIR <name>  OPEN <name>  UP  MOVE <file> <folder>', 13, 10, 0
 msg_shell_unknown:     db 'Unknown command. Type HELP for a list.', 13, 10, 0
 msg_shell_nl:          db 13, 10, 0
@@ -4375,8 +4579,13 @@ msg_shell_readfail:    db 'Error reading file.', 13, 10, 0
 msg_shell_write_usage: db 'Usage: WRITE <filename> <text>', 13, 10, 0
 msg_shell_write_ok:    db 'File written.', 13, 10, 0
 msg_shell_write_fail:  db 'Write failed (name may already exist).', 13, 10, 0
-msg_shell_run_usage:       db 'Usage: RUN <filename.bas>', 13, 10, 0
+msg_shell_run_usage:       db 'Usage: RUN <filename.bas|filename.axb>', 13, 10, 0
 msg_shell_run_compilefail: db 'BASIX64 compile error.', 13, 10, 0
+msg_shell_run_axb_stale:   db 'That .axb was compiled for a different kernel build (or is corrupt) -- recompile it.', 13, 10, 0
+msg_shell_compile_usage:      db 'Usage: COMPILE <source.bas> <output.axb>', 13, 10, 0
+msg_shell_compile_ok:         db 'Compiled.', 13, 10, 0
+msg_shell_compile_badpath:    db 'Bad path (a component is missing or not a directory).', 13, 10, 0
+msg_shell_compile_writefail:  db 'Write failed (name may already exist).', 13, 10, 0
 msg_shell_del_usage:  db 'Usage: DEL <filename>', 13, 10, 0
 msg_shell_del_ok:     db 'File deleted.', 13, 10, 0
 msg_shell_del_fail:   db 'Delete failed (file may not exist).', 13, 10, 0

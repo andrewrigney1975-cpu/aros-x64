@@ -1539,9 +1539,25 @@ exfat_name_matches:
     ret
 
 ; -------------------------------------------------------------------------
-; exfat_find_root_file: scans the root directory (following its FAT chain)
-; for a File entry whose name matches.
+; exfat_find_root_file: scans the current directory (exfat_cwd_cluster,
+; following its FAT chain) for a File entry whose name matches. Thin
+; wrapper over exfat_find_in_dir -- see that routine for the full
+; parameter/result-struct doc; kept as its own entry point since every
+; existing caller in this codebase already calls it with this exact
+; RCX/R8 signature.
+; -------------------------------------------------------------------------
+exfat_find_root_file:
+    mov edx, [rel exfat_cwd_cluster]
+    jmp exfat_find_in_dir
+
+; -------------------------------------------------------------------------
+; exfat_find_in_dir: like exfat_find_root_file, but scans an explicitly
+; given starting directory cluster instead of always reading
+; exfat_cwd_cluster -- the primitive exfat_resolve_path descends through
+; one path component at a time, without ever touching exfat_cwd_cluster
+; itself.
 ;   RCX = pointer to the NUL-terminated ASCII target name
+;   EDX = starting directory cluster
 ;   R8  = pointer to a result struct: [0]=FirstCluster(dd), [8]=DataLength(dq),
 ;         [16]=NoFatChain(dd, nonzero if the file is contiguously allocated
 ;         with no real FAT chain -- common for freshly-written files, and
@@ -1558,7 +1574,7 @@ exfat_name_matches:
 ;         exfat_find_result buffer.
 ; Returns EAX=1/0.
 ; -------------------------------------------------------------------------
-exfat_find_root_file:
+exfat_find_in_dir:
     push rbx
     push rcx
     push rdx
@@ -1572,7 +1588,7 @@ exfat_find_root_file:
     mov r12, r8                         ; r12 = result output ptr
     mov r11, rcx                        ; r11 = target name ptr
 
-    mov ecx, [rel exfat_cwd_cluster]
+    mov ecx, edx                        ; ecx = starting cluster
 .cluster_loop:
     mov r10d, ecx                       ; r10d = current cluster
     lea r8, [rel exfat_dir_buf]
@@ -1662,6 +1678,200 @@ exfat_find_root_file:
     pop rsi
     pop rdx
     pop rcx
+    pop rbx
+    ret
+
+BASIX_PATH_COMPONENT_MAX equ 64
+exfat_path_component_buf: times BASIX_PATH_COMPONENT_MAX db 0
+
+; -------------------------------------------------------------------------
+; exfat_resolve_path: like exfat_find_root_file, but RCX's name may be a
+; full '/'-separated path ("GRAPHICS/cube.bas") instead of a single bare
+; filename -- a plain name with no slash behaves identically to
+; exfat_find_root_file (resolved against exfat_cwd_cluster), so this is a
+; drop-in replacement everywhere a caller wants deep-path support (COMPILE/
+; RUN's filename arguments). A leading '/' resolves from
+; exfat_root_dir_cluster instead of cwd. Every non-final component must
+; already exist and be a directory (ATTR_DIRECTORY); the final component
+; is looked up the ordinary way and may be a file or a directory.
+; exfat_cwd_cluster itself is never read after the initial branch, nor
+; written -- this never changes "current directory" as a side effect.
+;   RCX = NUL-terminated path
+;   R8  = result struct ptr (see exfat_find_in_dir)
+; Returns EAX=1/0.
+; -------------------------------------------------------------------------
+exfat_resolve_path:
+    push rbx
+    push rdx
+    push rsi
+    push rdi
+    push r9
+    push r14
+    push r15
+
+    mov r14, r8                          ; r14 = caller's result ptr
+    mov rsi, rcx                         ; rsi = path cursor
+
+    cmp byte [rsi], '/'
+    jne .rel_start
+    inc rsi
+    mov r15d, [rel exfat_root_dir_cluster]
+    jmp .component_loop
+.rel_start:
+    mov r15d, [rel exfat_cwd_cluster]
+
+.component_loop:
+    cmp byte [rsi], 0
+    je .bad_path                         ; trailing slash / empty path
+
+    lea rdi, [rel exfat_path_component_buf]
+    xor ecx, ecx
+.copy_component:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .component_done
+    cmp al, '/'
+    je .component_done
+    cmp ecx, BASIX_PATH_COMPONENT_MAX - 1
+    jge .bad_path                        ; component too long
+    mov [rdi+rcx], al
+    inc ecx
+    inc rsi
+    jmp .copy_component
+.component_done:
+    mov byte [rdi+rcx], 0
+    test ecx, ecx
+    jz .bad_path                         ; empty component ("//")
+
+    cmp byte [rsi], '/'
+    je .not_last
+
+    lea rcx, [rel exfat_path_component_buf]
+    mov edx, r15d
+    mov r8, r14
+    call exfat_find_in_dir
+    jmp .out
+
+.not_last:
+    inc rsi                              ; skip the '/'
+    lea rcx, [rel exfat_path_component_buf]
+    mov edx, r15d
+    mov r8, r14
+    call exfat_find_in_dir
+    test eax, eax
+    jz .out                              ; not found -- eax already 0
+    test byte [r14+32], ATTR_DIRECTORY
+    jz .bad_path                         ; a path component that isn't a folder
+    mov r15d, [r14+0]                    ; descend into it
+    jmp .component_loop
+
+.bad_path:
+    xor eax, eax
+.out:
+    pop r15
+    pop r14
+    pop r9
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; exfat_resolve_parent_dir: resolves everything up to (but not including)
+; a path's final component -- e.g. for "APPS/foo.axb", walks into APPS/
+; and hands back its cluster, without ever creating or looking up
+; "foo.axb" itself and without touching exfat_cwd_cluster. Used by
+; writers (COMPILE) that need the destination directory's cluster so
+; they can point exfat_cwd_cluster at it temporarily, then call the
+; ordinary single-component exfat_create_file/exfat_write_file with just
+; the filename part. A bare filename (no slash) resolves to the current
+; exfat_cwd_cluster unchanged, same as today's plain-name behavior.
+;   RCX = NUL-terminated path
+; Returns EAX=1/0; on success ECX = resolved parent directory cluster,
+; RDX = pointer to the final component (a suffix of the RCX string, e.g.
+; "foo.axb"), NUL-terminated exactly like the original path was.
+; -------------------------------------------------------------------------
+exfat_resolve_parent_dir:
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r14
+    push r15
+
+    mov rsi, rcx                        ; rsi = path cursor
+    cmp byte [rsi], '/'
+    jne .rel_start
+    inc rsi
+    mov r15d, [rel exfat_root_dir_cluster]
+    jmp .component_loop
+.rel_start:
+    mov r15d, [rel exfat_cwd_cluster]
+
+.component_loop:
+    mov r14, rsi                        ; r14 = start of this component
+.scan_component:
+    cmp byte [rsi], 0
+    je .last_is_here
+    cmp byte [rsi], '/'
+    je .have_separator
+    inc rsi
+    jmp .scan_component
+
+.have_separator:
+    cmp rsi, r14
+    je .bad_path                        ; empty component ("//")
+    mov r9, rsi
+    sub r9, r14                         ; r9 = component length
+    cmp r9, BASIX_PATH_COMPONENT_MAX - 1
+    jge .bad_path
+
+    lea rdi, [rel exfat_path_component_buf]
+    xor r8d, r8d
+.copyloop:
+    cmp r8, r9
+    jge .copydone
+    mov al, [r14+r8]
+    mov [rdi+r8], al
+    inc r8
+    jmp .copyloop
+.copydone:
+    mov byte [rdi+r8], 0
+
+    lea rcx, [rel exfat_path_component_buf]
+    mov edx, r15d
+    lea r8, [rel exfat_find_result]     ; scratch: intermediate hop only,
+                                         ; the caller's own lookup (if any)
+                                         ; always happens after this returns
+    call exfat_find_in_dir
+    test eax, eax
+    jz .fail
+    test byte [rel exfat_find_result+32], ATTR_DIRECTORY
+    jz .bad_path                        ; a path component that isn't a folder
+    mov r15d, [rel exfat_find_result+0] ; descend into it
+    inc rsi                             ; skip the '/'
+    jmp .component_loop
+
+.last_is_here:
+    cmp rsi, r14
+    je .bad_path                        ; trailing slash, e.g. "APPS/"
+    mov ecx, r15d                       ; return: parent cluster
+    mov rdx, r14                        ; return: ptr to final component
+    mov eax, 1
+    jmp .out
+
+.bad_path:
+.fail:
+    xor eax, eax
+.out:
+    pop r15
+    pop r14
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
     pop rbx
     ret
 
