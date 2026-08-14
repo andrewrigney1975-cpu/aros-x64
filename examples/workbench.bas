@@ -39,6 +39,8 @@ DIM entNameLen(40) AS INTEGER
 DIM nameBuf(32) AS INTEGER
 DIM editorProgName(16) AS INTEGER
 DIM viewerProgName(16) AS INTEGER
+DIM diskIconName(16) AS INTEGER
+DIM closeIconName(16) AS INTEGER
 
 GOTO START
 
@@ -92,6 +94,55 @@ LET viewerProgName[7] = 46
 LET viewerProgName[8] = 66
 LET viewerProgName[9] = 65
 LET viewerProgName[10] = 83
+
+' "ICONDISK.PNG" and "ICONCLOSE.PNG" -- icon art (scripts/gen_icons.py).
+' Bare (cwd-relative), NOT root-relative like the program names above:
+' LOADPNG/FSAVE/FLOAD resolve paths via basix_resolve_dir_path
+' (basix_runtime.inc), a different/older resolver than RUN/COMPILE/
+' LAUNCH's exfat_resolve_path -- it does NOT special-case a leading
+' '/' as "start from root" (a real bug there, not yet fixed; a bare
+' leading '/' makes it look up an empty-named subdirectory and fail
+' immediately). Bare names work correctly at the disk's root, which
+' is where these icons live and where the desktop icon/close gadget
+' spend most of their time being drawn; if the window is open on a
+' deep folder when they redraw, LOADPNG will fail here and the
+' existing plain-RECT fallback below covers it gracefully instead of
+' showing nothing.
+'
+' LOADPNG has only one decoded-image slot (DRAWPNG always blits
+' whichever was LOADPNG'd most recently -- see kernel/png.inc), so
+' these are (re)loaded right before each is drawn rather than once at
+' startup; both are drawn at most once per frame, so that's two
+' decodes/frame, not a problem. The window grid's folder/file icons
+' stay plain RECTs for now -- there can be dozens of those in one
+' frame, and redecoding a PNG per icon per frame would be a real cost
+' at ~50fps.
+LET diskIconName[0] = 73
+LET diskIconName[1] = 67
+LET diskIconName[2] = 79
+LET diskIconName[3] = 78
+LET diskIconName[4] = 68
+LET diskIconName[5] = 73
+LET diskIconName[6] = 83
+LET diskIconName[7] = 75
+LET diskIconName[8] = 46
+LET diskIconName[9] = 80
+LET diskIconName[10] = 78
+LET diskIconName[11] = 71
+
+LET closeIconName[0] = 73
+LET closeIconName[1] = 67
+LET closeIconName[2] = 79
+LET closeIconName[3] = 78
+LET closeIconName[4] = 67
+LET closeIconName[5] = 76
+LET closeIconName[6] = 79
+LET closeIconName[7] = 83
+LET closeIconName[8] = 69
+LET closeIconName[9] = 46
+LET closeIconName[10] = 80
+LET closeIconName[11] = 78
+LET closeIconName[12] = 71
 
 LET sw = SCREENW
 LET sh = SCREENH
@@ -329,13 +380,22 @@ WHILE 1
   CLS 11184810
 
   RECT 0, 0, sw, 20, 8947660
+  RECT 0, 18, sw, 2, 0
   DRAWTEXT 6, 3, "arOS-X64 Workbench", 16777215
 
-  RECT iconX, iconY, iconW, iconH, 16777215
-  RECT iconX, iconY, iconW, 2, 0
-  RECT iconX, iconY + iconH - 2, iconW, 2, 0
-  RECT iconX, iconY, 2, iconH, 0
-  RECT iconX + iconW - 2, iconY, 2, iconH, 0
+  LET diskLoaded = LOADPNG(diskIconName, 12)
+  IF diskLoaded = 1 THEN
+    DRAWPNG iconX, iconY
+  ELSE
+    ' Fallback if the icon art isn't staged on this VHD -- same plain
+    ' box Phase 1-3 always drew, so a missing icon file degrades
+    ' gracefully instead of leaving a blank hole.
+    RECT iconX, iconY, iconW, iconH, 16777215
+    RECT iconX, iconY, iconW, 2, 0
+    RECT iconX, iconY + iconH - 2, iconW, 2, 0
+    RECT iconX, iconY, 2, iconH, 0
+    RECT iconX + iconW - 2, iconY, 2, iconH, 0
+  ENDIF
   DRAWTEXT iconX - 8, iconY + iconH + 6, "AROSTEST", 0
   IF selected = 1 THEN
     IF winOpen = 0 THEN
@@ -349,8 +409,16 @@ WHILE 1
   IF winOpen = 1 THEN
     RECT winX, winY, winW, winH, 11184810
     RECT winX, winY, winW, titleH, 8947660
+    RECT winX, winY, winW, 1, 16777215
+    RECT winX, winY + titleH - 1, winW, 1, 0
     DRAWTEXT winX + 6, winY + 2, "AROSTEST", 16777215
-    RECT winX + winW - closeW - 2, winY + 2, closeW, titleH - 4, 16777215
+
+    LET closeLoaded = LOADPNG(closeIconName, 13)
+    IF closeLoaded = 1 THEN
+      DRAWPNG winX + winW - closeW - 2, winY + 2
+    ELSE
+      RECT winX + winW - closeW - 2, winY + 2, closeW, titleH - 4, 16777215
+    ENDIF
 
     LET gx = winX + 10
     LET gy = winY + titleH + 8
