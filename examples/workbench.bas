@@ -24,7 +24,7 @@
 ' skipping past RESCAN below does NOT help if RESCAN's body were
 ' parsed before these DIMs. Keep all DIMs first.
 DIM entIsDir(40) AS INTEGER
-DIM entChars(640) AS INTEGER
+DIM entChars(480) AS INTEGER
 DIM entNameLen(40) AS INTEGER
 DIM navName(16) AS INTEGER
 
@@ -40,10 +40,10 @@ RESCAN:
     IF entCount < 40 THEN
       LET entIsDir[entCount] = DIRISDIR
       LET nlen = DIRNAMELEN
-      IF nlen > 16 THEN LET nlen = 16
+      IF nlen > 12 THEN LET nlen = 12
       LET j = 0
       WHILE j < nlen
-        LET entChars[entCount * 16 + j] = DIRNAMECHAR(j)
+        LET entChars[entCount * 12 + j] = DIRNAMECHAR(j)
         LET j = j + 1
       WEND
       LET entNameLen[entCount] = nlen
@@ -64,18 +64,20 @@ LET iconH = 32
 LET selected = 0
 
 LET winOpen = 0
-LET winX = 120
-LET winY = 60
-LET winW = 320
-LET winH = 220
+LET winX = 100
+LET winY = 50
+LET winW = 420
+LET winH = 300
 LET titleH = 18
 LET closeW = 14
 
 LET gridCols = 4
-LET cellW = 70
+LET cellW = 95
 LET cellH = 58
 LET iconBoxW = 40
 LET iconBoxH = 28
+LET maxRows = (winH - titleH - 18) / cellH
+LET maxSlots = gridCols * maxRows
 
 LET navDepth = 0
 LET entCount = 0
@@ -150,11 +152,13 @@ WHILE 1
         LET first = 0
         IF navDepth > 0 THEN LET first = 1
         LET clickedSomething = 0
-        IF first = 1 THEN
-          IF cidx = 0 THEN LET clickedSomething = 1
-        ENDIF
-        IF cidx >= first THEN
-          IF cidx - first < entCount THEN LET clickedSomething = 1
+        IF cidx < maxSlots THEN
+          IF first = 1 THEN
+            IF cidx = 0 THEN LET clickedSomething = 1
+          ENDIF
+          IF cidx >= first THEN
+            IF cidx - first < entCount THEN LET clickedSomething = 1
+          ENDIF
         ENDIF
 
         IF clickedSomething = 1 THEN
@@ -173,7 +177,7 @@ WHILE 1
                   IF entIsDir[ei] = 1 THEN
                     LET p = 0
                     WHILE p < entNameLen[ei]
-                      LET navName[p] = entChars[ei * 16 + p]
+                      LET navName[p] = entChars[ei * 12 + p]
                       LET p = p + 1
                     WEND
                     DIRCD navName, entNameLen[ei]
@@ -271,23 +275,25 @@ WHILE 1
     LET ei = 0
     WHILE ei < entCount
       LET didx = drawIdx + ei
-      LET dcol = didx MOD gridCols
-      LET drow = didx / gridCols
-      LET ex = gx + dcol * cellW
-      LET ey = gy + drow * cellH
-      LET ifill = 16777215
-      IF entIsDir[ei] = 1 THEN LET ifill = 11184810
-      RECT ex, ey, iconBoxW, iconBoxH, ifill
-      RECT ex, ey, iconBoxW, 2, 0
-      RECT ex, ey + iconBoxH - 2, iconBoxW, 2, 0
-      RECT ex, ey, 2, iconBoxH, 0
-      RECT ex + iconBoxW - 2, ey, 2, iconBoxH, 0
+      IF didx < maxSlots THEN
+        LET dcol = didx MOD gridCols
+        LET drow = didx / gridCols
+        LET ex = gx + dcol * cellW
+        LET ey = gy + drow * cellH
+        LET ifill = 16777215
+        IF entIsDir[ei] = 1 THEN LET ifill = 11184810
+        RECT ex, ey, iconBoxW, iconBoxH, ifill
+        RECT ex, ey, iconBoxW, 2, 0
+        RECT ex, ey + iconBoxH - 2, iconBoxW, 2, 0
+        RECT ex, ey, 2, iconBoxH, 0
+        RECT ex + iconBoxW - 2, ey, 2, iconBoxH, 0
 
-      LET nk = 0
-      WHILE nk < entNameLen[ei]
-        DRAWCHAR ex + nk * 6, ey + iconBoxH + 4, entChars[ei * 16 + nk], 0
-        LET nk = nk + 1
-      WEND
+        LET nk = 0
+        WHILE nk < entNameLen[ei]
+          DRAWCHAR ex + nk * 6, ey + iconBoxH + 4, entChars[ei * 12 + nk], 0
+          LET nk = nk + 1
+        WEND
+      ENDIF
 
       LET ei = ei + 1
     WEND
