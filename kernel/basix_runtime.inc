@@ -1261,6 +1261,23 @@ basix_rt_locate:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_rt_peek: RCX = address. Returns the byte at that address (0-255)
+; zero-extended in EAX. No bounds checking -- a BASIX64 program can fault
+; the kernel with a bad address, same as real PEEK on classic 8-bit BASIC.
+; -------------------------------------------------------------------------
+basix_rt_peek:
+    movzx eax, byte [rcx]
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_poke: RCX = address, RDX = value. Writes value & 0xFF to that
+; address. No bounds checking, same caveat as basix_rt_peek.
+; -------------------------------------------------------------------------
+basix_rt_poke:
+    mov [rcx], dl
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_rt_set_text_color: RCX = color as a standard 0x00RRGGBB packed
 ; value (bits 16-23=R, 8-15=G, 0-7=B), unlike PSET/LINE's raw
 ; native-pixel-order color args -- text is drawn one glyph at a time via

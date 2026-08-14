@@ -1239,6 +1239,23 @@ basix_parse_locate:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_parse_poke: "POKE addr, value" -- writes one byte (value & 0xFF)
+; to raw memory at addr. Same comma-separated, no-parens statement shape
+; as LOCATE/PSET.
+; -------------------------------------------------------------------------
+basix_parse_poke:
+    call basix_parse_int_arg_push        ; addr
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; value
+
+    call basix_emit_pop_rdx              ; value
+    call basix_emit_pop_rcx              ; addr
+    lea rcx, [rel basix_rt_poke]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_parse_drawpng: "DRAWPNG x, y" -- blits the most recently LOADPNG'd
 ; image into the graphics back buffer at (x, y), clipped to the back
 ; buffer's own bounds (see basix_rt_drawpng). Same "comma-separated,
@@ -1469,6 +1486,8 @@ basix_parse_primary:
     je .do_pngpeekinfl
     cmp eax, TOK_PNGPEEKABC
     je .do_pngpeekabc
+    cmp eax, TOK_PEEK
+    je .do_peek
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
@@ -1629,6 +1648,24 @@ basix_parse_primary:
     lea rcx, [rel basix_rt_png_peek_abc]
     call basix_emit_call_to
     xor r11d, r11d
+    ret
+
+; -------------------------------------------------------------------------
+; PEEK(addr) -- reads one byte from raw memory at addr (any 64-bit
+; address; caller's responsibility that it's mapped). Same one-arg,
+; parenthesized shape as PNGPEEKINFL.
+; -------------------------------------------------------------------------
+.do_peek:
+    call basix_lex_next
+    mov eax, TOK_LPAREN
+    call basix_expect
+    call basix_parse_int_arg_push        ; addr
+    mov eax, TOK_RPAREN
+    call basix_expect
+    call basix_emit_pop_rcx              ; addr
+    lea rcx, [rel basix_rt_peek]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
     ret
 
 ; -------------------------------------------------------------------------
@@ -3139,6 +3176,8 @@ basix_parse_statement:
     je .do_putchar
     cmp r15d, TOK_LOCATE
     je .do_locate
+    cmp r15d, TOK_POKE
+    je .do_poke
     cmp r15d, TOK_COLOR
     je .do_color
     cmp r15d, TOK_DRAWPNG
@@ -3230,6 +3269,10 @@ basix_parse_statement:
 .do_locate:
     call basix_lex_next
     call basix_parse_locate
+    jmp .out
+.do_poke:
+    call basix_lex_next
+    call basix_parse_poke
     jmp .out
 .do_color:
     call basix_lex_next

@@ -131,6 +131,11 @@ TOK_PNGPEEKPIXEL equ 104  ; TEMP: remove once LOADPNG is verified working
 TOK_PNGPEEKINFL equ 105   ; TEMP: remove once LOADPNG is verified working
 TOK_PNGPEEKABC equ 106    ; TEMP: remove once LOADPNG is verified working
 
+; Raw memory access (expression-level PEEK(addr), statement-level
+; POKE addr, value -- byte granularity, same shape as PNGPEEKINFL/LOCATE)
+TOK_PEEK    equ 107
+TOK_POKE    equ 108
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -1208,5 +1213,13 @@ basix_keywords:
     db 10
     dd TOK_PNGPEEKABC
     db 'PNGPEEKABC', 0,0,0,0,0,0
+
+    db 4
+    dd TOK_PEEK
+    db 'PEEK', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_POKE
+    db 'POKE', 0,0,0,0,0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table
