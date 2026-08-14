@@ -310,6 +310,101 @@ basix_rt_cls:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_rt_rect: RCX = color. x/y/w/h are read from basix_rect_x/y/w/h
+; (fixed globals the parser stores into via basix_parse_int_arg_store --
+; RECT takes five int arguments, one more than fit in RCX/RDX/R8/R9, so
+; it follows LINE/TRIFILL's convention of stashing all-but-the-last
+; through globals instead of registers). Fills the (clipped) rectangle
+; in the back buffer with a plain row-at-a-time rep stosd -- no
+; blending, same hard-fill semantics as CLS.
+; -------------------------------------------------------------------------
+basix_rt_rect:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    call basix_rt_ensure_backbuf
+    cmp qword [rel basix_backbuf_ptr], 0
+    je .out
+
+    mov r10d, ecx                        ; r10d = color
+    mov ecx, [rel basix_rect_x]
+    mov edx, [rel basix_rect_y]
+    mov r8d, [rel basix_rect_w]
+    mov r9d, [rel basix_rect_h]
+
+    ; Clip x/w to [0, backbuf_w)
+    test ecx, ecx
+    jns .x_ok
+    add r8d, ecx                         ; shrink w by how far x was negative
+    xor ecx, ecx
+.x_ok:
+    mov eax, [rel basix_backbuf_w]
+    sub eax, ecx
+    cmp r8d, eax
+    jle .w_ok
+    mov r8d, eax
+.w_ok:
+    test r8d, r8d
+    jle .out
+
+    ; Clip y/h to [0, backbuf_h)
+    test edx, edx
+    jns .y_ok
+    add r9d, edx
+    xor edx, edx
+.y_ok:
+    mov eax, [rel basix_backbuf_h]
+    sub eax, edx
+    cmp r9d, eax
+    jle .h_ok
+    mov r9d, eax
+.h_ok:
+    test r9d, r9d
+    jle .out
+
+    mov ebx, [rel basix_backbuf_w]       ; ebx = stride (in pixels)
+    xor r11d, r11d                       ; r11d = row counter
+.row_loop:
+    cmp r11d, r9d
+    jge .out
+
+    mov eax, edx
+    add eax, r11d
+    imul eax, ebx
+    add eax, ecx                         ; eax = (y+row)*stride + x
+    mov rdi, [rel basix_backbuf_ptr]
+    lea rdi, [rdi + rax*4]
+
+    mov eax, r10d                        ; color, for stosd
+    push rcx
+    mov ecx, r8d                         ; width = count of dwords this row
+    cld
+    rep stosd
+    pop rcx
+
+    inc r11d
+    jmp .row_loop
+
+.out:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_rt_flip: no arguments. Blits the back buffer onto the real,
 ; visible framebuffer, one scanline at a time -- the two can't share a
 ; single rep movsd over the whole thing since the back buffer is
@@ -1238,6 +1333,139 @@ basix_rt_getkey:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_rt_mousex/mousey/mousebtn: no arguments. Poll the PS/2 mouse
+; driver's live state (mouse.inc) -- unlike GETKEY, never blocks, so a
+; GUI main loop calls these every frame. mousebtn's bits match
+; MOUSE_PKT_LBTN/RBTN/MBTN (0x01/0x02/0x04).
+; -------------------------------------------------------------------------
+basix_rt_mousex:
+    mov eax, [rel mouse_x]
+    ret
+
+basix_rt_mousey:
+    mov eax, [rel mouse_y]
+    ret
+
+basix_rt_mousebtn:
+    mov eax, [rel mouse_btn]
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_drawtext: RCX = string ptr, RDX = string length, R8 = color
+; (packed 32-bit pixel). x/y come from basix_drawtext_x/y (parser-
+; stashed globals -- DRAWTEXT takes four values plus the string, one
+; more than fits in RCX/RDX/R8/R9 alongside it, same reasoning as
+; RECT). Draws each character's 8x16 glyph (font8x16, the same table
+; the text console uses) into the back buffer at pixel coordinates,
+; left to right. Unlike fb_draw_char's console-cell text (which paints
+; both the glyph's set AND clear pixels, replacing the whole cell),
+; this only paints set pixels and leaves everything else alone, so a
+; label drawn over a colored background/icon doesn't punch an opaque
+; box around itself.
+; -------------------------------------------------------------------------
+basix_rt_drawtext:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    call basix_rt_ensure_backbuf
+    cmp qword [rel basix_backbuf_ptr], 0
+    je .out
+
+    mov r13, rcx                         ; r13 = string ptr
+    mov r14d, edx                        ; r14d = string length
+    mov r11d, r8d                        ; r11d = color
+    mov r9d, [rel basix_drawtext_x]      ; r9d = glyph x origin (advances)
+    mov r10d, [rel basix_drawtext_y]     ; r10d = y origin (constant)
+
+    xor r12d, r12d                       ; r12d = char index
+.char_loop:
+    cmp r12d, r14d
+    jge .out
+
+    movzx eax, byte [r13 + r12]
+    sub eax, 32
+    cmp eax, 95                          ; 95 printable glyphs (32..126)
+    jae .next_char                       ; unprintable -- skip, no box drawn
+    shl eax, 4                           ; * 16 bytes per glyph
+    lea rsi, [rel font8x16]
+    add rsi, rax                         ; rsi = this glyph's 16 scanline bytes
+
+    xor ecx, ecx                         ; ecx = glyph row 0..15
+.row_loop:
+    cmp ecx, 16
+    jge .next_char
+    movzx ebx, byte [rsi + rcx]          ; row bits, bit7 = leftmost pixel
+    mov edi, r10d
+    add edi, ecx                         ; edi = pixel y
+    cmp edi, 0
+    jl .row_skip
+    cmp edi, [rel basix_backbuf_h]
+    jge .row_skip
+
+    mov eax, edi
+    imul eax, [rel basix_backbuf_w]
+    mov r15d, eax                        ; r15d = rowbase = y*stride
+
+    xor edx, edx                         ; edx = column 0..7
+.col_loop:
+    cmp edx, 8
+    jge .row_skip
+    test ebx, 0x80
+    jz .col_skip
+    mov eax, r9d
+    add eax, edx                         ; eax = pixel x
+    cmp eax, 0
+    jl .col_skip
+    cmp eax, [rel basix_backbuf_w]
+    jge .col_skip
+    add eax, r15d                        ; eax = rowbase + x
+    mov r8, [rel basix_backbuf_ptr]
+    lea r8, [r8 + rax*4]
+    mov [r8], r11d
+.col_skip:
+    shl ebx, 1
+    inc edx
+    jmp .col_loop
+
+.row_skip:
+    inc ecx
+    jmp .row_loop
+
+.next_char:
+    add r9d, 8                           ; advance to the next glyph column
+    inc r12d
+    jmp .char_loop
+
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_rt_print_char: RCX = character code. Prints it as one raw byte
 ; via console_putc -- unlike PRINT (always decimal digits or a string
 ; literal), this is how a program renders an int-array-of-char-codes
@@ -1720,3 +1948,149 @@ basix_tri_maxy:  dd 0
 basix_tri_px:    dd 0
 basix_tri_py:    dd 0
 basix_tri_color: dd 0
+
+; RECT's x/y/w/h (basix_parse_rect stores them via
+; basix_parse_int_arg_store; basix_rt_rect reads them) -- RECT takes
+; five int arguments, one more than fit in RCX/RDX/R8/R9 alongside the
+; trailing color, same reasoning as TRIFILL's vertices above.
+align 8
+basix_rect_x: dq 0
+basix_rect_y: dq 0
+basix_rect_w: dq 0
+basix_rect_h: dq 0
+
+; DRAWTEXT's x/y (basix_parse_drawtext stores them; basix_rt_drawtext
+; reads them).
+basix_drawtext_x: dq 0
+basix_drawtext_y: dq 0
+
+; -------------------------------------------------------------------------
+; LAUNCH's byte buffers (basix_rt_launch fills both from the int-array-
+; of-char-codes arguments it's given) and the stashed argument
+; ARGLEN/ARGCHAR read. basix_launch_arg_len is 0 whenever the current
+; program was started via RUN rather than LAUNCH -- never reset
+; mid-program, so it stays valid for that program's whole lifetime.
+; -------------------------------------------------------------------------
+BASIX_LAUNCH_NAME_BUF_SIZE equ 128
+BASIX_LAUNCH_ARG_BUF_SIZE  equ 256
+
+basix_launch_name_buf: times BASIX_LAUNCH_NAME_BUF_SIZE db 0
+basix_launch_arg_buf:  times BASIX_LAUNCH_ARG_BUF_SIZE db 0
+basix_launch_arg_len:  dd 0
+
+; -------------------------------------------------------------------------
+; basix_rt_launch: RCX = program-name array base ptr (int, char codes),
+; RDX = name length, R8 = argument array base ptr (int, char codes),
+; R9 = argument length. Converts both int-array-of-char-codes arguments
+; into plain byte buffers (BASIX64 has no string type -- see the
+; comment on basix_launch_name_buf/basix_launch_arg_buf), stashes the
+; argument for the launched program's ARGLEN/ARGCHAR to read, then
+; loads the target exactly like RUN (basix_load_program: resolves the
+; path, deep paths included, and magic-sniffs for a precompiled .axb).
+;
+; On success this NEVER RETURNS to its caller: it discards its own
+; return address and jumps straight into the freshly loaded
+; basix_code_buf, so the launched program's own trailing RET pops the
+; *original* top-level invocation's return address (the shell's `call
+; basix_code_buf` for RUN, or an outer LAUNCH's) instead of unwinding
+; back into the code that just called LAUNCH -- which basix_load_program
+; has already overwritten (basix_code_buf is one shared, fixed buffer;
+; see basix_codegen.inc's top comment). That overwrite is safe because
+; by the time execution ever runs from basix_code_buf again, this
+; function -- which lives in the kernel's own separate code, never in
+; basix_code_buf -- has already finished writing it. On failure (bad
+; path/compile error/stale .axb) it returns normally instead, and the
+; calling program continues past the LAUNCH statement untouched.
+; -------------------------------------------------------------------------
+basix_rt_launch:
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, rcx                        ; namearr ptr
+    mov r13d, edx                       ; namelen
+    mov r14, r8                         ; argarr ptr
+    mov r15d, r9d                       ; arglen
+
+    cmp r13d, BASIX_LAUNCH_NAME_BUF_SIZE - 1
+    jbe .namelen_ok
+    mov r13d, BASIX_LAUNCH_NAME_BUF_SIZE - 1
+.namelen_ok:
+    lea rdi, [rel basix_launch_name_buf]
+    xor esi, esi
+.name_copy:
+    cmp esi, r13d
+    jge .name_done
+    mov rax, [r12 + rsi*8]
+    mov [rdi + rsi], al
+    inc esi
+    jmp .name_copy
+.name_done:
+    mov byte [rdi + rsi], 0
+
+    cmp r15d, BASIX_LAUNCH_ARG_BUF_SIZE
+    jbe .arglen_ok
+    mov r15d, BASIX_LAUNCH_ARG_BUF_SIZE
+.arglen_ok:
+    lea rdi, [rel basix_launch_arg_buf]
+    xor esi, esi
+.arg_copy:
+    cmp esi, r15d
+    jge .arg_done
+    mov rax, [r14 + rsi*8]
+    mov [rdi + rsi], al
+    inc esi
+    jmp .arg_copy
+.arg_done:
+    mov [rel basix_launch_arg_len], r15d
+
+    lea rcx, [rel basix_launch_name_buf]
+    call basix_load_program
+    test eax, eax
+    jnz .fail
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rax                             ; discard our own return address --
+                                         ; see the header comment above:
+                                         ; this never returns to its caller
+    jmp basix_code_buf
+
+.fail:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_arglen: no arguments. Returns the length (in bytes) of the
+; argument the current program was LAUNCHed with, or 0 if it wasn't
+; (e.g. started via RUN).
+; -------------------------------------------------------------------------
+basix_rt_arglen:
+    mov eax, [rel basix_launch_arg_len]
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_argchar: RCX = index. Returns the index'th byte (as an int
+; char code) of the current LAUNCH argument, or 0 if out of range.
+; -------------------------------------------------------------------------
+basix_rt_argchar:
+    cmp ecx, [rel basix_launch_arg_len]
+    jae .oob
+    lea rax, [rel basix_launch_arg_buf]
+    movzx eax, byte [rax+rcx]
+    ret
+.oob:
+    xor eax, eax
+    ret

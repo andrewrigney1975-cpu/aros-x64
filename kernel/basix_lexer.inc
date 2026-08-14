@@ -132,6 +132,19 @@ TOK_PNGDEBUG2 equ 103  ; TEMP: remove once LOADPNG is verified working
 TOK_PEEK    equ 107
 TOK_POKE    equ 108
 
+; GUI phase 0 primitives: mouse polling (bare-keyword functions, same
+; shape as TIMER/SCREENW), RECT/DRAWTEXT (statements), and the
+; LAUNCH/ARGLEN/ARGCHAR launch-argument mechanism (see basix_runtime.inc
+; and basix_load_program in kernel.asm).
+TOK_MOUSEX   equ 109
+TOK_MOUSEY   equ 110
+TOK_MOUSEBTN equ 111
+TOK_RECT     equ 112
+TOK_DRAWTEXT equ 113
+TOK_LAUNCH   equ 114
+TOK_ARGLEN   equ 115
+TOK_ARGCHAR  equ 116
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -1205,5 +1218,37 @@ basix_keywords:
     db 4
     dd TOK_POKE
     db 'POKE', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 6
+    dd TOK_MOUSEX
+    db 'MOUSEX', 0,0,0,0,0,0,0,0,0,0
+
+    db 6
+    dd TOK_MOUSEY
+    db 'MOUSEY', 0,0,0,0,0,0,0,0,0,0
+
+    db 8
+    dd TOK_MOUSEBTN
+    db 'MOUSEBTN', 0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_RECT
+    db 'RECT', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 8
+    dd TOK_DRAWTEXT
+    db 'DRAWTEXT', 0,0,0,0,0,0,0,0
+
+    db 6
+    dd TOK_LAUNCH
+    db 'LAUNCH', 0,0,0,0,0,0,0,0,0,0
+
+    db 6
+    dd TOK_ARGLEN
+    db 'ARGLEN', 0,0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_ARGCHAR
+    db 'ARGCHAR', 0,0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table

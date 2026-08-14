@@ -1303,6 +1303,32 @@ basix_parse_float_arg_store:
                                            ; own caller directly
 
 ; -------------------------------------------------------------------------
+; basix_parse_int_arg_store: RAX = a fixed (compile-time-constant)
+; scratch address. Parses one arithmetic expression, coercing a float
+; result to a truncated int, then emits code storing that int to the
+; given address. The int sibling of basix_parse_float_arg_store, for
+; statements like RECT/DRAWTEXT that take more plain int arguments than
+; fit in the four argument registers.
+;
+; basix_parse_arith leaves an int result in RAX itself (unlike float's
+; XMM0), so unlike the float version this can't just overwrite RAX with
+; the destination address once parsing is done -- the parsed value has
+; to move out of RAX (into RCX, via the already-emitted mov_rcx_rax
+; pattern) before RAX gets reused for the address.
+; -------------------------------------------------------------------------
+basix_parse_int_arg_store:
+    push rax
+    call basix_parse_arith                ; r11d = expr type (0=int)
+    test r11d, r11d
+    jz .already_int
+    call basix_emit_cvttsd2si_rax_x0
+.already_int:
+    call basix_emit_mov_rcx_rax           ; emit: rcx := the parsed value
+    pop rax
+    call basix_emit_mov_rax_imm64         ; emit: rax := scratch address
+    jmp basix_emit_mov_memrax_rcx         ; emit: [rax] := rcx -- tail call
+
+; -------------------------------------------------------------------------
 ; basix_parse_line: "LINE x1, y1, x2, y2, color" -- draws an
 ; anti-aliased line (Wu's algorithm, basix_rt_line_aa) into the back
 ; buffer. Endpoints keep full float precision (stored to fixed globals
@@ -1370,6 +1396,126 @@ basix_parse_trifill:
     call basix_parse_int_arg_push        ; color
     call basix_emit_pop_rcx              ; color
     lea rcx, [rel basix_rt_fill_tri]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_rect: "RECT x, y, w, h, color" -- fills one solid-color
+; rectangle into the back buffer (basix_rt_rect). Five int arguments,
+; one more than fit in the argument registers alongside color, so x/y/
+; w/h are stashed to fixed globals (basix_parse_int_arg_store) the
+; same way LINE/TRIFILL stash their float endpoints; only the trailing
+; color argument goes through a register.
+; -------------------------------------------------------------------------
+basix_parse_rect:
+    lea rax, [rel basix_rect_x]
+    call basix_parse_int_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+    lea rax, [rel basix_rect_y]
+    call basix_parse_int_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+    lea rax, [rel basix_rect_w]
+    call basix_parse_int_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+    lea rax, [rel basix_rect_h]
+    call basix_parse_int_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+
+    call basix_parse_int_arg_push        ; color
+    call basix_emit_pop_rcx              ; color
+    lea rcx, [rel basix_rt_rect]
+    call basix_emit_call_to
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_drawtext: "DRAWTEXT x, y, "string", color" -- draws a
+; pixel-positioned text label into the back buffer (basix_rt_drawtext),
+; unlike PRINT/PUTCHAR's character-cell/LOCATE-based console text. x/y
+; are stashed to fixed globals like RECT's coordinates; the string
+; literal is interned into the permanent pool exactly like PRINT's
+; string items (see basix_parse_print_list), and its ptr/length plus
+; the trailing color are passed through RCX/RDX/R8.
+; -------------------------------------------------------------------------
+basix_parse_drawtext:
+    push r12
+    push r13
+
+    lea rax, [rel basix_drawtext_x]
+    call basix_parse_int_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+    lea rax, [rel basix_drawtext_y]
+    call basix_parse_int_arg_store
+    mov eax, TOK_COMMA
+    call basix_expect
+
+    cmp dword [rel basix_tok_type], TOK_STRING
+    jne .bad
+    mov rcx, [rel basix_tok_text]
+    mov edx, [rel basix_tok_len]
+    call basix_strlit_intern             ; rax=permanent ptr, ecx=length --
+                                          ; both compile-time constants,
+                                          ; carried across the further
+                                          ; parsing below the same way
+                                          ; basix_parse_print_list does
+    mov r12, rax
+    mov r13d, ecx
+    call basix_lex_next
+    mov eax, TOK_COMMA
+    call basix_expect
+
+    call basix_parse_int_arg_push        ; color
+    call basix_emit_pop_r8               ; color
+
+    mov rax, r12
+    call basix_emit_mov_rcx_imm64        ; emit: rcx := string ptr
+    mov eax, r13d
+    call basix_emit_mov_rdx_imm64        ; emit: rdx := string length
+    lea rcx, [rel basix_rt_drawtext]
+    call basix_emit_call_to
+
+    pop r13
+    pop r12
+    ret
+
+.bad:
+    mov dword [rel basix_compile_ok], 0
+    call basix_lex_next
+    pop r13
+    pop r12
+    ret
+
+; -------------------------------------------------------------------------
+; basix_parse_launch: "LAUNCH namearr, namelen, argarr, arglen" -- loads
+; and jumps into another program the same way RUN does (deep paths and
+; precompiled .axb included; see basix_rt_launch/basix_load_program),
+; after stashing argarr/arglen where the launched program's ARGLEN/
+; ARGCHAR can read it. namearr/argarr are bare int arrays of char codes
+; (BASIX64 has no string type) -- same "bare array decays to its base
+; pointer" argument shape as FSAVE/LOADPNG, so no special-casing is
+; needed here beyond the ordinary four-int-argument plumbing.
+; -------------------------------------------------------------------------
+basix_parse_launch:
+    call basix_parse_int_arg_push        ; namearr (base ptr)
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; namelen
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; argarr (base ptr)
+    mov eax, TOK_COMMA
+    call basix_expect
+    call basix_parse_int_arg_push        ; arglen
+
+    call basix_emit_pop_r9               ; arglen
+    call basix_emit_pop_r8               ; argarr
+    call basix_emit_pop_rdx              ; namelen
+    call basix_emit_pop_rcx              ; namearr
+    lea rcx, [rel basix_rt_launch]
     call basix_emit_call_to
     ret
 
@@ -1482,6 +1628,16 @@ basix_parse_primary:
     je .do_pngdebug2
     cmp eax, TOK_PEEK
     je .do_peek
+    cmp eax, TOK_MOUSEX
+    je .do_mousex
+    cmp eax, TOK_MOUSEY
+    je .do_mousey
+    cmp eax, TOK_MOUSEBTN
+    je .do_mousebtn
+    cmp eax, TOK_ARGLEN
+    je .do_arglen
+    cmp eax, TOK_ARGCHAR
+    je .do_argchar
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
@@ -1615,6 +1771,43 @@ basix_parse_primary:
     call basix_expect
     call basix_emit_pop_rcx              ; addr
     lea rcx, [rel basix_rt_peek]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+
+.do_mousex:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_mousex]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_mousey:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_mousey]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_mousebtn:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_mousebtn]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_arglen:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_arglen]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_argchar:
+    call basix_lex_next
+    mov eax, TOK_LPAREN
+    call basix_expect
+    call basix_parse_int_arg_push        ; index
+    mov eax, TOK_RPAREN
+    call basix_expect
+    call basix_emit_pop_rcx              ; index
+    lea rcx, [rel basix_rt_argchar]
     call basix_emit_call_to
     xor r11d, r11d                       ; result type = int
     ret
@@ -3133,6 +3326,12 @@ basix_parse_statement:
     je .do_color
     cmp r15d, TOK_DRAWPNG
     je .do_drawpng
+    cmp r15d, TOK_RECT
+    je .do_rect
+    cmp r15d, TOK_DRAWTEXT
+    je .do_drawtext
+    cmp r15d, TOK_LAUNCH
+    je .do_launch
     cmp r15d, TOK_IDENT
     je .do_ident_stmt
 
@@ -3232,6 +3431,19 @@ basix_parse_statement:
 .do_drawpng:
     call basix_lex_next
     call basix_parse_drawpng
+    jmp .out
+
+.do_rect:
+    call basix_lex_next
+    call basix_parse_rect
+    jmp .out
+.do_drawtext:
+    call basix_lex_next
+    call basix_parse_drawtext
+    jmp .out
+.do_launch:
+    call basix_lex_next
+    call basix_parse_launch
     jmp .out
 
 .do_ident_stmt:

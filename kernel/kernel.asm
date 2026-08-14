@@ -41,6 +41,7 @@ entry:
     call idt_install
     call irq_install
     call kbd_install
+    call mouse_install
     call paging_init
     call lapic_init
     call basix_fpu_init
@@ -2895,6 +2896,103 @@ shell_read_line:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_load_program: RCX = NUL-terminated path (may be a deep path --
+; see exfat_resolve_path). Resolves it and gets a runnable program
+; sitting in basix_code_buf, ready for `call basix_code_buf`, either by
+; copying a precompiled .AXB straight in (magic-sniffed, see
+; basix_codegen.inc's format comment) or by stream-compiling .bas
+; source -- the shared core behind both RUN and LAUNCH, so both go
+; through the exact same resolve/sniff/load logic. Never touches
+; console output; callers decide how (or whether) to report a failure.
+; Returns EAX = status: 0=ok, 1=not found, 2=BASIX64 compile error,
+; 3=.axb stale/corrupt/oversized for this kernel build.
+; -------------------------------------------------------------------------
+basix_load_program:
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+
+    lea r8, [rel exfat_find_result]
+    call exfat_resolve_path
+    test eax, eax
+    jz .notfound
+
+    cmp qword [rel exfat_find_result+8], 4   ; DataLength >= 4?
+    jb .source
+
+    mov ecx, [rel exfat_find_result+0]  ; FirstCluster
+    xor edx, edx                        ; offset 0
+    mov r8d, 16
+    lea r9, [rel basix_axb_header_buf]
+    mov r10d, [rel exfat_find_result+16] ; NoFatChain
+    call exfat_read_file_at             ; preserves RCX/R10 across the
+                                         ; call -- both still hold
+                                         ; FirstCluster/NoFatChain below
+    test eax, eax
+    jz .source                          ; header read failed -- fall back
+
+    mov eax, [rel basix_axb_header_buf+0]
+    cmp eax, 0x31425841                 ; 'A','X','B','1' little-endian
+    jne .source
+
+    mov eax, [rel basix_axb_header_buf+4]  ; kernel_id
+    cmp eax, BASIX_AXB_KERNEL_ID
+    jne .axb_stale
+
+    mov r11d, [rel basix_axb_header_buf+8] ; code_size
+    cmp r11d, BASIX_CODE_BUF_SIZE
+    ja .axb_stale                       ; too big to be a real match -- refuse
+
+    mov edx, 16                         ; code bytes start right after the header
+    mov r8d, r11d
+    lea r9, [rel basix_code_buf]
+    call exfat_read_file_at
+    test eax, eax
+    jz .axb_stale
+
+    mov [rel basix_code_pos], r11d
+    mov dword [rel basix_compile_ok], 1
+    call basix_runtime_reset_state
+    xor eax, eax
+    jmp .out
+
+.source:
+    ; Stream-compile straight from exFAT (basix_compile_file /
+    ; basix_lex_init_stream) instead of reading the whole program into
+    ; one buffer first -- program size is no longer bounded by
+    ; exfat_test_buf/SHELL_TYPE_BUF_MAX at all (that limit still
+    ; applies to TYPE, which genuinely needs the whole file resident
+    ; to display it).
+    mov ecx, [rel exfat_find_result+0]  ; FirstCluster
+    mov rdx, [rel exfat_find_result+8]  ; DataLength
+    mov r8d, [rel exfat_find_result+16] ; NoFatChain
+    call basix_compile_file
+    test eax, eax
+    jz .compilefail
+    xor eax, eax
+    jmp .out
+
+.notfound:
+    mov eax, 1
+    jmp .out
+.compilefail:
+    mov eax, 2
+    jmp .out
+.axb_stale:
+    mov eax, 3
+.out:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
 ; shell_dispatch: RCX = ptr to a NUL-terminated command line. Parses the
 ; first whitespace-delimited word as the command (case-folded to
 ; lowercase) and dispatches on it.
@@ -3225,70 +3323,14 @@ shell_dispatch:
     ; way editor/viewer's OPEN-then-bare-name navigation does, but
     ; without needing an OPEN first and without touching cwd.
     lea rcx, [rel shell_arg_buf]
-    lea r8, [rel exfat_find_result]
-    call exfat_resolve_path
-    test eax, eax
-    jz .run_notfound
+    call basix_load_program
+    cmp eax, 1
+    je .run_notfound
+    cmp eax, 2
+    je .run_compilefail
+    cmp eax, 3
+    je .run_axb_stale
 
-    ; Sniff the first 4 bytes for the "AXB1" magic (COMPILE's output --
-    ; see basix_codegen.inc's .AXB format comment) before deciding how
-    ; to get a program into basix_code_buf: a precompiled binary is
-    ; copied straight in (no lex/parse/codegen at all -- the whole
-    ; point), anything else stream-compiles from source exactly as RUN
-    ; always has.
-    cmp qword [rel exfat_find_result+8], 4   ; DataLength >= 4?
-    jb .run_source
-
-    mov ecx, [rel exfat_find_result+0]  ; FirstCluster
-    xor edx, edx                        ; offset 0
-    mov r8d, 16
-    lea r9, [rel basix_axb_header_buf]
-    mov r10d, [rel exfat_find_result+16] ; NoFatChain
-    call exfat_read_file_at             ; preserves RCX/R10 across the
-                                         ; call -- both still hold
-                                         ; FirstCluster/NoFatChain below
-    test eax, eax
-    jz .run_source                      ; header read failed -- fall back
-
-    mov eax, [rel basix_axb_header_buf+0]
-    cmp eax, 0x31425841                 ; 'A','X','B','1' little-endian
-    jne .run_source
-
-    mov eax, [rel basix_axb_header_buf+4]  ; kernel_id
-    cmp eax, BASIX_AXB_KERNEL_ID
-    jne .run_axb_stale
-
-    mov r11d, [rel basix_axb_header_buf+8] ; code_size
-    cmp r11d, BASIX_CODE_BUF_SIZE
-    ja .run_axb_stale                   ; too big to be a real match -- refuse
-
-    mov edx, 16                         ; code bytes start right after the header
-    mov r8d, r11d
-    lea r9, [rel basix_code_buf]
-    call exfat_read_file_at
-    test eax, eax
-    jz .run_axb_stale
-
-    mov [rel basix_code_pos], r11d
-    mov dword [rel basix_compile_ok], 1
-    call basix_runtime_reset_state
-    jmp .run_go
-
-.run_source:
-    ; Stream-compile straight from exFAT (basix_compile_file /
-    ; basix_lex_init_stream) instead of reading the whole program into
-    ; one buffer first -- program size is no longer bounded by
-    ; exfat_test_buf/SHELL_TYPE_BUF_MAX at all (that limit still
-    ; applies to TYPE, which genuinely needs the whole file resident
-    ; to display it).
-    mov ecx, [rel exfat_find_result+0]  ; FirstCluster
-    mov rdx, [rel exfat_find_result+8]  ; DataLength
-    mov r8d, [rel exfat_find_result+16] ; NoFatChain
-    call basix_compile_file
-    test eax, eax
-    jz .run_compilefail
-
-.run_go:
     call basix_code_buf
     mov dword [rel fb_text_color], 0xFFFFFFFF  ; a program may leave COLOR
                                                 ; set to something other than
@@ -4761,6 +4803,7 @@ gdt_descriptor:
 %include "storage.inc"
 %include "exfat.inc"
 %include "keyboard.inc"
+%include "mouse.inc"
 %include "basix_lexer.inc"
 %include "basix_codegen.inc"
 %include "basix_symbols.inc"
