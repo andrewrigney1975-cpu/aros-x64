@@ -2897,15 +2897,24 @@ shell_read_line:
 
 ; -------------------------------------------------------------------------
 ; basix_load_program: RCX = NUL-terminated path (may be a deep path --
-; see exfat_resolve_path). Resolves it and gets a runnable program
-; sitting in basix_code_buf, ready for `call basix_code_buf`, either by
-; copying a precompiled .AXB straight in (magic-sniffed, see
-; basix_codegen.inc's format comment) or by stream-compiling .bas
-; source -- the shared core behind both RUN and LAUNCH, so both go
-; through the exact same resolve/sniff/load logic. Never touches
-; console output; callers decide how (or whether) to report a failure.
-; Returns EAX = status: 0=ok, 1=not found, 2=BASIX64 compile error,
-; 3=.axb stale/corrupt/oversized for this kernel build.
+; see exfat_resolve_path). RDX = child mode (0/1): 0 for a top-level
+; load (RUN/GUI) that fully resets BASIX64's compile state (variables,
+; array arena, string pool, labels, fixups) the way a fresh program
+; always has; 1 for a LAUNCHed child that must leave all of that alone
+; so the launching program's variables/arrays survive the child's
+; entire compile+run and it can resume afterward (see
+; basix_compile_reset_state_child and basix_rt_launch, which alone
+; passes 1 -- RUN and GUI both pass 0).
+;
+; Resolves the path and gets a runnable program sitting in
+; basix_code_buf, ready for `call basix_code_buf`, either by copying a
+; precompiled .AXB straight in (magic-sniffed, see basix_codegen.inc's
+; format comment) or by stream-compiling .bas source -- the shared
+; core behind both RUN and LAUNCH, so both go through the exact same
+; resolve/sniff/load logic. Never touches console output; callers
+; decide how (or whether) to report a failure. Returns EAX = status:
+; 0=ok, 1=not found, 2=BASIX64 compile error, 3=.axb stale/corrupt/
+; oversized for this kernel build.
 ; -------------------------------------------------------------------------
 basix_load_program:
     push rcx
@@ -2914,6 +2923,10 @@ basix_load_program:
     push r9
     push r10
     push r11
+    push r12
+
+    mov r12d, edx                       ; r12d = child mode (saved before
+                                         ; rdx gets reused as scratch below)
 
     lea r8, [rel exfat_find_result]
     call exfat_resolve_path
@@ -2955,7 +2968,10 @@ basix_load_program:
 
     mov [rel basix_code_pos], r11d
     mov dword [rel basix_compile_ok], 1
+    test r12d, r12d
+    jnz .axb_ok_child            ; child mode: leave vars/arena/etc alone
     call basix_runtime_reset_state
+.axb_ok_child:
     xor eax, eax
     jmp .out
 
@@ -2969,7 +2985,13 @@ basix_load_program:
     mov ecx, [rel exfat_find_result+0]  ; FirstCluster
     mov rdx, [rel exfat_find_result+8]  ; DataLength
     mov r8d, [rel exfat_find_result+16] ; NoFatChain
+    test r12d, r12d
+    jnz .source_child
     call basix_compile_file
+    jmp .source_done
+.source_child:
+    call basix_compile_file_child
+.source_done:
     test eax, eax
     jz .compilefail
     xor eax, eax
@@ -2984,6 +3006,7 @@ basix_load_program:
 .axb_stale:
     mov eax, 3
 .out:
+    pop r12
     pop r11
     pop r10
     pop r9
@@ -3329,6 +3352,7 @@ shell_dispatch:
     ; way editor/viewer's OPEN-then-bare-name navigation does, but
     ; without needing an OPEN first and without touching cwd.
     lea rcx, [rel shell_arg_buf]
+    xor edx, edx                         ; child mode = 0 (top-level)
     call basix_load_program
     cmp eax, 1
     je .run_notfound
@@ -3497,6 +3521,7 @@ shell_dispatch:
 ; -------------------------------------------------------------------------
 .do_gui:
     lea rcx, [rel gui_program_name]
+    xor edx, edx                         ; child mode = 0 (top-level)
     call basix_load_program
     test eax, eax
     jnz .gui_load_failed

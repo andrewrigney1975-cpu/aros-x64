@@ -7,9 +7,17 @@
 ; -- there is no stack frame or register allocator for v1.
 ; =============================================================================
 
-BASIX_MAX_VARS    equ 96
-BASIX_MAX_LABELS  equ 64
-BASIX_MAX_FIXUPS  equ 64
+; Sized to comfortably hold a LAUNCHing program's own symbols PLUS a
+; LAUNCHed child's (basix_rt_launch/basix_load_program's "child" mode
+; deliberately does not reset var/label/fixup/array-arena/strlit-pool
+; state the way a top-level RUN/GUI compile does, so a parent's
+; variables and arrays survive a child running and returning -- see
+; the comment on basix_compile_reset_state_child) -- e.g.
+; workbench.bas (~65 vars) LAUNCHing editor.bas (~50 vars) needs more
+; than either alone.
+BASIX_MAX_VARS    equ 200
+BASIX_MAX_LABELS  equ 96
+BASIX_MAX_FIXUPS  equ 96
 BASIX_MAX_FOR_DEPTH equ 8
 BASIX_MAX_ARRAY_DIMS equ 4       ; DIM arr(d0,d1,...) -- up to 4 dimensions
 

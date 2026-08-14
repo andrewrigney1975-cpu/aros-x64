@@ -103,14 +103,14 @@ LET iconH = 32
 LET selected = 0
 
 LET winOpen = 0
-LET winX = 100
-LET winY = 50
-LET winW = 420
-LET winH = 300
+LET winX = 80
+LET winY = 40
+LET winW = 650
+LET winH = 460
 LET titleH = 18
 LET closeW = 14
 
-LET gridCols = 4
+LET gridCols = 6
 LET cellW = 95
 LET cellH = 58
 LET iconBoxW = 40

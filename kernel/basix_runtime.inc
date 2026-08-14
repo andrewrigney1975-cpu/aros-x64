@@ -2137,6 +2137,16 @@ basix_launch_name_buf: times BASIX_LAUNCH_NAME_BUF_SIZE db 0
 basix_launch_arg_buf:  times BASIX_LAUNCH_ARG_BUF_SIZE db 0
 basix_launch_arg_len:  dd 0
 
+; basix_launch_saved_code/basix_launch_saved_len: basix_rt_launch's
+; save slot for the LAUNCHing (parent) program's own compiled code
+; while a child runs in basix_code_buf -- see basix_rt_launch. One
+; slot deep: a child that itself calls LAUNCH would clobber its
+; parent's save here, so nested LAUNCH (an app launching another app)
+; isn't supported yet, only one level (e.g. Workbench launching
+; editor.bas/viewer.bas).
+basix_launch_saved_code: times BASIX_CODE_BUF_SIZE db 0
+basix_launch_saved_len:  dd 0
+
 ; -------------------------------------------------------------------------
 ; basix_rt_launch: RCX = program-name array base ptr (int, char codes),
 ; RDX = name length, R8 = argument array base ptr (int, char codes),
@@ -2144,22 +2154,24 @@ basix_launch_arg_len:  dd 0
 ; into plain byte buffers (BASIX64 has no string type -- see the
 ; comment on basix_launch_name_buf/basix_launch_arg_buf), stashes the
 ; argument for the launched program's ARGLEN/ARGCHAR to read, then
-; loads the target exactly like RUN (basix_load_program: resolves the
-; path, deep paths included, and magic-sniffs for a precompiled .axb).
+; loads the target exactly like RUN (basix_load_program, in "child"
+; mode: resolves the path, deep paths included, magic-sniffs for a
+; precompiled .axb, and -- unlike a top-level RUN/GUI load -- leaves
+; the shared variable/array-arena/string-pool/label state untouched,
+; see basix_compile_reset_state_child, so THIS program's own variables
+; and arrays survive the child running).
 ;
-; On success this NEVER RETURNS to its caller: it discards its own
-; return address and jumps straight into the freshly loaded
-; basix_code_buf, so the launched program's own trailing RET pops the
-; *original* top-level invocation's return address (the shell's `call
-; basix_code_buf` for RUN, or an outer LAUNCH's) instead of unwinding
-; back into the code that just called LAUNCH -- which basix_load_program
-; has already overwritten (basix_code_buf is one shared, fixed buffer;
-; see basix_codegen.inc's top comment). That overwrite is safe because
-; by the time execution ever runs from basix_code_buf again, this
-; function -- which lives in the kernel's own separate code, never in
-; basix_code_buf -- has already finished writing it. On failure (bad
-; path/compile error/stale .axb) it returns normally instead, and the
-; calling program continues past the LAUNCH statement untouched.
+; Runs the child via a real CALL (not a tail-jump) after saving this
+; program's own compiled bytes to basix_launch_saved_code, so once the
+; child's own trailing RET returns here, its code can be restored back
+; into basix_code_buf and this routine can return normally too --
+; resuming the launching program exactly where it left off, the same
+; way any ordinary subroutine call would, rather than replacing it
+; forever. On a failed load (bad path/compile error/stale .axb) the
+; save is restored immediately and this returns normally either way,
+; so the calling program always continues past the LAUNCH statement
+; once basix_rt_launch returns -- it just may have had a whole other
+; program run to completion first.
 ; -------------------------------------------------------------------------
 basix_rt_launch:
     push rsi
@@ -2206,23 +2218,35 @@ basix_rt_launch:
 .arg_done:
     mov [rel basix_launch_arg_len], r15d
 
+    ; Save the currently-running (parent) program's compiled code so it
+    ; can be restored and RESUMED via an ordinary CALL/RET once the
+    ; child finishes, instead of being replaced forever.
+    mov eax, [rel basix_code_pos]
+    mov [rel basix_launch_saved_len], eax
+    mov ecx, eax
+    lea rsi, [rel basix_code_buf]
+    lea rdi, [rel basix_launch_saved_code]
+    cld
+    rep movsb
+
     lea rcx, [rel basix_launch_name_buf]
+    mov edx, 1                          ; child mode
     call basix_load_program
     test eax, eax
-    jnz .fail
+    jnz .restore                        ; load failed -- restore & return
 
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rdi
-    pop rsi
-    pop rax                             ; discard our own return address --
-                                         ; see the header comment above:
-                                         ; this never returns to its caller
-    jmp basix_code_buf
+    call basix_code_buf                 ; real CALL: the child's own
+                                         ; trailing RET returns here
 
-.fail:
+.restore:
+    mov ecx, [rel basix_launch_saved_len]
+    mov [rel basix_code_pos], ecx
+    lea rsi, [rel basix_launch_saved_code]
+    lea rdi, [rel basix_code_buf]
+    cld
+    rep movsb
+    mov dword [rel basix_compile_ok], 1
+
     pop r15
     pop r14
     pop r13

@@ -3809,6 +3809,30 @@ basix_compile_reset_state:
     jmp basix_runtime_reset_state
 
 ; -------------------------------------------------------------------------
+; basix_compile_reset_state_child: like basix_compile_reset_state, but
+; deliberately does NOT call basix_runtime_reset_state -- used when
+; compiling a program LAUNCHed as a child of one still running (see
+; basix_rt_launch), which needs to RESUME afterward via a normal CALL/
+; RET rather than being replaced forever. The parent's variables (fixed
+; absolute addresses baked into its already-compiled code -- see this
+; file's top comment) and array-arena contents must survive the
+; child's entire compile+run, so basix_var_count/basix_array_arena_pos/
+; basix_strlit_pool_pos/basix_label_count/basix_fixup_count are left
+; exactly where the parent's own compile left them; the child's own
+; variables/arrays/labels/string-literals simply continue bump-
+; allocating from there instead of colliding with the parent's. Only
+; basix_code_pos/basix_compile_ok reset, since basix_code_buf itself
+; unavoidably has to be overwritten with the child's code (its caller
+; is responsible for saving/restoring the parent's own code bytes
+; around the child's whole compile+run -- this routine only handles
+; the symbol-table side of that split).
+; -------------------------------------------------------------------------
+basix_compile_reset_state_child:
+    mov dword [rel basix_compile_ok], 1
+    mov dword [rel basix_code_pos], 0
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_compile: RCX = ptr to a NUL-terminated BASIX64 source buffer
 ; already fully resident in memory. Compiles it into basix_code_buf
 ; (callable at that address on success). Returns EAX=1/0.
@@ -3830,6 +3854,19 @@ basix_compile:
 basix_compile_file:
     push rbx
     call basix_compile_reset_state
+    call basix_lex_init_stream
+    call basix_lex_next
+    jmp basix_compile_tail
+
+; -------------------------------------------------------------------------
+; basix_compile_file_child: identical to basix_compile_file except it
+; calls basix_compile_reset_state_child instead -- see that routine's
+; comment. Used by basix_load_program's child mode (LAUNCH), never by
+; a top-level RUN/GUI compile.
+; -------------------------------------------------------------------------
+basix_compile_file_child:
+    push rbx
+    call basix_compile_reset_state_child
     call basix_lex_init_stream
     call basix_lex_next
     jmp basix_compile_tail
