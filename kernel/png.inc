@@ -1593,6 +1593,18 @@ basix_rt_drawpng:
     mov r10d, ecx                       ; x0
     mov r11d, edx                       ; y0
 
+    push rcx
+    push rdx
+    mov ecx, r10d
+    mov edx, r11d
+    mov r8d, r10d
+    add r8d, r12d
+    mov r9d, r11d
+    add r9d, r13d
+    call basix_mark_dirty
+    pop rdx
+    pop rcx
+
     xor esi, esi                        ; row y
 .row_loop:
     cmp esi, r13d

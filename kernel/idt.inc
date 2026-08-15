@@ -164,6 +164,17 @@ isr_common:
     call sched_pick_next                ; rax=outgoing (unchanged); rcx=next
     mov [rel current_task], rcx
 
+    ; Mirror the incoming task's own back buffer into the global every
+    ; basix_rt_* graphics routine reads through -- see pic.inc's
+    ; irq0_stub (this mirrors that) and TCB_BACKBUF_PTR's comment in
+    ; sched.inc.
+    mov rax, [rcx+TCB_BACKBUF_PTR]
+    mov [rel basix_backbuf_ptr], rax
+    mov eax, [rcx+TCB_BACKBUF_W]
+    mov [rel basix_backbuf_w], eax
+    mov eax, [rcx+TCB_BACKBUF_H]
+    mov [rel basix_backbuf_h], eax
+
     ; Switch to the surviving task's own page tables before touching its
     ; RSP -- see the matching comment in pic.inc's irq0_stub, which this
     ; mirrors exactly.

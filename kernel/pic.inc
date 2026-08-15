@@ -121,6 +121,17 @@ irq0_stub:
     call sched_pick_next                ; rax=outgoing (unchanged); rcx=next
     mov [rel current_task], rcx
 
+    ; Mirror the incoming task's own back buffer into the global every
+    ; basix_rt_* graphics routine already reads through -- see
+    ; TCB_BACKBUF_PTR's comment (sched.inc). Cheap (3 loads/stores)
+    ; even done unconditionally on every switch.
+    mov rax, [rcx+TCB_BACKBUF_PTR]
+    mov [rel basix_backbuf_ptr], rax
+    mov eax, [rcx+TCB_BACKBUF_W]
+    mov [rel basix_backbuf_w], eax
+    mov eax, [rcx+TCB_BACKBUF_H]
+    mov [rel basix_backbuf_h], eax
+
     ; Switch to the incoming task's own page tables (its private stack
     ; mapping only exists there) before touching its RSP -- 0 means "no
     ; private paging" (the main task), which uses the shared global

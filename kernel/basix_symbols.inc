@@ -2,24 +2,47 @@
 ; BASIX64 symbol tables: variables, labels, and the forward-reference
 ; fixup list used by GOTO/GOSUB targeting a label not yet seen.
 ;
-; Variables are 8-byte slots in a flat static array (basix_var_slots),
-; addressed directly since this kernel is a flat, non-relocatable binary
-; -- there is no stack frame or register allocator for v1.
+; Variables are 8-byte slots in the currently-active execution slot's
+; own heap-allocated storage (see the R0 slot block below), addressed
+; directly since this kernel is a flat, non-relocatable binary -- there
+; is no stack frame or register allocator for v1.
 ; =============================================================================
 
-; Sized to comfortably hold a LAUNCHing program's own symbols PLUS a
-; LAUNCHed child's (basix_rt_launch/basix_load_program's "child" mode
-; deliberately does not reset var/label/fixup/array-arena/strlit-pool
-; state the way a top-level RUN/GUI compile does, so a parent's
-; variables and arrays survive a child running and returning -- see
-; the comment on basix_compile_reset_state_child) -- e.g.
-; workbench.bas (~65 vars) LAUNCHing editor.bas (~50 vars) needs more
-; than either alone.
-BASIX_MAX_VARS    equ 200
-BASIX_MAX_LABELS  equ 96
-BASIX_MAX_FIXUPS  equ 96
+; Per-slot capacity (see the R0 slot block below): each of the 8
+; concurrent execution slots gets its OWN complete set of these
+; tables, so there's no more need to size for "a parent plus a child
+; sharing one table" the way the old single-buffer LAUNCH hack did --
+; every LAUNCHed program (nested or not) gets a full, freshly-reset
+; table of its own in a different slot. Sized generously per slot
+; since RAM is not a constraint here (512 vars/labels/fixups is far
+; more than any BASIX64 program written so far comes close to using).
+BASIX_MAX_VARS    equ 512
+BASIX_MAX_LABELS  equ 256
+BASIX_MAX_FIXUPS  equ 256
 BASIX_MAX_FOR_DEPTH equ 8
 BASIX_MAX_ARRAY_DIMS equ 4       ; DIM arr(d0,d1,...) -- up to 4 dimensions
+
+; -------------------------------------------------------------------------
+; R0: concurrent execution slots. Each slot is a completely independent
+; execution context -- its own code buffer, variable/wide-var storage,
+; array arena, and string-literal pool, all heap-allocated (kmalloc_large)
+; at boot by basix_slot_init_all rather than embedded in the kernel image
+; (same "don't bloat KERNEL.BIN" reasoning as basix_array_arena_ptr
+; below, just applied per-slot). Compile-time-only bookkeeping (variable
+; NAMES/types/counts, label table, fixup table -- see basix_var_count
+; etc. further down) stays a single shared scratch workspace reset at
+; the start of every compile, since only the RESULT of a compile
+; (baked-in absolute addresses into a slot's own dedicated memory)
+; needs to persist or be isolated between slots; the bookkeeping itself
+; is never consulted again once a compile finishes. basix_compile_lock
+; serializes compiles across slots (compiling is inherently a shared
+; critical section over that scratch workspace + the "active slot"
+; pointers below) -- safe to spin-wait on under preemptive scheduling
+; since the holder will get its own timer slice to finish and release.
+; -------------------------------------------------------------------------
+BASIX_SLOT_COUNT       equ 8
+BASIX_SLOT_ARENA_SIZE  equ 33554432    ; 32MB/slot array arena
+BASIX_SLOT_STRLIT_SIZE equ 65536       ; 64KB/slot string-literal pool
 
 ; var_type encoding continued (0=INT,1=SFLOAT,2=DFLOAT,3=VECTOR2,
 ; 4=VECTOR3,5=VECTOR4,6=MATRIX4 -- see basix_parser.inc's DIM parsing):
@@ -32,15 +55,9 @@ BASIX_MAX_ARRAY_DIMS equ 4       ; DIM arr(d0,d1,...) -- up to 4 dimensions
 BASIX_VARTYPE_ARRAY_INT   equ 7
 BASIX_VARTYPE_ARRAY_FLOAT equ 8
 
-BASIX_ARRAY_ARENA_SIZE equ 16777216      ; 16MB, bump-allocated by DIM's
-                                          ; array path. Grown from the
-                                          ; original 256KB so a text editor
-                                          ; program can DIM buf(1048576) AS
-                                          ; INTEGER (~8MB, since arrays here
-                                          ; are uniformly 8 bytes/element)
-                                          ; to edit files up to 1MB, with
-                                          ; headroom left for other arrays
-                                          ; (e.g. a filename buffer).
+; Per-slot array arena size is BASIX_SLOT_ARENA_SIZE, defined below
+; alongside the rest of the R0 slot constants (32MB/slot -- plenty for
+; a text editor's DIM buf(1048576) AS INTEGER (~8MB) plus headroom).
 
 ; -------------------------------------------------------------------------
 ; basix_name_eq: RCX = candidate ptr, EDX = candidate len, R8 = stored
@@ -248,22 +265,34 @@ basix_var_find_or_create:
 
 ; -------------------------------------------------------------------------
 ; basix_var_slot_addr: EAX = variable index. Returns RAX = absolute
-; address of its 8-byte slot.
+; address of its 8-byte slot, within the CURRENTLY ACTIVE compile
+; slot's dedicated storage (basix_active_var_slots_ptr, repointed by
+; basix_compile_slot_begin before every compile) -- this is the one
+; place a variable's runtime address gets computed and baked into the
+; compiled program as an immediate, so per-slot isolation lives here
+; rather than needing every call site throughout the parser touched.
 ; -------------------------------------------------------------------------
 basix_var_slot_addr:
+    push rcx
     imul eax, eax, 8
-    lea rax, [rel basix_var_slots + rax]
+    mov rcx, [rel basix_active_var_slots_ptr]
+    add rax, rcx
+    pop rcx
     ret
 
 ; -------------------------------------------------------------------------
 ; basix_var_wide_slot_addr: EAX = variable index. Returns RAX = absolute
 ; address of its 128-byte wide slot (VECTOR2/3/4 and MATRIX4 storage --
-; up to 16 doubles, row-major for MATRIX4). Every variable gets one of
-; these regardless of declared type; scalars just never use theirs.
+; up to 16 doubles, row-major for MATRIX4), within the active compile
+; slot's dedicated storage. Every variable gets one of these regardless
+; of declared type; scalars just never use theirs.
 ; -------------------------------------------------------------------------
 basix_var_wide_slot_addr:
+    push rcx
     imul eax, eax, 128
-    lea rax, [rel basix_var_wide_slots + rax]
+    mov rcx, [rel basix_active_var_wide_ptr]
+    add rax, rcx
+    pop rcx
     ret
 
 ; -------------------------------------------------------------------------
@@ -467,19 +496,168 @@ basix_goto_or_gosub_emit:
     pop rbx
     ret
 
+; -------------------------------------------------------------------------
+; basix_slot_lock_acquire/release: RCX unused. Spins on a single bit,
+; not a proper mutex -- fine under this kernel's preemptive scheduler,
+; since a spinning task keeps taking timer interrupts, which is exactly
+; what lets the lock's current holder (running as some other task) get
+; scheduled and reach the release. No SMP here, so a plain BTS/BTR (no
+; LOCK prefix needed for correctness against interrupts on one core --
+; an interrupt can only land between whole instructions) is enough.
+; -------------------------------------------------------------------------
+basix_compile_lock_acquire:
+    push rax
+.retry:
+    bts dword [rel basix_compile_lock], 0
+    jc .retry
+    pop rax
+    ret
+
+basix_compile_lock_release:
+    push rax
+    btr dword [rel basix_compile_lock], 0
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_slot_init_all: called once from kernel.asm's boot sequence
+; (alongside basix_heap_init). Heap-allocates every slot's code buffer,
+; variable/wide-variable storage, array arena, and string-literal pool.
+; -------------------------------------------------------------------------
+basix_slot_init_all:
+    push rbx
+    push rcx
+    push rax
+
+    mov dword [rel basix_compile_lock], 0
+    mov dword [rel basix_active_slot], 0xFFFFFFFF
+
+    xor ebx, ebx
+.loop:
+    cmp ebx, BASIX_SLOT_COUNT
+    jge .done
+    mov dword [rel basix_slot_in_use + ebx*4], 0
+
+    mov rcx, BASIX_CODE_BUF_SIZE
+    call kmalloc_large
+    mov [rel basix_slot_code_ptr + ebx*8], rax
+
+    mov rcx, BASIX_SLOT_ARENA_SIZE
+    call kmalloc_large
+    mov [rel basix_slot_arena_ptr + ebx*8], rax
+
+    mov rcx, BASIX_SLOT_STRLIT_SIZE
+    call kmalloc_large
+    mov [rel basix_slot_strlit_ptr + ebx*8], rax
+
+    mov rcx, BASIX_MAX_VARS*8
+    call kmalloc_large
+    mov [rel basix_slot_varslots_ptr + ebx*8], rax
+
+    mov rcx, BASIX_MAX_VARS*128
+    call kmalloc_large
+    mov [rel basix_slot_varwide_ptr + ebx*8], rax
+
+    inc ebx
+    jmp .loop
+.done:
+    pop rax
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_slot_alloc: no arguments. Returns EAX = a free slot index,
+; marked in-use, or -1 (0xFFFFFFFF) if all BASIX_SLOT_COUNT slots are
+; busy. Not atomic against another task concurrently allocating --
+; callers already serialize through basix_compile_lock around the
+; compile that follows an allocation, which covers the only place two
+; tasks could actually race for a slot in practice (LAUNCH/RUN/GUI).
+; -------------------------------------------------------------------------
+basix_slot_alloc:
+    push rbx
+    xor ebx, ebx
+.scan:
+    cmp ebx, BASIX_SLOT_COUNT
+    jge .none
+    cmp dword [rel basix_slot_in_use + ebx*4], 0
+    jne .next
+    mov dword [rel basix_slot_in_use + ebx*4], 1
+    mov eax, ebx
+    jmp .out
+.next:
+    inc ebx
+    jmp .scan
+.none:
+    mov eax, 0xFFFFFFFF
+.out:
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_slot_free: ECX = slot index. Marks it available again.
+; -------------------------------------------------------------------------
+basix_slot_free:
+    mov dword [rel basix_slot_in_use + ecx*4], 0
+    ret
+
+; -------------------------------------------------------------------------
+; basix_compile_slot_begin: ECX = slot index. Repoints every "active
+; compile target" pointer at that slot's own dedicated storage and
+; fully resets the shared compile-time bookkeeping (basix_compile_
+; reset_state) -- the one place that makes a compile land in a
+; specific slot's isolated memory instead of some other slot's.
+; Callers must hold basix_compile_lock across resolve+compile+finish.
+; -------------------------------------------------------------------------
+basix_compile_slot_begin:
+    push rax
+    push rbx
+    mov ebx, ecx
+    mov [rel basix_active_slot], ebx
+
+    mov rax, [rel basix_slot_code_ptr + rbx*8]
+    mov [rel basix_active_code_buf_ptr], rax
+    mov rax, [rel basix_slot_varslots_ptr + rbx*8]
+    mov [rel basix_active_var_slots_ptr], rax
+    mov rax, [rel basix_slot_varwide_ptr + rbx*8]
+    mov [rel basix_active_var_wide_ptr], rax
+    mov rax, [rel basix_slot_arena_ptr + rbx*8]
+    mov [rel basix_array_arena_ptr], rax
+    mov rax, [rel basix_slot_strlit_ptr + rbx*8]
+    mov [rel basix_strlit_pool_ptr], rax
+
+    call basix_compile_reset_state
+
+    pop rbx
+    pop rax
+    ret
+
 ; =========================================================================
 ; Data
 ; =========================================================================
 basix_compile_ok: dd 1
 
+; Per-slot heap block pointers (see basix_slot_init_all) and the
+; "currently active compile target" pointers the compiler actually
+; reads/writes through -- repointed by basix_compile_slot_begin.
+align 8
+basix_slot_code_ptr:     times BASIX_SLOT_COUNT dq 0
+basix_slot_arena_ptr:    times BASIX_SLOT_COUNT dq 0
+basix_slot_strlit_ptr:   times BASIX_SLOT_COUNT dq 0
+basix_slot_varslots_ptr: times BASIX_SLOT_COUNT dq 0
+basix_slot_varwide_ptr:  times BASIX_SLOT_COUNT dq 0
+basix_slot_in_use:       times BASIX_SLOT_COUNT dd 0
+basix_active_slot:       dd 0xFFFFFFFF
+basix_compile_lock:      dd 0
+align 8
+basix_active_code_buf_ptr:  dq 0
+basix_active_var_slots_ptr: dq 0
+basix_active_var_wide_ptr:  dq 0
+
 basix_var_count: dd 0
 basix_var_type:  times BASIX_MAX_VARS dd 0
 align 8
 basix_var_name:  times (BASIX_MAX_VARS*32) db 0
-basix_var_slots: times BASIX_MAX_VARS dq 0
-
-align 8
-basix_var_wide_slots: times (BASIX_MAX_VARS * 128) db 0
 
 basix_var_arr_len: times BASIX_MAX_VARS dd 0   ; TOTAL element count
                                                 ; (product of all dims),
@@ -501,12 +679,11 @@ basix_var_arr_dims:  times (BASIX_MAX_VARS * BASIX_MAX_ARRAY_DIMS) dd 0
 basix_dim_scratch_ndims: dd 0
 basix_dim_scratch_dims:  times BASIX_MAX_ARRAY_DIMS dd 0
 
-; basix_array_arena is heap-allocated at kernel init (basix_heap_init,
-; kernel.asm) via kmalloc_large rather than baked into the kernel image
-; as literal zero bytes -- at 16MB, embedding it directly would have
-; bloated KERNEL.BIN from ~2MB to ~18MB, big enough to make the
-; bootloader's fixed-address AllocatePages(KERNEL_LOAD_ADDR) call fail
-; (not enough contiguous free physical memory at that fixed range).
+; basix_array_arena_ptr/pos are now the "active slot" arena pointer/
+; bump-position, repointed to one of BASIX_SLOT_COUNT independently
+; heap-allocated (kmalloc_large, basix_slot_init_all) 32MB arenas by
+; basix_compile_slot_begin before every compile -- no longer a single
+; shared arena set up once at kernel init.
 basix_array_arena_pos: dd 0
 align 8
 basix_array_arena_ptr: dq 0
@@ -515,11 +692,12 @@ basix_array_arena_ptr: dq 0
 ; basix_strlit_intern, basix_parser.inc) -- unlike basix_tok_text_buf,
 ; never reused within one compile, so a compiled program can safely
 ; read from it at runtime long after compilation has moved on to later
-; tokens.
-BASIX_STRLIT_POOL_SIZE equ 16384
+; tokens. Like the array arena above, this is now the "active slot"
+; pointer, repointed to one of BASIX_SLOT_COUNT independent 64KB pools
+; (BASIX_SLOT_STRLIT_SIZE) by basix_compile_slot_begin.
 basix_strlit_pool_pos: dd 0
 align 8
-basix_strlit_pool: times BASIX_STRLIT_POOL_SIZE db 0
+basix_strlit_pool_ptr: dq 0
 
 ; FSAVE/FLOAD (basix_rt_fsave/basix_rt_fload, basix_runtime.inc) scratch:
 ; BASIX64 has no string type, so a filename/file-content array arrives as

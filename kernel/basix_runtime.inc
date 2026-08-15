@@ -204,37 +204,152 @@ basix_rt_newline:
 ; compiled program with no graphics simply draws nothing rather than
 ; crashing the kernel.
 ; -------------------------------------------------------------------------
+; -------------------------------------------------------------------------
+; basix_mark_dirty: ECX=x0, EDX=y0, R8D=x1, R9D=y1 (exclusive upper
+; bounds, screen/back-buffer pixel coordinates -- NOT clipped or
+; validated here, callers pass whatever they already clipped to their
+; own back buffer). Unions this rect into current_task's own dirty
+; bounds (TCB_DIRTY_*, sched.inc) -- the compositor task reads these
+; to blit only the changed region of a task's back buffer instead of
+; the whole thing every pass. No-op before the scheduler is armed
+; (current_task==0) -- nothing composites yet at that point anyway.
+; -------------------------------------------------------------------------
+basix_mark_dirty:
+    push rax
+    push rbx
+
+    mov rbx, [rel current_task]
+    test rbx, rbx
+    jz .out
+
+    cmp dword [rbx+TCB_DIRTY_VALID], 0
+    jne .union
+    mov [rbx+TCB_DIRTY_X0], ecx
+    mov [rbx+TCB_DIRTY_Y0], edx
+    mov [rbx+TCB_DIRTY_X1], r8d
+    mov [rbx+TCB_DIRTY_Y1], r9d
+    mov dword [rbx+TCB_DIRTY_VALID], 1
+    jmp .out
+
+.union:
+    mov eax, [rbx+TCB_DIRTY_X0]
+    cmp ecx, eax
+    jge .x0_ok
+    mov [rbx+TCB_DIRTY_X0], ecx
+.x0_ok:
+    mov eax, [rbx+TCB_DIRTY_Y0]
+    cmp edx, eax
+    jge .y0_ok
+    mov [rbx+TCB_DIRTY_Y0], edx
+.y0_ok:
+    mov eax, [rbx+TCB_DIRTY_X1]
+    cmp r8d, eax
+    jle .x1_ok
+    mov [rbx+TCB_DIRTY_X1], r8d
+.x1_ok:
+    mov eax, [rbx+TCB_DIRTY_Y1]
+    cmp r9d, eax
+    jle .out
+    mov [rbx+TCB_DIRTY_Y1], r9d
+
+.out:
+    pop rbx
+    pop rax
+    ret
+
 basix_rt_ensure_backbuf:
     push rax
     push rcx
     push rdx
     push rdi
+    push r14
+    push r15
 
+    ; Check current_task's OWN TCB_BACKBUF_PTR, not just the global
+    ; mirror -- the global is clobbered to whatever the incoming task's
+    ; TCB says on EVERY context switch (idt.inc/pic.inc), including
+    ; switches to compositor_task/test_task_a/test_task_b, none of
+    ; which ever allocate a back buffer. Under real preemption, an
+    ; intervening switch to one of those between two graphics calls on
+    ; the same program left the global reading 0 again even though this
+    ; task's own buffer was already allocated -- so the global-only
+    ; check below wrongly treated an already-drawn-into buffer as
+    ; "never allocated" and kmalloc'd a fresh, blank one, silently
+    ; discarding everything drawn so far. If our own TCB already has
+    ; one, just re-mirror it into the global (repairing whatever the
+    ; last switch clobbered) instead of reallocating.
+    mov rcx, [rel current_task]
+    test rcx, rcx
+    jz .check_global
+    mov rax, [rcx+TCB_BACKBUF_PTR]
+    test rax, rax
+    jz .check_global
+    mov [rel basix_backbuf_ptr], rax
+    mov eax, [rcx+TCB_BACKBUF_W]
+    mov [rel basix_backbuf_w], eax
+    mov eax, [rcx+TCB_BACKBUF_H]
+    mov [rel basix_backbuf_h], eax
+    jmp .out
+
+.check_global:
     cmp qword [rel basix_backbuf_ptr], 0
     jne .out
 
-    mov eax, [rbx+FB_WIDTH]
-    mov [rel basix_backbuf_w], eax
-    mov eax, [rbx+FB_HEIGHT]
-    mov [rel basix_backbuf_h], eax
+    ; Cache width/height in r14d/r15d (callee-preserved here, unlike the
+    ; basix_backbuf_w/h GLOBALS) for the rest of this function -- kmalloc
+    ; below can take long enough to allocate a fresh page that this task
+    ; gets preempted mid-call, and the SAME global-clobber-on-context-
+    ; switch problem the check above works around also bites here: a
+    ; switch to compositor_task/test_task_a/b during kmalloc zeroes
+    ; basix_backbuf_w/h out from under us (their TCB_BACKBUF_W/H are both
+    ; 0), so re-reading the globals after kmalloc returns silently used
+    ; 0x0 for both the TCB sync below and the zero-fill size -- the
+    ; buffer got allocated with the right byte count (computed before the
+    ; call) but then reported/zero-filled as if it were 0x0, leaving
+    ; every task's TCB_BACKBUF_W/H permanently 0 and every dirty rect the
+    ; compositor ever saw clamped down to nothing.
+    mov r14d, [rbx+FB_WIDTH]
+    mov r15d, [rbx+FB_HEIGHT]
+    mov [rel basix_backbuf_w], r14d
+    mov [rel basix_backbuf_h], r15d
 
-    mov eax, [rel basix_backbuf_w]
-    imul eax, [rel basix_backbuf_h]
+    mov eax, r14d
+    imul eax, r15d
     shl rax, 2                          ; * 4 bytes/pixel
     mov rcx, rax
     call kmalloc
     test rax, rax
     jz .out
     mov [rel basix_backbuf_ptr], rax
+    mov [rel basix_backbuf_w], r14d     ; repair the globals in case a
+    mov [rel basix_backbuf_h], r15d     ; switch during kmalloc clobbered them
+
+    ; Persist into the CURRENTLY RUNNING task's own TCB too (see
+    ; TCB_BACKBUF_PTR, sched.inc) -- otherwise the very next context
+    ; switch back to this task would overwrite the global we just set
+    ; with the stale zero still sitting in its TCB, undoing this
+    ; allocation from that task's point of view. Skipped before the
+    ; scheduler is armed (current_task==0, e.g. the boot-time basixtest
+    ; smoke test) -- the global alone is authoritative then, same as
+    ; always.
+    mov rcx, [rel current_task]
+    test rcx, rcx
+    jz .no_tcb_sync
+    mov [rcx+TCB_BACKBUF_PTR], rax
+    mov [rcx+TCB_BACKBUF_W], r14d
+    mov [rcx+TCB_BACKBUF_H], r15d
+.no_tcb_sync:
 
     mov rdi, rax
-    mov eax, [rel basix_backbuf_w]
-    imul eax, [rel basix_backbuf_h]
+    mov eax, r14d
+    imul eax, r15d
     mov ecx, eax
     xor eax, eax
     cld
     rep stosd
 .out:
+    pop r15
+    pop r14
     pop rdi
     pop rdx
     pop rcx
@@ -275,6 +390,12 @@ basix_rt_pset:
     add rdi, rax
     mov eax, r8d
     mov [rdi], eax
+
+    mov r8d, ecx
+    inc r8d
+    mov r9d, edx
+    inc r9d
+    call basix_mark_dirty
 .out:
     pop rdi
     pop rsi
@@ -303,6 +424,12 @@ basix_rt_cls:
     imul ecx, [rel basix_backbuf_h]
     cld
     rep stosd
+
+    xor ecx, ecx
+    xor edx, edx
+    mov r8d, [rel basix_backbuf_w]
+    mov r9d, [rel basix_backbuf_h]
+    call basix_mark_dirty
 .out:
     pop rdi
     pop rcx
@@ -369,6 +496,18 @@ basix_rt_rect:
     test r9d, r9d
     jle .out
 
+    push rcx
+    push rdx
+    push r8
+    push r9
+    add r8d, ecx                         ; r8d = x+w = x1
+    add r9d, edx                         ; r9d = y+h = y1
+    call basix_mark_dirty                ; ecx=x0, edx=y0 unchanged
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+
     mov ebx, [rel basix_backbuf_w]       ; ebx = stride (in pixels)
     xor r11d, r11d                       ; r11d = row counter
 .row_loop:
@@ -405,56 +544,24 @@ basix_rt_rect:
     ret
 
 ; -------------------------------------------------------------------------
-; basix_rt_flip: no arguments. Blits the back buffer onto the real,
-; visible framebuffer, one scanline at a time -- the two can't share a
-; single rep movsd over the whole thing since the back buffer is
-; tightly packed (stride == width) but the real framebuffer's stride
-; (FB_STRIDE) may exceed its width (GOP padding), so each row needs its
-; own copy with the two pointers re-synced afterward.
+; basix_rt_flip: no arguments. R1: presentation is no longer done here
+; -- a dedicated compositor_task (kernel.asm) independently blits
+; whichever task currently has keyboard focus's own dirty rect to the
+; real framebuffer on its own schedule (see basix_mark_dirty, called
+; by every drawing primitive). FLIP blitting straight to the screen
+; itself, synchronously, is exactly the behavior that let two
+; concurrently-running programs fight over the same pixels once R0
+; made genuine concurrent execution possible -- decoupling
+; presentation from any one program's own draw calls is the actual
+; point of R1.
+;
+; Kept as a real (if now-empty) entry point rather than deleted so
+; every existing .bas program's "draw a frame, then FLIP" structure
+; keeps compiling and running unchanged -- FLIP simply has nothing left
+; to do that basix_mark_dirty (called from within RECT/PSET/LINE/etc.
+; as they draw) and the compositor haven't already handled.
 ; -------------------------------------------------------------------------
 basix_rt_flip:
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-
-    call basix_rt_ensure_backbuf
-    cmp qword [rel basix_backbuf_ptr], 0
-    je .out
-
-    mov r8d, [rel basix_backbuf_h]
-    test r8d, r8d
-    jz .out
-    xor edx, edx                        ; row index
-    mov rsi, [rel basix_backbuf_ptr]
-    mov rdi, [rbx+FB_BASE]
-.rowloop:
-    cmp edx, r8d
-    jge .out
-    mov ecx, [rel basix_backbuf_w]
-    push rsi
-    push rdi
-    cld
-    rep movsd
-    pop rdi
-    pop rsi
-    mov eax, [rel basix_backbuf_w]
-    shl rax, 2
-    add rsi, rax
-    mov eax, [rbx+FB_STRIDE]
-    shl rax, 2
-    add rdi, rax
-    inc edx
-    jmp .rowloop
-.out:
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
     ret
 
 ; -------------------------------------------------------------------------
@@ -578,6 +685,14 @@ basix_rt_fill_tri:
     mov eax, ecx
 .maxy_ok:
     mov [rel basix_tri_maxy], eax
+
+    mov ecx, [rel basix_tri_minx]
+    mov edx, [rel basix_tri_miny]
+    mov r8d, [rel basix_tri_maxx]
+    inc r8d                              ; maxx/maxy are inclusive above --
+    mov r9d, [rel basix_tri_maxy]        ; +1 for basix_mark_dirty's
+    inc r9d                              ; exclusive-upper-bound convention
+    call basix_mark_dirty
 
     ; Per-edge coefficients so each pixel's edge test is just
     ; A*sx+B*sy+C (2 muls, 2 adds) instead of recomputing every
@@ -883,6 +998,45 @@ basix_rt_line_aa:
     movsd [rel basix_wu_x1], xmm0
     movsd xmm0, [rel basix_line_y2f]
     movsd [rel basix_wu_y1], xmm0
+
+    ; Dirty rect: bounding box of both endpoints, with a 1px margin on
+    ; each side for Wu's algorithm's antialiasing bleed onto the
+    ; adjacent pixel row/column at every step.
+    movsd xmm0, [rel basix_line_x1f]
+    minsd xmm0, [rel basix_line_x2f]
+    cvttsd2si ecx, xmm0
+    dec ecx
+    cmp ecx, 0
+    jge .dirty_x0_ok
+    xor ecx, ecx
+.dirty_x0_ok:
+    movsd xmm0, [rel basix_line_y1f]
+    minsd xmm0, [rel basix_line_y2f]
+    cvttsd2si edx, xmm0
+    dec edx
+    cmp edx, 0
+    jge .dirty_y0_ok
+    xor edx, edx
+.dirty_y0_ok:
+    movsd xmm0, [rel basix_line_x1f]
+    maxsd xmm0, [rel basix_line_x2f]
+    cvttsd2si r8d, xmm0
+    add r8d, 2
+    mov eax, [rel basix_backbuf_w]
+    cmp r8d, eax
+    jle .dirty_x1_ok
+    mov r8d, eax
+.dirty_x1_ok:
+    movsd xmm0, [rel basix_line_y1f]
+    maxsd xmm0, [rel basix_line_y2f]
+    cvttsd2si r9d, xmm0
+    add r9d, 2
+    mov eax, [rel basix_backbuf_h]
+    cmp r9d, eax
+    jle .dirty_y1_ok
+    mov r9d, eax
+.dirty_y1_ok:
+    call basix_mark_dirty
 
     ; steep = |y1-y0| > |x1-x0|
     movsd xmm0, [rel basix_wu_y1]
@@ -1492,7 +1646,7 @@ basix_rt_drawtext:
     xor r12d, r12d                       ; r12d = char index
 .char_loop:
     cmp r12d, r14d
-    jge .out
+    jge .mark_dirty
 
     movzx eax, byte [r13 + r12]
     call basix_draw_glyph                ; AL=char, R9D=x, R10D=y, R11D=color
@@ -1500,6 +1654,16 @@ basix_rt_drawtext:
     inc r12d
     jmp .char_loop
 
+.mark_dirty:
+    cmp r14d, 0
+    je .out                              ; empty string -- nothing drawn
+    mov ecx, [rel basix_drawtext_x]      ; x0
+    mov edx, r10d                        ; y0
+    mov r8d, r9d                         ; x1 -- r9d already advanced
+                                          ; past the last glyph column
+    mov r9d, r10d
+    add r9d, 16                          ; y1 = y0+16 (glyph height)
+    call basix_mark_dirty
 .out:
     pop r14
     pop r13
@@ -1536,6 +1700,18 @@ basix_rt_drawchar:
     mov r9d, [rel basix_drawtext_x]
     mov r10d, [rel basix_drawtext_y]
     call basix_draw_glyph
+
+    push rcx
+    push rdx
+    mov ecx, r9d
+    mov edx, r10d
+    mov r8d, r9d
+    add r8d, 8
+    mov r9d, r10d
+    add r9d, 16
+    call basix_mark_dirty
+    pop rdx
+    pop rcx
 
 .out:
     pop r11
@@ -2137,45 +2313,85 @@ basix_launch_name_buf: times BASIX_LAUNCH_NAME_BUF_SIZE db 0
 basix_launch_arg_buf:  times BASIX_LAUNCH_ARG_BUF_SIZE db 0
 basix_launch_arg_len:  dd 0
 
-; basix_launch_saved_code/basix_launch_saved_len: basix_rt_launch's
-; save slot for the LAUNCHing (parent) program's own compiled code
-; while a child runs in basix_code_buf -- see basix_rt_launch. One
-; slot deep: a child that itself calls LAUNCH would clobber its
-; parent's save here, so nested LAUNCH (an app launching another app)
-; isn't supported yet, only one level (e.g. Workbench launching
-; editor.bas/viewer.bas).
-basix_launch_saved_code: times BASIX_CODE_BUF_SIZE db 0
-basix_launch_saved_len:  dd 0
+; -------------------------------------------------------------------------
+; basix_task_launch_wrapper: entry point every LAUNCHed task actually
+; starts at (task_create's RIP), never called directly. RDI = pointer
+; to a small kmalloc'd basix_launch_info block (see basix_rt_launch):
+;   +0  code_ptr      (qword) -- the compiled program's entry point
+;   +8  slot_index     (dword) -- this task's execution slot, to free
+;   +12 arg_len        (dword)
+;   +16 arg_buf_ptr    (qword) -- 0 if arg_len is 0
+; Stores arg_len/arg_buf_ptr into THIS task's own TCB (so ARGLEN/
+; ARGCHAR, called from deep inside the compiled program, can find them
+; via current_task) before running it, then on return frees the arg
+; buffer, the slot, and the launch-info block itself, and terminates
+; via task_exit -- never returns.
+; -------------------------------------------------------------------------
+basix_task_launch_wrapper:
+    ; A fresh task's initial GPR frame is all zeros except RDI (see
+    ; compositor_task's own comment) -- RBX does NOT inherit boot_info*
+    ; here the way it does for every task that grew out of `entry:`'s
+    ; own setup. The launched program's own basix_rt_* calls (PRINT's
+    ; fb_draw_char above all) need RBX=boot_info* for the whole time it
+    ; runs, so recover it from the one global stash before anything else.
+    mov rbx, [rel basix_boot_info_ptr]
+    mov rax, [rel current_task]
+    mov r10, [rdi+16]
+    mov [rax+TCB_LAUNCH_ARG_BUF_PTR], r10
+    mov r10d, [rdi+12]
+    mov [rax+TCB_LAUNCH_ARG_LEN], r10d
+
+    push rdi
+    mov rax, [rdi+0]
+    call rax                            ; run the compiled program
+    pop rdi
+
+    mov rcx, [rdi+16]
+    test rcx, rcx
+    jz .no_arg_free
+    call kfree
+.no_arg_free:
+
+    mov ecx, [rdi+8]
+    call basix_slot_free
+
+    mov rcx, rdi
+    call kfree
+
+    jmp task_exit                       ; never returns
 
 ; -------------------------------------------------------------------------
 ; basix_rt_launch: RCX = program-name array base ptr (int, char codes),
 ; RDX = name length, R8 = argument array base ptr (int, char codes),
 ; R9 = argument length. Converts both int-array-of-char-codes arguments
-; into plain byte buffers (BASIX64 has no string type -- see the
-; comment on basix_launch_name_buf/basix_launch_arg_buf), stashes the
-; argument for the launched program's ARGLEN/ARGCHAR to read, then
-; loads the target exactly like RUN (basix_load_program, in "child"
-; mode: resolves the path, deep paths included, magic-sniffs for a
-; precompiled .axb, and -- unlike a top-level RUN/GUI load -- leaves
-; the shared variable/array-arena/string-pool/label state untouched,
-; see basix_compile_reset_state_child, so THIS program's own variables
-; and arrays survive the child running).
+; into plain byte buffers (BASIX64 has no string type), loads the
+; target exactly like RUN into a freshly basix_slot_alloc'd execution
+; slot of its own (see basix_symbols.inc's R0 slot block) -- the
+; child's variables, arrays, string literals and code all live in
+; genuinely separate memory from the launching program's, so nested
+; LAUNCH (an app launching another app launching another...) just
+; works up to BASIX_SLOT_COUNT deep instead of the old one-level limit.
 ;
-; Runs the child via a real CALL (not a tail-jump) after saving this
-; program's own compiled bytes to basix_launch_saved_code, so once the
-; child's own trailing RET returns here, its code can be restored back
-; into basix_code_buf and this routine can return normally too --
-; resuming the launching program exactly where it left off, the same
-; way any ordinary subroutine call would, rather than replacing it
-; forever. On a failed load (bad path/compile error/stale .axb) the
-; save is restored immediately and this returns normally either way,
-; so the calling program always continues past the LAUNCH statement
-; once basix_rt_launch returns -- it just may have had a whole other
-; program run to completion first.
+; Genuinely concurrent and non-blocking: creates a real scheduled task
+; (task_create, entry = basix_task_launch_wrapper) and splices it into
+; the ready ring right after the CALLING task, then returns immediately
+; -- the calling program continues on to its next statement while the
+; child runs alongside it, not after it. The argument bytes are copied
+; into a private kmalloc'd buffer handed to the child's own task (see
+; basix_task_launch_wrapper) rather than left in a shared buffer,
+; specifically because a second LAUNCH can now happen before the first
+; child has even started running, let alone read ARGLEN/ARGCHAR -- a
+; shared buffer would let one LAUNCH's argument clobber another's.
+;
+; On failure (no free slot/bad path/compile error/stale .axb/kmalloc
+; or task_create failure) this returns normally either way, so the
+; calling program always continues past the LAUNCH statement; a failed
+; launch is silently skipped (no console here to report to).
 ; -------------------------------------------------------------------------
 basix_rt_launch:
     push rsi
     push rdi
+    push rbx
     push r12
     push r13
     push r14
@@ -2185,6 +2401,14 @@ basix_rt_launch:
     mov r13d, edx                       ; namelen
     mov r14, r8                         ; argarr ptr
     mov r15d, r9d                       ; arglen
+
+    ; Name-buffer fill + resolve/compile all happen under the compile
+    ; lock now (widened from just resolve+compile) so a second LAUNCH
+    ; can't overwrite this one's shared basix_launch_name_buf staging
+    ; area before basix_load_program has read it -- see this routine's
+    ; header comment on why that race is real now that LAUNCH doesn't
+    ; block.
+    call basix_compile_lock_acquire
 
     cmp r13d, BASIX_LAUNCH_NAME_BUF_SIZE - 1
     jbe .namelen_ok
@@ -2216,66 +2440,180 @@ basix_rt_launch:
     inc esi
     jmp .arg_copy
 .arg_done:
-    mov [rel basix_launch_arg_len], r15d
+                                         ; r15d = arg byte count, kept
+                                         ; alive through to the private
+                                         ; copy below
 
-    ; Save the currently-running (parent) program's compiled code so it
-    ; can be restored and RESUMED via an ordinary CALL/RET once the
-    ; child finishes, instead of being replaced forever.
-    mov eax, [rel basix_code_pos]
-    mov [rel basix_launch_saved_len], eax
-    mov ecx, eax
-    lea rsi, [rel basix_code_buf]
-    lea rdi, [rel basix_launch_saved_code]
-    cld
-    rep movsb
+    call basix_slot_alloc
+    cmp eax, 0xFFFFFFFF
+    je .no_slot                         ; all 8 slots busy
+    mov ebx, eax                        ; ebx = child's slot
 
+    ; basix_load_program's own prologue only saves/restores RCX/RDX/R8/
+    ; R9/R10/R11/R12 around its body -- R13/R14/R15 are NOT guaranteed
+    ; to survive the call (this bit a similar assumption once already,
+    ; see [[basix_rel32_farcall_bug]]), so r15d (arg byte count, still
+    ; needed below) gets spilled to the stack across it rather than
+    ; trusted to survive in-register.
+    push r15
     lea rcx, [rel basix_launch_name_buf]
-    mov edx, 1                          ; child mode
+    mov edx, ebx
     call basix_load_program
+    pop r15
     test eax, eax
-    jnz .restore                        ; load failed -- restore & return
+    jnz .load_failed
 
-    call basix_code_buf                 ; real CALL: the child's own
-                                         ; trailing RET returns here
+    mov r12, [rel basix_active_code_buf_ptr]  ; r12 = code ptr, capture
+                                               ; before unlocking
+    call basix_compile_lock_release
 
-.restore:
-    mov ecx, [rel basix_launch_saved_len]
-    mov [rel basix_code_pos], ecx
-    lea rsi, [rel basix_launch_saved_code]
-    lea rdi, [rel basix_code_buf]
+    ; Private copy of the argument bytes for the child's own task (see
+    ; header comment) -- 0 length is fine, just means arg_buf_ptr stays
+    ; 0 and ARGLEN reads back 0, same as "started via RUN".
+    xor r13, r13                        ; r13 = arg_buf_ptr (private copy)
+    test r15d, r15d
+    jz .no_arg_bytes
+    mov rcx, r15
+    call kmalloc
+    test rax, rax
+    jz .arg_alloc_failed
+    mov r13, rax
+    lea rsi, [rel basix_launch_arg_buf]
+    mov rdi, rax
+    mov ecx, r15d
     cld
     rep movsb
+.no_arg_bytes:
+
+    mov rcx, 24
+    call kmalloc
+    test rax, rax
+    jz .info_alloc_failed
+    mov r14, rax                        ; r14 = launch-info block
+    mov [r14+0], r12                    ; code_ptr
+    mov [r14+8], ebx                    ; slot_index
+    mov [r14+12], r15d                  ; arg_len
+    mov [r14+16], r13                   ; arg_buf_ptr
+
+    mov rcx, basix_task_launch_wrapper
+    mov rdx, r14
+    mov r8, 16384
+    call task_create
+    test rax, rax
+    jz .task_create_failed
+    mov r12, rax                        ; r12 = new task's TCB
+
+    ; Splice into the ready ring right after the CALLING task. Two
+    ; plain writes, safe under preemption without disabling interrupts
+    ; -- the ring stays validly circular (just missing the new node)
+    ; right up until the second write makes it reachable; no window
+    ; where sched_pick_next could see a dangling/half-built link.
+    mov rbx, [rel current_task]
+    test rbx, rbx
+    jz .no_scheduler                    ; shouldn't happen (LAUNCH only
+                                         ; makes sense once armed), but
+                                         ; defensive: leaks the task
+                                         ; rather than risk a bad splice
+    mov rcx, [rbx+TCB_NEXT]
+    mov [r12+TCB_NEXT], rcx
+    mov [rbx+TCB_NEXT], r12
+    jmp .done
+
+.task_create_failed:
+    ; Free whatever we already committed for this launch attempt.
+    test r13, r13
+    jz .tcf_no_arg
+    mov rcx, r13
+    call kfree
+.tcf_no_arg:
+    mov rcx, r14
+    call kfree
+    mov ecx, ebx
+    call basix_slot_free
+    jmp .done
+
+.info_alloc_failed:
+    test r13, r13
+    jz .iaf_no_arg
+    mov rcx, r13
+    call kfree
+.iaf_no_arg:
+    mov ecx, ebx
+    call basix_slot_free
+    jmp .done
+
+.arg_alloc_failed:
+    mov ecx, ebx
+    call basix_slot_free
+    jmp .done
+
+.no_scheduler:
+    ; Leaks the TCB/stack/slot -- extremely unlikely path (LAUNCH
+    ; called with no current task at all) and not worth the extra
+    ; unwind machinery for something that shouldn't happen in practice.
+    jmp .done
+
+.load_failed:
+    call basix_compile_lock_release
+    mov ecx, ebx
+    call basix_slot_free
+    jmp .done
+
+.no_slot:
+    call basix_compile_lock_release
+
+.done:
     mov dword [rel basix_compile_ok], 1
 
     pop r15
     pop r14
     pop r13
     pop r12
+    pop rbx
     pop rdi
     pop rsi
     ret
 
 ; -------------------------------------------------------------------------
 ; basix_rt_arglen: no arguments. Returns the length (in bytes) of the
-; argument the current program was LAUNCHed with, or 0 if it wasn't
-; (e.g. started via RUN).
+; argument the CALLING task (current_task) was LAUNCHed with, or 0 if
+; it wasn't (e.g. started via RUN, or the scheduler isn't armed yet).
+; Reads current_task's own TCB_LAUNCH_ARG_LEN/BUF_PTR (see
+; basix_task_launch_wrapper) rather than a single shared buffer --
+; needed now that LAUNCH creates a genuinely concurrent task instead
+; of blocking, so two LAUNCHed programs' arguments can't collide.
 ; -------------------------------------------------------------------------
 basix_rt_arglen:
-    mov eax, [rel basix_launch_arg_len]
+    mov rax, [rel current_task]
+    test rax, rax
+    jz .none
+    mov eax, [rax+TCB_LAUNCH_ARG_LEN]
+    ret
+.none:
+    xor eax, eax
     ret
 
 ; -------------------------------------------------------------------------
 ; basix_rt_argchar: RCX = index. Returns the index'th byte (as an int
-; char code) of the current LAUNCH argument, or 0 if out of range.
+; char code) of the current task's LAUNCH argument, or 0 if out of
+; range.
 ; -------------------------------------------------------------------------
 basix_rt_argchar:
-    cmp ecx, [rel basix_launch_arg_len]
+    push rbx
+    mov rbx, [rel current_task]
+    test rbx, rbx
+    jz .oob
+    cmp ecx, [rbx+TCB_LAUNCH_ARG_LEN]
     jae .oob
-    lea rax, [rel basix_launch_arg_buf]
+    mov rax, [rbx+TCB_LAUNCH_ARG_BUF_PTR]
+    test rax, rax
+    jz .oob
     movzx eax, byte [rax+rcx]
-    ret
+    jmp .out
 .oob:
     xor eax, eax
+.out:
+    pop rbx
     ret
 
 ; -------------------------------------------------------------------------

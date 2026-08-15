@@ -72,7 +72,54 @@ TCB_FPU         equ 40  ; pointer to this task's 512-byte, 16-byte-aligned
                          ; lives in almost entirely; without this a task
                          ; preempted mid float computation could resume
                          ; with another task's XMM state)
-TCB_SIZE        equ 48
+TCB_BACKBUF_PTR equ 48  ; this task's own off-screen back buffer (see
+                         ; basix_rt_ensure_backbuf, basix_runtime.inc) --
+                         ; 0 until that task's first graphics call
+                         ; allocates one. irq0_stub/isr_common mirror
+                         ; TCB_BACKBUF_PTR/W/H into the global
+                         ; basix_backbuf_ptr/w/h on every switch-IN, so
+                         ; every basix_rt_* graphics routine keeps reading
+                         ; through the same global as before and just
+                         ; transparently sees "whichever task is running
+                         ; right now"'s own buffer -- see R0's per-task
+                         ; backbuffer work.
+TCB_BACKBUF_W   equ 56
+TCB_BACKBUF_H   equ 60
+TCB_KBD_BUF_PTR equ 64  ; this task's own 256-byte keyboard ring buffer
+                         ; (see keyboard.inc's kbd_has_char/kbd_read_char,
+                         ; which now resolve through current_task instead
+                         ; of one shared kbd_buf) -- allocated up front in
+                         ; task_create, not lazily like the back buffer,
+                         ; since 256 bytes/task is trivial and every task
+                         ; that can call GETKEY/KEYHIT needs one from the
+                         ; moment it starts.
+TCB_KBD_HEAD    equ 72
+TCB_KBD_TAIL    equ 76
+TCB_LAUNCH_ARG_BUF_PTR equ 80  ; this task's own kmalloc'd copy of its
+                                ; LAUNCH argument bytes (0/empty if it
+                                ; wasn't started via LAUNCH -- e.g. RUN),
+                                ; read by ARGLEN/ARGCHAR through
+                                ; current_task. Freed by
+                                ; basix_task_launch_wrapper once the
+                                ; task's own compiled code returns. A
+                                ; private per-task copy (not the old
+                                ; single shared basix_launch_arg_buf) is
+                                ; what makes LAUNCH safe to be genuinely
+                                ; concurrent/non-blocking now -- see
+                                ; basix_rt_launch.
+TCB_LAUNCH_ARG_LEN     equ 88
+; R1: this task's own dirty rect (bounding box of everything drawn
+; into its back buffer since the compositor task last composited it --
+; see basix_mark_dirty, basix_runtime.inc, and the compositor task).
+; [X0,Y0)-[X1,Y1), exclusive upper bound. TCB_DIRTY_VALID==0 means
+; nothing has been drawn since the last composite (or ever) -- the
+; other four fields are meaningless until it's 1.
+TCB_DIRTY_X0    equ 92
+TCB_DIRTY_Y0    equ 96
+TCB_DIRTY_X1    equ 100
+TCB_DIRTY_Y1    equ 104
+TCB_DIRTY_VALID equ 108
+TCB_SIZE        equ 112
 
 TCB_STATE_ALIVE      equ 0
 TCB_STATE_TERMINATED equ 1
@@ -228,6 +275,9 @@ task_create:
     mov [rbx+TCB_RSP], rax
     mov qword [rbx+TCB_NEXT], 0
     mov dword [rbx+TCB_STATE], TCB_STATE_ALIVE
+    mov qword [rbx+TCB_BACKBUF_PTR], 0
+    mov dword [rbx+TCB_BACKBUF_W], 0
+    mov dword [rbx+TCB_BACKBUF_H], 0
 
     ; This task's own FXSAVE area (see TCB_FPU) -- captured from the
     ; CURRENT cpu's FPU/SSE state (kmalloc's 16-byte alignment satisfies
@@ -240,6 +290,19 @@ task_create:
     jz .fail_free_stack
     fxsave [rax]
     mov [rbx+TCB_FPU], rax
+
+    ; This task's own keyboard ring buffer (see TCB_KBD_BUF_PTR above).
+    mov rcx, 256
+    call kmalloc
+    test rax, rax
+    jz .fail_free_stack
+    mov [rbx+TCB_KBD_BUF_PTR], rax
+    mov dword [rbx+TCB_KBD_HEAD], 0
+    mov dword [rbx+TCB_KBD_TAIL], 0
+
+    mov qword [rbx+TCB_LAUNCH_ARG_BUF_PTR], 0
+    mov dword [rbx+TCB_LAUNCH_ARG_LEN], 0
+    mov dword [rbx+TCB_DIRTY_VALID], 0
 
     mov rax, rbx
     jmp .out

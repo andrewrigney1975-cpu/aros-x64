@@ -3296,7 +3296,7 @@ basix_parse_dim:
     shl ecx, 3                           ; bytes needed = size * 8
     mov edx, [rel basix_array_arena_pos]
     add edx, ecx
-    cmp edx, BASIX_ARRAY_ARENA_SIZE
+    cmp edx, BASIX_SLOT_ARENA_SIZE
     ja .arena_overflow
 
     mov eax, [rel basix_array_arena_pos]
@@ -3722,14 +3722,14 @@ basix_strlit_intern:
     mov r9d, edx                        ; r9d = requested length
     mov r10d, [rel basix_strlit_pool_pos] ; r10d = start of this copy
 
-    mov eax, BASIX_STRLIT_POOL_SIZE
+    mov eax, BASIX_SLOT_STRLIT_SIZE
     sub eax, r10d                       ; eax = remaining space
     cmp r9d, eax
     jbe .len_ok
     mov dword [rel basix_compile_ok], 0
     xor r9d, r9d
 .len_ok:
-    lea rdi, [rel basix_strlit_pool]
+    mov rdi, [rel basix_strlit_pool_ptr]
     add rdi, r10
     mov rsi, r8
     mov ecx, r9d
@@ -3740,7 +3740,7 @@ basix_strlit_intern:
     add eax, r9d
     mov [rel basix_strlit_pool_pos], eax
 
-    lea rax, [rel basix_strlit_pool]
+    mov rax, [rel basix_strlit_pool_ptr]
     add rax, r10                        ; rax = address of this copy
     mov ecx, r9d                        ; ecx = length copied
 
@@ -3755,19 +3755,15 @@ basix_strlit_intern:
 ; -------------------------------------------------------------------------
 ; basix_heap_init: called once from kernel.asm's boot sequence, right
 ; after pmm_init, and before anything might compile/run a BASIX64
-; program. Heap-allocates basix_array_arena/basix_file_scratch (via
-; kmalloc_large) instead of embedding them as literal zero bytes in the
-; kernel image -- at a combined 17MB, embedding them directly would
-; have bloated KERNEL.BIN enough to make the bootloader's fixed-address
-; AllocatePages(KERNEL_LOAD_ADDR) call fail outright (see basix_symbols.
-; inc's comment on basix_array_arena_ptr).
+; program. Heap-allocates basix_file_scratch (via kmalloc_large)
+; instead of embedding it as literal zero bytes in the kernel image
+; (see basix_symbols.inc's comment on basix_file_scratch_ptr). The
+; per-slot code/arena/strlit/var buffers (basix_array_arena_ptr's own
+; backing memory included) are allocated separately by
+; basix_slot_init_all, called right alongside this from kernel.asm.
 ; -------------------------------------------------------------------------
 basix_heap_init:
     push rcx
-    mov rcx, BASIX_ARRAY_ARENA_SIZE
-    call kmalloc_large
-    mov [rel basix_array_arena_ptr], rax
-
     mov rcx, BASIX_FILE_SCRATCH_SIZE
     call kmalloc_large
     mov [rel basix_file_scratch_ptr], rax
@@ -3809,30 +3805,6 @@ basix_compile_reset_state:
     jmp basix_runtime_reset_state
 
 ; -------------------------------------------------------------------------
-; basix_compile_reset_state_child: like basix_compile_reset_state, but
-; deliberately does NOT call basix_runtime_reset_state -- used when
-; compiling a program LAUNCHed as a child of one still running (see
-; basix_rt_launch), which needs to RESUME afterward via a normal CALL/
-; RET rather than being replaced forever. The parent's variables (fixed
-; absolute addresses baked into its already-compiled code -- see this
-; file's top comment) and array-arena contents must survive the
-; child's entire compile+run, so basix_var_count/basix_array_arena_pos/
-; basix_strlit_pool_pos/basix_label_count/basix_fixup_count are left
-; exactly where the parent's own compile left them; the child's own
-; variables/arrays/labels/string-literals simply continue bump-
-; allocating from there instead of colliding with the parent's. Only
-; basix_code_pos/basix_compile_ok reset, since basix_code_buf itself
-; unavoidably has to be overwritten with the child's code (its caller
-; is responsible for saving/restoring the parent's own code bytes
-; around the child's whole compile+run -- this routine only handles
-; the symbol-table side of that split).
-; -------------------------------------------------------------------------
-basix_compile_reset_state_child:
-    mov dword [rel basix_compile_ok], 1
-    mov dword [rel basix_code_pos], 0
-    ret
-
-; -------------------------------------------------------------------------
 ; basix_compile: RCX = ptr to a NUL-terminated BASIX64 source buffer
 ; already fully resident in memory. Compiles it into basix_code_buf
 ; (callable at that address on success). Returns EAX=1/0.
@@ -3854,19 +3826,6 @@ basix_compile:
 basix_compile_file:
     push rbx
     call basix_compile_reset_state
-    call basix_lex_init_stream
-    call basix_lex_next
-    jmp basix_compile_tail
-
-; -------------------------------------------------------------------------
-; basix_compile_file_child: identical to basix_compile_file except it
-; calls basix_compile_reset_state_child instead -- see that routine's
-; comment. Used by basix_load_program's child mode (LAUNCH), never by
-; a top-level RUN/GUI compile.
-; -------------------------------------------------------------------------
-basix_compile_file_child:
-    push rbx
-    call basix_compile_reset_state_child
     call basix_lex_init_stream
     call basix_lex_next
     jmp basix_compile_tail

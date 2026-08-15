@@ -197,59 +197,129 @@ kbd_irq_stub:
     iretq
 
 ; -------------------------------------------------------------------------
-; kbd_buf_push: AL = character to enqueue. Silently drops it if the
-; buffer is full (a stuck/unread console is not worth crashing over).
+; kbd_buf_push: AL = character to enqueue. Pushes into the currently
+; keyboard-focused task's own 256-byte ring buffer (TCB_KBD_BUF_PTR/
+; HEAD/TAIL, see sched.inc) rather than one buffer shared by every
+; task -- see basix_kbd_focus_task below. Falls back to the original
+; single shared kbd_buf whenever no focus target is set yet (very
+; early boot, before main's TCB exists) or that task's queue somehow
+; isn't allocated, so nothing breaks before the scheduler is armed.
+; Silently drops the character if the target buffer is full (a stuck/
+; unread console is not worth crashing over).
 ; -------------------------------------------------------------------------
 kbd_buf_push:
     push rbx
     push rcx
     push rdx
+    push r8
 
+    mov rbx, [rel basix_kbd_focus_task]
+    test rbx, rbx
+    jz .legacy
+    mov rdx, [rbx+TCB_KBD_BUF_PTR]
+    test rdx, rdx
+    jz .legacy
+
+    movzx ecx, byte [rbx+TCB_KBD_HEAD]
+    mov r8b, cl
+    inc r8b
+    cmp r8b, [rbx+TCB_KBD_TAIL]
+    je .out                             ; full -- drop
+    mov [rdx+rcx], al
+    mov [rbx+TCB_KBD_HEAD], r8b
+    jmp .out
+
+.legacy:
     movzx edx, byte [rel kbd_buf_head]
     mov bl, dl
     inc bl
     cmp bl, [rel kbd_buf_tail]
-    je .full
+    je .out
     lea rcx, [rel kbd_buf]
     mov [rcx+rdx], al
     mov [rel kbd_buf_head], bl
-.full:
+
+.out:
+    pop r8
     pop rdx
     pop rcx
     pop rbx
     ret
 
 ; -------------------------------------------------------------------------
-; kbd_has_char: returns EAX=1 if a decoded character is waiting, else 0.
+; kbd_has_char: returns EAX=1 if a decoded character is waiting for the
+; CALLING task (current_task's own queue), else 0. Falls back to the
+; legacy shared kbd_buf before the scheduler is armed (current_task==0
+; -- e.g. the boot-time basixtest smoke test) or if the current task
+; somehow has no queue allocated.
 ; -------------------------------------------------------------------------
 kbd_has_char:
+    push rbx
+    mov rbx, [rel current_task]
+    test rbx, rbx
+    jz .legacy
+    cmp qword [rbx+TCB_KBD_BUF_PTR], 0
+    je .legacy
+    movzx eax, byte [rbx+TCB_KBD_TAIL]
+    cmp al, [rbx+TCB_KBD_HEAD]
+    je .none
+    mov eax, 1
+    jmp .out
+.legacy:
     movzx eax, byte [rel kbd_buf_tail]
     cmp al, [rel kbd_buf_head]
     je .none
     mov eax, 1
-    ret
+    jmp .out
 .none:
     xor eax, eax
+.out:
+    pop rbx
     ret
 
 ; -------------------------------------------------------------------------
-; kbd_read_char: blocks (via HLT) until a character is available, then
-; returns it in AL (zero-extended into EAX).
+; kbd_read_char: blocks (via HLT) until a character is available for the
+; CALLING task (current_task's own queue, or the legacy shared kbd_buf
+; before the scheduler is armed -- see kbd_has_char), then returns it in
+; AL (zero-extended into EAX). Re-resolves current_task on every wait
+; iteration, which is safe: a task only ever calls this about itself,
+; and current_task is always back to pointing at this task by the time
+; its own code resumes running after any preemption in between.
 ; -------------------------------------------------------------------------
 kbd_read_char:
     push rbx
     push rcx
+    push rdx
 .wait:
-    movzx ecx, byte [rel kbd_buf_tail]
-    cmp cl, [rel kbd_buf_head]
-    jne .have_char
+    mov rbx, [rel current_task]
+    test rbx, rbx
+    jz .wait_legacy
+    mov rdx, [rbx+TCB_KBD_BUF_PTR]
+    test rdx, rdx
+    jz .wait_legacy
+    movzx ecx, byte [rbx+TCB_KBD_TAIL]
+    cmp cl, [rbx+TCB_KBD_HEAD]
+    jne .have_char_task
     hlt
     jmp .wait
-.have_char:
+.have_char_task:
+    movzx eax, byte [rdx+rcx]
+    inc cl
+    mov [rbx+TCB_KBD_TAIL], cl
+    jmp .out
+.wait_legacy:
+    movzx ecx, byte [rel kbd_buf_tail]
+    cmp cl, [rel kbd_buf_head]
+    jne .have_char_legacy
+    hlt
+    jmp .wait
+.have_char_legacy:
     lea rbx, [rel kbd_buf]
     movzx eax, byte [rbx+rcx]
     inc cl
     mov [rel kbd_buf_tail], cl
+.out:
+    pop rdx
     pop rcx
     pop rbx
     ret
@@ -288,6 +358,14 @@ kbd_ralt_active:      db 0
 
 kbd_buf_head: db 0
 kbd_buf_tail: db 0
+
+; R0: which task's own keyboard queue the ISR delivers new characters
+; into (see kbd_buf_push). 0 until main's TCB is built (kernel.asm),
+; at which point it's set to main and nothing else moves it yet -- a
+; real focus-follows-window mechanism is future GUI/window-manager
+; work, not part of R0.
+align 8
+basix_kbd_focus_task: dq 0
 
 ; Scancode Set 1, unshifted. Index = make-code scancode (0x00-0x7F).
 ; Zero entries are keys with no printable ASCII (modifiers, F-keys, etc.)

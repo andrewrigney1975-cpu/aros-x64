@@ -26,6 +26,12 @@ entry:
     mov rbx, rcx                        ; rbx = boot_info (kept for the
                                          ; whole kernel; must not be
                                          ; clobbered by any helper below)
+    mov [rel basix_boot_info_ptr], rcx  ; stashed once so any fresh task
+                                         ; (task_create's initial GPR frame
+                                         ; is all zeros except RDI -- no
+                                         ; inherited RBX) can still recover
+                                         ; boot_info* -- see
+                                         ; basix_task_launch_wrapper
     sub rsp, 32                         ; shadow space (JMP entry starts
                                          ; 16B-aligned, so no parity fixup
                                          ; is needed here -- see bootloader
@@ -50,6 +56,7 @@ entry:
     call pmm_init
 
     call basix_heap_init
+    call basix_slot_init_all
 
     ; Interrupts stay off until every bulk rep-stos/rep-movs boot-time
     ; clear above (the PMM bitmap fill, the VMM's page-table zeroing, the
@@ -963,6 +970,9 @@ entry:
                                          ; the shared global pml4
     mov qword [r15+TCB_STACK_PAGES], 0
     mov dword [r15+TCB_STATE], TCB_STATE_ALIVE
+    mov qword [r15+TCB_BACKBUF_PTR], 0
+    mov dword [r15+TCB_BACKBUF_W], 0
+    mov dword [r15+TCB_BACKBUF_H], 0
 
     mov rcx, 512
     call kmalloc                        ; kmalloc never touches r15
@@ -970,6 +980,37 @@ entry:
     jz .sched_bad
     fxsave [rax]
     mov [r15+TCB_FPU], rax
+
+    mov rcx, 256
+    call kmalloc
+    test rax, rax
+    jz .sched_bad
+    mov [r15+TCB_KBD_BUF_PTR], rax
+    mov dword [r15+TCB_KBD_HEAD], 0
+    mov dword [r15+TCB_KBD_TAIL], 0
+    mov qword [r15+TCB_LAUNCH_ARG_BUF_PTR], 0
+    mov dword [r15+TCB_LAUNCH_ARG_LEN], 0
+    mov dword [r15+TCB_DIRTY_VALID], 0
+
+    ; Main starts out as the sole keyboard-focused task -- exactly
+    ; today's behavior (the interactive shell and any RUN/GUI program
+    ; it launches synchronously are all still "main" at this point in
+    ; R0). Nothing yet moves focus elsewhere; that's a later GUI/
+    ; window-manager concern once real concurrent tasks exist.
+    mov [rel basix_kbd_focus_task], r15
+
+    ; R1: the compositor task -- see compositor_task's own comment.
+    ; Needs boot_info* (RBX) to reach the real framebuffer, which
+    ; task_create can't hand it implicitly (a fresh task's initial GPR
+    ; frame is all zeros except RDI), so it's passed explicitly as the
+    ; task_create argument and moved into RBX at the task's own start.
+    mov rcx, compositor_task
+    mov rdx, rbx
+    mov r8, 16384
+    call task_create
+    test rax, rax
+    jz .sched_bad
+    mov r12, rax                        ; r12 = compositor's TCB
 
     mov rcx, test_task_a
     xor edx, edx
@@ -1011,7 +1052,8 @@ entry:
     jz .sched_bad
     mov r9, rax                         ; r9 = overflow-demo task's TCB
 
-    mov [r15+TCB_NEXT], r13             ; ring: main -> A -> B -> exit -> crash -> overflow -> main
+    mov [r15+TCB_NEXT], r12             ; ring: main -> compositor -> A -> B -> exit -> crash -> overflow -> main
+    mov [r12+TCB_NEXT], r13
     mov [r13+TCB_NEXT], r14
     mov [r14+TCB_NEXT], r10
     mov [r10+TCB_NEXT], r11
@@ -1136,11 +1178,17 @@ entry:
     ; This only proves the pipeline works end to end (compiles without
     ; error and executes without crashing) -- RUN in the shell is the
     ; real way to see a program's output.
+    xor ecx, ecx
+    call basix_compile_slot_begin       ; use slot 0 for this boot-time
+                                         ; smoke test -- basix_compile
+                                         ; itself no longer resolves an
+                                         ; active code buffer on its own
     lea rcx, [rel basixtest_src]
     call basix_compile
     test eax, eax
     jz .basixtest_bad
-    call basix_code_buf
+    mov rax, [rel basix_active_code_buf_ptr]
+    call rax
     lea rcx, [rel msg_basixtest_ran]
     call serial_puts
     jmp .basixtest_done
@@ -1168,6 +1216,123 @@ entry:
 .hang:
     hlt
     jmp .hang
+
+; -------------------------------------------------------------------------
+; compositor_task: R1's compositor. RDI = boot_info* (task_create's
+; argument delivery -- moved into RBX immediately, since a fresh
+; task's initial GPR frame doesn't carry the "RBX=boot_info* always"
+; convention the rest of the kernel relies on; every basix_rt_* caller
+; up to now only ever ran on a task that inherited RBX from `entry:`'s
+; own setup, never a brand-new one).
+;
+; Loop: find the current foreground task (basix_kbd_focus_task -- a
+; stand-in for real window z-order/stacking, which doesn't exist until
+; R2), and if it has a dirty rect (TCB_DIRTY_VALID) and a back buffer,
+; blit just that rect from its back buffer to the real framebuffer at
+; the same coordinates (no window offset yet -- every task's back
+; buffer is still full-screen-sized and origin-(0,0), see
+; basix_rt_ensure_backbuf; R4/R5's window chrome/positioning work is
+; what will give a task's own drawing a real screen offset), then
+; clear its dirty flag. This is what FLIP used to do synchronously,
+; inline, in the calling program itself -- now it happens
+; independently, on its own schedule, from a dedicated task, which is
+; the actual point of R1: presentation is decoupled from any one
+; program's own execution, so multiple concurrent programs no longer
+; each fight to blit their own frame straight to the screen.
+;
+; Paced with a plain busy-wait between passes (same style as
+; test_task_a/b below) rather than tightly looping -- there's nothing
+; to do most passes (nothing dirty), so there's no reason to burn a
+; full timer quantum on this every single time round the ready ring.
+; -------------------------------------------------------------------------
+compositor_task:
+    mov rbx, rdi                        ; rbx = boot_info*
+.loop:
+    mov rax, [rel basix_kbd_focus_task]
+    test rax, rax
+    jz .delay
+    cmp dword [rax+TCB_DIRTY_VALID], 0
+    je .delay
+    mov rsi, [rax+TCB_BACKBUF_PTR]
+    test rsi, rsi
+    jz .delay
+
+    mov r8d, [rax+TCB_DIRTY_X0]
+    mov r9d, [rax+TCB_DIRTY_Y0]
+    mov r10d, [rax+TCB_DIRTY_X1]
+    mov r11d, [rax+TCB_DIRTY_Y1]
+    mov r12d, [rax+TCB_BACKBUF_W]
+    mov r13d, [rax+TCB_BACKBUF_H]
+
+    cmp r8d, 0
+    jge .x0_clamped
+    xor r8d, r8d
+.x0_clamped:
+    cmp r9d, 0
+    jge .y0_clamped
+    xor r9d, r9d
+.y0_clamped:
+    cmp r10d, r12d
+    jle .x1_clamped
+    mov r10d, r12d
+.x1_clamped:
+    cmp r11d, r13d
+    jle .y1_clamped
+    mov r11d, r13d
+.y1_clamped:
+    cmp r8d, r10d
+    jge .clear_dirty                    ; empty after clamping
+    cmp r9d, r11d
+    jge .clear_dirty
+
+    mov r14d, r9d                       ; r14d = row index
+.row_loop:
+    cmp r14d, r11d
+    jge .clear_dirty
+
+    mov eax, r14d
+    imul eax, r12d
+    add eax, r8d
+    mov rcx, rsi
+    lea rcx, [rcx + rax*4]              ; source: this row's dirty span
+
+    mov eax, r14d
+    imul eax, [rbx+FB_STRIDE]
+    add eax, r8d
+    mov rdx, [rbx+FB_BASE]
+    lea rdx, [rdx + rax*4]              ; dest: same span in the real fb
+
+    push rsi
+    push rdi
+    mov rsi, rcx
+    mov rdi, rdx
+    mov ecx, r10d
+    sub ecx, r8d                        ; span width, in pixels
+    cld
+    rep movsd
+    pop rdi
+    pop rsi
+
+    inc r14d
+    jmp .row_loop
+
+.clear_dirty:
+    mov dword [rax+TCB_DIRTY_VALID], 0
+
+.delay:
+    ; No explicit busy-wait: checking "is anything dirty" is a handful
+    ; of memory reads, cheap enough to just do again immediately.
+    ; Round-robin scheduling already caps how much of the CPU this can
+    ; ever take -- SCHED_QUANTUM (sched.inc) preempts back to the next
+    ; ready task at the same fixed ~20ms cadence whether this loop
+    ; spins tightly or sleeps, so a busy-wait here would only add
+    ; guesswork about how many cycles is "long enough" (this kernel's
+    ; TCG emulation speed varies widely across environments -- a fixed
+    ; iteration count tuned on a fast host, like this one originally
+    ; was, could leave a slow host waiting tens of seconds for the
+    ; first composite pass) without changing the actual worst-case CPU
+    ; share this task can consume.
+    jmp .loop
 
 ; -------------------------------------------------------------------------
 ; test_task_a / test_task_b: preemptive-scheduling demo tasks. Each loops
@@ -2897,24 +3062,28 @@ shell_read_line:
 
 ; -------------------------------------------------------------------------
 ; basix_load_program: RCX = NUL-terminated path (may be a deep path --
-; see exfat_resolve_path). RDX = child mode (0/1): 0 for a top-level
-; load (RUN/GUI) that fully resets BASIX64's compile state (variables,
-; array arena, string pool, labels, fixups) the way a fresh program
-; always has; 1 for a LAUNCHed child that must leave all of that alone
-; so the launching program's variables/arrays survive the child's
-; entire compile+run and it can resume afterward (see
-; basix_compile_reset_state_child and basix_rt_launch, which alone
-; passes 1 -- RUN and GUI both pass 0).
+; see exfat_resolve_path). RDX = target slot index (0..
+; BASIX_SLOT_COUNT-1, see basix_symbols.inc) -- the caller has already
+; basix_slot_alloc'd this slot; basix_load_program always compiles a
+; fresh, fully-reset program into it via basix_compile_slot_begin (no
+; more "child mode" sharing -- every load gets its own isolated slot,
+; so a LAUNCHed program's variables/arrays simply can't collide with
+; its launcher's, in a different slot's own dedicated memory. See
+; basix_rt_launch, which now allocates a real slot instead of sharing
+; the caller's).
 ;
-; Resolves the path and gets a runnable program sitting in
-; basix_code_buf, ready for `call basix_code_buf`, either by copying a
-; precompiled .AXB straight in (magic-sniffed, see basix_codegen.inc's
-; format comment) or by stream-compiling .bas source -- the shared
-; core behind both RUN and LAUNCH, so both go through the exact same
-; resolve/sniff/load logic. Never touches console output; callers
-; decide how (or whether) to report a failure. Returns EAX = status:
-; 0=ok, 1=not found, 2=BASIX64 compile error, 3=.axb stale/corrupt/
-; oversized for this kernel build.
+; Resolves the path and gets a runnable program sitting in the active
+; slot's code buffer (basix_active_code_buf_ptr), ready to be CALLed,
+; either by copying a precompiled .AXB straight in (magic-sniffed, see
+; basix_codegen.inc's format comment) or by stream-compiling .bas
+; source -- the shared core behind RUN, GUI, and LAUNCH, so all three
+; go through the exact same resolve/sniff/load logic. Never touches
+; console output; callers decide how (or whether) to report a failure.
+; Caller must hold basix_compile_lock across this call (and, for
+; .source below, the whole exfat_resolve_path+compile sequence is what
+; the lock is actually protecting -- see basix_compile_slot_begin).
+; Returns EAX = status: 0=ok, 1=not found, 2=BASIX64 compile error,
+; 3=.axb stale/corrupt/oversized for this kernel build.
 ; -------------------------------------------------------------------------
 basix_load_program:
     push rcx
@@ -2924,10 +3093,18 @@ basix_load_program:
     push r10
     push r11
     push r12
+    push r13
 
-    mov r12d, edx                       ; r12d = child mode (saved before
-                                         ; rdx gets reused as scratch below)
+    mov r13, rcx                        ; r13 = path ptr, saved before RCX
+                                         ; gets reused as basix_compile_
+                                         ; slot_begin's slot-index arg below
+    mov r12d, edx                       ; r12d = target slot index (saved
+                                         ; before rdx gets reused below)
+    mov ecx, r12d
+    call basix_compile_slot_begin       ; repoints active_* ptrs, resets
+                                         ; compile-time bookkeeping
 
+    mov rcx, r13
     lea r8, [rel exfat_find_result]
     call exfat_resolve_path
     test eax, eax
@@ -2961,17 +3138,13 @@ basix_load_program:
 
     mov edx, 16                         ; code bytes start right after the header
     mov r8d, r11d
-    lea r9, [rel basix_code_buf]
+    mov r9, [rel basix_active_code_buf_ptr]
     call exfat_read_file_at
     test eax, eax
     jz .axb_stale
 
     mov [rel basix_code_pos], r11d
     mov dword [rel basix_compile_ok], 1
-    test r12d, r12d
-    jnz .axb_ok_child            ; child mode: leave vars/arena/etc alone
-    call basix_runtime_reset_state
-.axb_ok_child:
     xor eax, eax
     jmp .out
 
@@ -2985,13 +3158,7 @@ basix_load_program:
     mov ecx, [rel exfat_find_result+0]  ; FirstCluster
     mov rdx, [rel exfat_find_result+8]  ; DataLength
     mov r8d, [rel exfat_find_result+16] ; NoFatChain
-    test r12d, r12d
-    jnz .source_child
     call basix_compile_file
-    jmp .source_done
-.source_child:
-    call basix_compile_file_child
-.source_done:
     test eax, eax
     jz .compilefail
     xor eax, eax
@@ -3006,6 +3173,7 @@ basix_load_program:
 .axb_stale:
     mov eax, 3
 .out:
+    pop r13
     pop r12
     pop r11
     pop r10
@@ -3351,21 +3519,57 @@ shell_dispatch:
     ; "GRAPHICS/cube.bas" or "/APPS/foo.axb" works directly, the same
     ; way editor/viewer's OPEN-then-bare-name navigation does, but
     ; without needing an OPEN first and without touching cwd.
-    lea rcx, [rel shell_arg_buf]
-    xor edx, edx                         ; child mode = 0 (top-level)
-    call basix_load_program
-    cmp eax, 1
-    je .run_notfound
-    cmp eax, 2
-    je .run_compilefail
-    cmp eax, 3
-    je .run_axb_stale
+    call basix_compile_lock_acquire
+    call basix_slot_alloc
+    cmp eax, 0xFFFFFFFF
+    je .run_noslot
+    mov r12d, eax                        ; r12d = this run's slot
 
-    call basix_code_buf
+    lea rcx, [rel shell_arg_buf]
+    mov edx, r12d
+    call basix_load_program
+    mov r13d, eax                        ; r13d = load status
+    ; Capture the code entry point while still under the lock -- a
+    ; concurrent compile on another task could repoint the shared
+    ; basix_active_code_buf_ptr the instant the lock is released.
+    ; RAX, not RBX: RBX is the kernel-wide "boot_info*" register, still
+    ; relied on by fb_draw_char (console text -- see basix_rt_print_str
+    ; et al) for the whole duration the called program runs, so it must
+    ; not be clobbered by the code-pointer-to-call itself.
+    mov rax, [rel basix_active_code_buf_ptr]
+    call basix_compile_lock_release
+
+    cmp r13d, 1
+    je .run_notfound_freed
+    cmp r13d, 2
+    je .run_compilefail_freed
+    cmp r13d, 3
+    je .run_axb_stale_freed
+
+    call rax
     mov dword [rel fb_text_color], 0xFFFFFFFF  ; a program may leave COLOR
                                                 ; set to something other than
                                                 ; white -- don't let that leak
                                                 ; into the shell's own prompt
+    mov ecx, r12d
+    call basix_slot_free
+    jmp .out
+.run_notfound_freed:
+    mov ecx, r12d
+    call basix_slot_free
+    jmp .run_notfound
+.run_compilefail_freed:
+    mov ecx, r12d
+    call basix_slot_free
+    jmp .run_compilefail
+.run_axb_stale_freed:
+    mov ecx, r12d
+    call basix_slot_free
+    jmp .run_axb_stale
+.run_noslot:
+    call basix_compile_lock_release
+    lea rcx, [rel msg_shell_run_noslot]
+    call console_puts
     jmp .out
 .run_usage:
     lea rcx, [rel msg_shell_run_usage]
@@ -3439,19 +3643,33 @@ shell_dispatch:
     test ecx, ecx
     jz .compile_usage
 
+    call basix_compile_lock_acquire
+    call basix_slot_alloc
+    cmp eax, 0xFFFFFFFF
+    je .compile_noslot
+    mov r15d, eax                       ; r15d = this compile's slot
+    mov ecx, r15d
+    call basix_compile_slot_begin
+
     lea rcx, [rel shell_arg_buf]
     lea r8, [rel exfat_find_result]
     call exfat_resolve_path
     test eax, eax
-    jz .compile_notfound
+    jz .compile_notfound_freed
 
     mov ecx, [rel exfat_find_result+0]  ; FirstCluster
     mov rdx, [rel exfat_find_result+8]  ; DataLength
     mov r8d, [rel exfat_find_result+16] ; NoFatChain
     call basix_compile_file
     test eax, eax
-    jz .compile_compilefail
+    jz .compile_compilefail_freed
 
+    ; The compile lock stays held through the disk write below (kept
+    ; simple rather than capturing basix_active_code_buf_ptr/
+    ; basix_code_pos across calls whose register-clobber contract
+    ; isn't guaranteed to preserve them) -- COMPILE is an interactive,
+    ; infrequent shell command, not a hot path, so a slightly longer
+    ; lock hold here is a non-issue.
     lea rcx, [rel shell_arg_buf2]
     call exfat_resolve_parent_dir
     test eax, eax
@@ -3485,13 +3703,16 @@ shell_dispatch:
     jz .compile_writefail
 
     mov rcx, r13
-    lea r8, [rel basix_code_buf]
+    mov r8, [rel basix_active_code_buf_ptr]
     mov r9d, [rel basix_code_pos]
     call exfat_append_file
     test eax, eax
     jz .compile_writefail
 
     mov [rel exfat_cwd_cluster], r14d
+    mov ecx, r15d
+    call basix_slot_free
+    call basix_compile_lock_release
     lea rcx, [rel msg_shell_compile_ok]
     call console_puts
     jmp .out
@@ -3500,19 +3721,40 @@ shell_dispatch:
     lea rcx, [rel msg_shell_compile_usage]
     call console_puts
     jmp .out
+.compile_noslot:
+    call basix_compile_lock_release
+    lea rcx, [rel msg_shell_run_noslot]
+    call console_puts
+    jmp .out
+.compile_notfound_freed:
+    mov ecx, r15d
+    call basix_slot_free
+    call basix_compile_lock_release
+    jmp .compile_notfound
 .compile_notfound:
     lea rcx, [rel msg_shell_notfound]
     call console_puts
     jmp .out
+.compile_compilefail_freed:
+    mov ecx, r15d
+    call basix_slot_free
+    call basix_compile_lock_release
+    jmp .compile_compilefail
 .compile_compilefail:
     lea rcx, [rel msg_shell_run_compilefail]
     call console_puts
     jmp .out
 .compile_badpath:
+    mov ecx, r15d
+    call basix_slot_free
+    call basix_compile_lock_release
     lea rcx, [rel msg_shell_compile_badpath]
     call console_puts
     jmp .out
 .compile_writefail:
+    mov ecx, r15d
+    call basix_slot_free
+    call basix_compile_lock_release
     mov [rel exfat_cwd_cluster], r14d
     lea rcx, [rel msg_shell_compile_writefail]
     call console_puts
@@ -3528,20 +3770,42 @@ shell_dispatch:
 ; stale desktop pixels.
 ; -------------------------------------------------------------------------
 .do_gui:
-    lea rcx, [rel gui_program_name]
-    xor edx, edx                         ; child mode = 0 (top-level)
-    call basix_load_program
-    test eax, eax
-    jnz .gui_load_failed
+    call basix_compile_lock_acquire
+    call basix_slot_alloc
+    cmp eax, 0xFFFFFFFF
+    je .gui_noslot
+    mov r12d, eax                        ; r12d = this GUI run's slot
 
-    call basix_code_buf
+    lea rcx, [rel gui_program_name]
+    mov edx, r12d
+    call basix_load_program
+    mov r13d, eax
+    ; RAX, not RBX: RBX is the kernel-wide "boot_info*" register, still
+    ; needed (by fb_draw_char, fb_clear below, etc.) for the whole
+    ; duration the GUI program runs -- see the identical fix in .do_run.
+    mov rax, [rel basix_active_code_buf_ptr]   ; capture before unlocking
+    call basix_compile_lock_release
+    test r13d, r13d
+    jnz .gui_load_failed_freed
+
+    call rax
     mov dword [rel fb_text_color], 0xFFFFFFFF
 
     call fb_clear
     mov dword [rel console_row], 0
     mov dword [rel console_col], 0
+    mov ecx, r12d
+    call basix_slot_free
     jmp .out
 
+.gui_noslot:
+    call basix_compile_lock_release
+    lea rcx, [rel msg_shell_run_noslot]
+    call console_puts
+    jmp .out
+.gui_load_failed_freed:
+    mov ecx, r12d
+    call basix_slot_free
 .gui_load_failed:
     lea rcx, [rel msg_shell_gui_notfound]
     call console_puts
@@ -4608,6 +4872,8 @@ EXFAT_APPTEST_PART1_LEN equ 3000
 EXFAT_APPTEST_PART2_LEN equ 5000
 EXFAT_APPTEST_TOTAL_LEN equ EXFAT_APPTEST_PART1_LEN + EXFAT_APPTEST_PART2_LEN
 
+basix_boot_info_ptr:  dq 0
+
 msg_sched_ok:         db 'Scheduler: armed (main + 5 test tasks)', 13, 10, 0
 msg_sched_bad:        db 'Scheduler: setup FAILED', 13, 10, 0
 msg_sched_verify_ok:  db 'Scheduler: both test tasks made progress (preemption OK)', 13, 10, 0
@@ -4692,6 +4958,7 @@ msg_shell_write_fail:  db 'Write failed (name may already exist).', 13, 10, 0
 msg_shell_run_usage:       db 'Usage: RUN <filename.bas|filename.axb>', 13, 10, 0
 msg_shell_run_compilefail: db 'BASIX64 compile error.', 13, 10, 0
 msg_shell_run_axb_stale:   db 'That .axb was compiled for a different kernel build (or is corrupt) -- recompile it.', 13, 10, 0
+msg_shell_run_noslot:      db 'All 8 execution slots are busy -- close a running program first.', 13, 10, 0
 msg_shell_compile_usage:      db 'Usage: COMPILE <source.bas> <output.axb>', 13, 10, 0
 msg_shell_compile_ok:         db 'Compiled.', 13, 10, 0
 msg_shell_compile_badpath:    db 'Bad path (a component is missing or not a directory).', 13, 10, 0

@@ -9,7 +9,12 @@
 ; -- there's no register allocator or stack frame to design for v1.
 ; =============================================================================
 
-BASIX_CODE_BUF_SIZE equ 65536
+; Per-slot code buffer size (see basix_symbols.inc's R0 slot block --
+; BASIX_SLOT_COUNT independent buffers this size, heap-allocated by
+; basix_slot_init_all). 512KB, up from the original 64KB single
+; buffer -- plenty of headroom for richer GUI-era programs, and
+; trivial against available RAM even times 8 slots.
+BASIX_CODE_BUF_SIZE equ 524288
 
 ; -------------------------------------------------------------------------
 ; basix_emit_u8: AL = byte to append.
@@ -20,7 +25,7 @@ basix_emit_u8:
     mov ecx, [rel basix_code_pos]
     cmp ecx, BASIX_CODE_BUF_SIZE
     jae .overflow
-    lea rbx, [rel basix_code_buf]
+    mov rbx, [rel basix_active_code_buf_ptr]
     mov [rbx+rcx], al
     inc dword [rel basix_code_pos]
     jmp .out
@@ -42,7 +47,7 @@ basix_emit_u32:
     mov ecx, [rel basix_code_pos]
     cmp ecx, BASIX_CODE_BUF_SIZE - 4
     ja .overflow
-    lea rbx, [rel basix_code_buf]
+    mov rbx, [rel basix_active_code_buf_ptr]
     mov [rbx+rcx], edx
     add dword [rel basix_code_pos], 4
     jmp .out
@@ -65,7 +70,7 @@ basix_emit_u64:
     mov ecx, [rel basix_code_pos]
     cmp ecx, BASIX_CODE_BUF_SIZE - 8
     ja .overflow
-    lea rbx, [rel basix_code_buf]
+    mov rbx, [rel basix_active_code_buf_ptr]
     mov [rbx+rcx], rdx
     add dword [rel basix_code_pos], 8
     jmp .out
@@ -112,7 +117,7 @@ basix_emit_here:
     push rbx
     push rcx
     mov ecx, [rel basix_code_pos]
-    lea rbx, [rel basix_code_buf]
+    mov rbx, [rel basix_active_code_buf_ptr]
     lea rax, [rbx+rcx]
     pop rcx
     pop rbx
@@ -216,19 +221,37 @@ basix_emit_jmp_to:
     ret
 
 ; -------------------------------------------------------------------------
-; basix_emit_call_to: RCX = absolute target address. Emits a near CALL.
+; basix_emit_call_to: RCX = absolute target address. Emits MOV RAX,imm64
+; + CALL RAX (48 B8 <imm64> FF D0) -- an absolute indirect call, not a
+; rel32 near CALL. This matters now that a program's code buffer is a
+; per-slot heap allocation (see basix_symbols.inc's R0 slot block)
+; potentially tens of terabytes of virtual address space away from the
+; kernel image basix_rt_* runtime helpers live in: a rel32 displacement
+; only reaches +/-2GB, which silently truncates/wraps for a target that
+; far away and jumps into garbage. Used for BOTH calls out to basix_rt_*
+; helpers and GOSUBs to an already-defined BASIX label (see
+; basix_goto_or_gosub_emit's .call_defined -- a same-buffer label call
+; would fit in rel32 today, but there's no reason to keep two encodings
+; when the target is always known immediately here, unlike the
+; forward-reference GOSUB path below, which still uses a rel32
+; placeholder + basix_patch_rel32 since that one genuinely only ever
+; targets a same-buffer label).
 ; -------------------------------------------------------------------------
 basix_emit_call_to:
-    push rcx
-    mov al, 0xE8
+    push rax
+    mov rax, rcx
+    push rax
+    mov al, 0x48
     call basix_emit_u8
-    call basix_emit_here
-    mov r8, rax
-    xor eax, eax
-    call basix_emit_u32
-    pop rdx
-    mov rcx, r8
-    call basix_patch_rel32
+    mov al, 0xB8
+    call basix_emit_u8
+    pop rax
+    call basix_emit_u64
+    mov al, 0xFF
+    call basix_emit_u8
+    mov al, 0xD0
+    call basix_emit_u8
+    pop rax
     ret
 
 ; -------------------------------------------------------------------------
@@ -639,23 +662,26 @@ basix_emit_seta:
 ; =========================================================================
 basix_code_pos: dd 0
 
-align 16
-basix_code_buf: times BASIX_CODE_BUF_SIZE db 0
-
 ; =========================================================================
 ; .AXB (arOS eXecutable Binary): COMPILE's output format and RUN's fast
-; -load path for it. basix_code_buf is a fixed, non-relocatable address
-; baked into this specific KERNEL.BIN (see this file's top comment) --
-; basix_emit_call_to patches CALLs to basix_rt_* runtime helpers as
-; rel32 offsets computed against wherever the code actually ends up in
-; basix_code_buf, so an .AXB is only ever valid when copied back into
-; that exact same buffer under the exact same kernel build. There is no
-; relocation table (a real one would need codegen to record every such
-; patch site instead of just applying it -- not built here).
-; BASIX_AXB_KERNEL_ID is the guard against the mismatch that would
-; otherwise cause -- RUN/LAUNCH refuse to load an .AXB whose stamped ID
-; doesn't match this build's, rather than jumping into addresses that
-; may no longer mean what they meant at compile time. scripts/build.sh
+; -load path for it. Each slot's code buffer is a fixed, non-relocatable
+; heap address for THIS boot (see this file's top comment and
+; basix_symbols.inc's slot block) -- basix_emit_call_to patches CALLs to
+; basix_rt_* runtime helpers as rel32 offsets computed against wherever
+; the code actually ends up in the active slot's buffer, so an .AXB is
+; only ever valid when copied back into a slot buffer under the exact
+; same kernel build (kmalloc_large addresses are stable across runs of
+; the same boot image, but not across rebuilds/reboots in general --
+; BASIX_AXB_KERNEL_ID guards the build-mismatch case as before; a stale
+; buffer address from a previous boot is not otherwise possible since
+; .AXBs are always re-sniffed and re-loaded fresh by basix_load_program,
+; never cached across boots). There is no relocation table (a real one
+; would need codegen to record every such patch site instead of just
+; applying it -- not built here). BASIX_AXB_KERNEL_ID is the guard
+; against a stale/cross-build load -- RUN/LAUNCH refuse to load an
+; .AXB whose stamped ID doesn't match this build's, rather than
+; jumping into addresses that may no longer mean what they meant at
+; compile time. scripts/build.sh
 ; passes a fresh value (`date +%s`) on every build via `-D
 ; BASIX_AXB_KERNEL_ID=...`, so ANY kernel rebuild automatically
 ; invalidates old .AXBs -- this used to be a hand-maintained constant
