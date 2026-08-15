@@ -161,6 +161,12 @@ TOK_DIRCD      equ 123
 TOK_DIRUP      equ 124
 TOK_DRAWCHAR   equ 125
 
+; R4: window chrome. WINCLOSE polls whether the user clicked this
+; task's kernel-drawn close gadget since the last check (see
+; basix_rt_winclose) -- bare-keyword function, same shape as MOUSEBTN/
+; KEYHIT above.
+TOK_WINCLOSE   equ 126
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -1302,5 +1308,9 @@ basix_keywords:
     db 8
     dd TOK_DRAWCHAR
     db 'DRAWCHAR', 0,0,0,0,0,0,0,0
+
+    db 8
+    dd TOK_WINCLOSE
+    db 'WINCLOSE', 0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table

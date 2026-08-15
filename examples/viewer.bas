@@ -106,6 +106,16 @@ ENDIF
 
 main_loop:
 GOSUB redraw
+
+' Poll WINCLOSE (the kernel-drawn close gadget) alongside KEYHIT
+' instead of blocking straight on GETKEY -- see editor.bas's identical
+' comment for why.
+wait_key:
+IF WINCLOSE THEN END
+IF KEYHIT = 0 THEN
+  WAIT 1
+  GOTO wait_key
+ENDIF
 LET k = GETKEY
 
 IF k = 136 THEN

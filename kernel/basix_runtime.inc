@@ -308,8 +308,29 @@ basix_rt_ensure_backbuf:
     ; call) but then reported/zero-filled as if it were 0x0, leaving
     ; every task's TCB_BACKBUF_W/H permanently 0 and every dirty rect the
     ; compositor ever saw clamped down to nothing.
+    ; R4: a windowed task (TCB_WIN_W != 0 -- see basix_rt_launch, which
+    ; is the only thing that ever sets it) gets a back buffer sized to
+    ; its own window's CLIENT area, not the real screen -- chrome
+    ; (title bar/border) is drawn by the compositor OUTSIDE this
+    ; buffer entirely, so the program itself never needs to know it
+    ; isn't drawing straight to the display. Main (the desktop/shell
+    ; layer, z-order index 0) never has a window and falls through to
+    ; the old full-screen sizing unchanged.
+    xor r14d, r14d
+    xor r15d, r15d
+    mov rcx, [rel current_task]
+    test rcx, rcx
+    jz .use_fullscreen
+    mov eax, [rcx+TCB_WIN_W]
+    test eax, eax
+    jz .use_fullscreen
+    mov r14d, eax
+    mov r15d, [rcx+TCB_WIN_H]
+    jmp .size_chosen
+.use_fullscreen:
     mov r14d, [rbx+FB_WIDTH]
     mov r15d, [rbx+FB_HEIGHT]
+.size_chosen:
     mov [rel basix_backbuf_w], r14d
     mov [rel basix_backbuf_h], r15d
 
@@ -1449,12 +1470,41 @@ basix_rt_timer:
 ; the kernel-wide boot_info* convention (see the note on
 ; basix_rt_print_int above -- never repurposed as scratch).
 ; -------------------------------------------------------------------------
+; R4: a windowed task (TCB_WIN_W != 0 -- see basix_rt_launch) gets its
+; own window's CLIENT area size here, not the real screen's -- it's
+; drawing into a back buffer sized to match (basix_rt_ensure_backbuf),
+; so SCREENW/SCREENH (and TEXTCOLS/TEXTROWS below) staying full-screen
+; would make a program's own layout math (e.g. editor.bas's `cols =
+; TEXTCOLS`, used for its own line-wrap/scroll bounds) size itself for
+; a canvas bigger than it's actually drawing into. Main (the desktop/
+; shell layer) never has a window and keeps the old full-screen
+; answer.
 basix_rt_screenw:
+    push rcx
+    mov rcx, [rel current_task]
+    test rcx, rcx
+    jz .fullscreen
+    mov eax, [rcx+TCB_WIN_W]
+    test eax, eax
+    jnz .out
+.fullscreen:
     mov eax, [rbx+FB_WIDTH]
+.out:
+    pop rcx
     ret
 
 basix_rt_screenh:
+    push rcx
+    mov rcx, [rel current_task]
+    test rcx, rcx
+    jz .fullscreen
+    mov eax, [rcx+TCB_WIN_H]
+    test eax, eax
+    jnz .out
+.fullscreen:
     mov eax, [rbx+FB_HEIGHT]
+.out:
+    pop rcx
     ret
 
 ; -------------------------------------------------------------------------
@@ -1463,14 +1513,78 @@ basix_rt_screenh:
 ; console_rows, kernel.asm -- computed at boot from the framebuffer and
 ; font metrics), distinct from SCREENW/SCREENH's PIXEL dimensions above.
 ; Lets a program like the text editor lay out status/text/hint rows by
-; character cell instead of guessing a font size.
+; character cell instead of guessing a font size. Same R4 windowed-
+; task adjustment as SCREENW/SCREENH above -- a windowed task's own
+; back buffer is 8x16-glyph-compatible sized (TCB_WIN_W/H are chosen
+; in whole cells, see basix_rt_launch), so this is just that divided
+; down to cells rather than a separate real quantity.
 ; -------------------------------------------------------------------------
 basix_rt_textcols:
+    push rcx
+    push rdx
+    mov rcx, [rel current_task]
+    test rcx, rcx
+    jz .fullscreen
+    mov eax, [rcx+TCB_WIN_W]
+    test eax, eax
+    jz .fullscreen
+    xor edx, edx
+    mov ecx, 8
+    div ecx
+    jmp .out
+.fullscreen:
     mov eax, [rel console_cols]
+.out:
+    pop rdx
+    pop rcx
     ret
 
 basix_rt_textrows:
+    push rcx
+    push rdx
+    mov rcx, [rel current_task]
+    test rcx, rcx
+    jz .fullscreen
+    mov eax, [rcx+TCB_WIN_H]
+    test eax, eax
+    jz .fullscreen
+    xor edx, edx
+    mov ecx, 16
+    div ecx
+    jmp .out
+.fullscreen:
     mov eax, [rel console_rows]
+.out:
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_winclose: no arguments. Returns RAX = 1 if the user clicked
+; this task's kernel-drawn close gadget since the last WINCLOSE call,
+; else 0 -- same poll-and-consume style as KEYHIT, not a level (calling
+; it twice in a row without an intervening click returns 0 the second
+; time). Cooperative: this only reports the request (set by wm_tick,
+; kernel.asm, on a real click) -- a program has to actually check it
+; and act (typically END) for the close gadget to do anything, same as
+; every other exit path (X=Exit menu items, etc). RAX = 0 for main
+; (TCB_WIN_CLOSE_REQ is never set on a task with no window).
+; -------------------------------------------------------------------------
+basix_rt_winclose:
+    push rcx
+    mov rcx, [rel current_task]
+    test rcx, rcx
+    jz .none
+    mov eax, [rcx+TCB_WIN_CLOSE_REQ]
+    test eax, eax
+    jz .none
+    mov dword [rcx+TCB_WIN_CLOSE_REQ], 0
+    mov eax, 1
+    jmp .out
+.none:
+    xor eax, eax
+.out:
+    pop rcx
     ret
 
 ; -------------------------------------------------------------------------
@@ -2509,6 +2623,55 @@ basix_rt_launch:
     test rax, rax
     jz .task_create_failed
     mov r12, rax                        ; r12 = new task's TCB
+
+    ; R4: window geometry + title, set here (before RBX gets reused as
+    ; scratch below) while it's still boot_info* -- the kernel-wide
+    ; invariant this whole function inherited from its own caller and
+    ; hasn't touched yet. Fixed 640x420 client size for now (R5 is
+    ; resizing); cascaded position by however many windows already
+    ; exist (basix_zorder_count, read before this one is pushed), so
+    ; each new LAUNCH doesn't land exactly on top of the last one,
+    ; wrapping every 6 so a long LAUNCH chain doesn't cascade off the
+    ; edge of the screen.
+    mov dword [r12+TCB_WIN_W], 640      ; both exact multiples of the
+    mov dword [r12+TCB_WIN_H], 416      ; 8x16 glyph cell (80 cols x
+                                         ; 26 rows) -- TEXTCOLS/TEXTROWS
+                                         ; divide this evenly
+    mov eax, [rel basix_zorder_count]
+    xor edx, edx
+    mov ecx, 6
+    div ecx                              ; edx = zorder_count MOD 6
+    imul edx, edx, 30
+    mov eax, 100
+    add eax, edx
+    mov dword [r12+TCB_WIN_X], eax
+    mov eax, 60
+    add eax, edx
+    mov dword [r12+TCB_WIN_Y], eax
+
+    ; Title text: the LAUNCHed program's own name (basix_launch_name_buf,
+    ; NUL-terminated -- still valid here, nothing's overwritten it since
+    ; the name-copy step above), a leading '/' skipped since Workbench
+    ; passes root-relative paths like "/EDITOR.BAS" for its own fixed
+    ; helper programs, capped to TCB_WIN_TITLE's 32 bytes.
+    lea rsi, [rel basix_launch_name_buf]
+    cmp byte [rsi], '/'
+    jne .title_copy
+    inc rsi
+.title_copy:
+    lea rdi, [r12+TCB_WIN_TITLE]
+    xor ecx, ecx
+.title_copy_loop:
+    cmp ecx, 32
+    jge .title_copy_done
+    movzx eax, byte [rsi+rcx]
+    test al, al
+    jz .title_copy_done
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .title_copy_loop
+.title_copy_done:
+    mov [r12+TCB_WIN_TITLE_LEN], ecx
 
     ; Splice into the ready ring right after the CALLING task. Two
     ; plain writes, safe under preemption without disabling interrupts

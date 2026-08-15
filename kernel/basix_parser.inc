@@ -1695,6 +1695,8 @@ basix_parse_primary:
     je .do_dirnamelen
     cmp eax, TOK_DIRNAMECHAR
     je .do_dirnamechar
+    cmp eax, TOK_WINCLOSE
+    je .do_winclose
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
@@ -1847,6 +1849,12 @@ basix_parse_primary:
 .do_mousebtn:
     call basix_lex_next                  ; bare keyword, no parens/args
     lea rcx, [rel basix_rt_mousebtn]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_winclose:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_winclose]
     call basix_emit_call_to
     xor r11d, r11d                       ; result type = int
     ret

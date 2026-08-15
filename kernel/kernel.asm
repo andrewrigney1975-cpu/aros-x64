@@ -991,6 +991,16 @@ entry:
     mov qword [r15+TCB_LAUNCH_ARG_BUF_PTR], 0
     mov dword [r15+TCB_LAUNCH_ARG_LEN], 0
     mov dword [r15+TCB_DIRTY_VALID], 0
+    ; Main never has a window (it's the desktop/shell layer, drawn
+    ; full-screen with no chrome) -- TCB_WIN_W left/kept 0 is what
+    ; every "is this task windowed?" check (basix_rt_ensure_backbuf,
+    ; SCREENW/H, TEXTCOLS/ROWS, compositor_task) keys off of.
+    mov dword [r15+TCB_WIN_X], 0
+    mov dword [r15+TCB_WIN_Y], 0
+    mov dword [r15+TCB_WIN_W], 0
+    mov dword [r15+TCB_WIN_H], 0
+    mov dword [r15+TCB_WIN_TITLE_LEN], 0
+    mov dword [r15+TCB_WIN_CLOSE_REQ], 0
 
     ; Main starts out as the sole keyboard-focused task and the sole
     ; (back-most) z-order entry -- R2's z-order list (basix_zorder,
@@ -1290,6 +1300,12 @@ basix_zorder_remove:
 .shift_done:
     dec eax
     mov [rel basix_zorder_count], eax
+    ; R4: a removed entry may have had chrome (title bar/border) drawn
+    ; around it -- like a drag, closing/exiting leaves a screen region
+    ; nothing's own dirty rect reflects (nothing drew there, the
+    ; window just stopped existing), so force one full recomposite
+    ; pass to paint over whatever's now exposed there.
+    mov dword [rel basix_wm_force_full], 1
     test eax, eax
     jz .out                             ; shouldn't happen (main never
                                          ; removed) -- leave focus alone
@@ -1305,6 +1321,387 @@ basix_zorder_remove:
 
 basix_zorder: times BASIX_ZORDER_MAX dq 0
 basix_zorder_count: dd 0
+
+; -------------------------------------------------------------------------
+; R4: window chrome + a minimal window manager. Chrome (title bar +
+; text + close gadget + border) is drawn straight to the REAL
+; framebuffer by the compositor itself, OUTSIDE every windowed task's
+; own back buffer -- a program never draws its own title bar (unlike
+; Workbench's own hand-drawn internal "window" before this, which is
+; unrelated: that's Workbench's own in-app UI, not OS-level chrome).
+; Only the frontmost (topmost, z-order[count-1]) windowed task's
+; chrome is interactive (click-drag the title bar to move, click the
+; close gadget) -- consistent with R2's existing "topmost == focused"
+; invariant; there's still no real click-to-focus-a-background-window
+; routing.
+; -------------------------------------------------------------------------
+WM_TITLE_H     equ 20   ; title bar height, px
+WM_BORDER      equ 2    ; border thickness, px
+WM_CLOSE_SIZE  equ 14   ; close gadget square size, px
+WM_TITLE_BG    equ 0x8888CC
+WM_TITLE_FG    equ 0xFFFFFF
+WM_BORDER_COL  equ 0xFFFFFF
+WM_CLOSE_BG    equ 0xFFFFFF
+WM_CLOSE_FG    equ 0x000000
+
+basix_wm_dragging:    dq 0     ; task ptr currently being title-bar-
+                                ; dragged, or 0
+basix_wm_drag_off_x:  dd 0
+basix_wm_drag_off_y:  dd 0
+basix_wm_prev_btn:    dd 0     ; last pass's mouse_btn, for edge
+                                ; detection (press/release)
+basix_wm_force_full:  dd 0     ; set for one pass when a drag moved a
+                                ; window -- see wm_tick
+
+; -------------------------------------------------------------------------
+; wm_fb_fill_rect: RCX=x0, RDX=y0, R8=w, R9=h, R10d=color (packed
+; 32-bit pixel). Fills a rect directly on the REAL framebuffer,
+; clipped to its own bounds. RBX must be boot_info*.
+; -------------------------------------------------------------------------
+wm_fb_fill_rect:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r11
+    push r12
+
+    mov r11d, ecx                       ; x0
+    mov r12d, edx                       ; y0
+    add r8d, r11d                       ; x1 = x0+w
+    add r9d, r12d                       ; y1 = y0+h
+
+    cmp r11d, 0
+    jge .x0_ok
+    xor r11d, r11d
+.x0_ok:
+    cmp r12d, 0
+    jge .y0_ok
+    xor r12d, r12d
+.y0_ok:
+    cmp r8d, [rbx+FB_WIDTH]
+    jle .x1_ok
+    mov r8d, [rbx+FB_WIDTH]
+.x1_ok:
+    cmp r9d, [rbx+FB_HEIGHT]
+    jle .y1_ok
+    mov r9d, [rbx+FB_HEIGHT]
+.y1_ok:
+    cmp r11d, r8d
+    jge .out
+    cmp r12d, r9d
+    jge .out
+
+    mov esi, r12d                       ; row
+.row_loop:
+    cmp esi, r9d
+    jge .out
+
+    mov eax, esi
+    imul eax, [rbx+FB_STRIDE]
+    add eax, r11d
+    mov rdi, [rbx+FB_BASE]
+    lea rdi, [rdi + rax*4]
+
+    mov ecx, r8d
+    sub ecx, r11d                       ; span width
+    mov eax, r10d
+.col_loop:
+    test ecx, ecx
+    jz .row_next
+    mov [rdi], eax
+    add rdi, 4
+    dec ecx
+    jmp .col_loop
+
+.row_next:
+    inc esi
+    jmp .row_loop
+
+.out:
+    pop r12
+    pop r11
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; wm_fb_draw_glyph: AL=char code, R9D=x, R10D=y, R11D=color. Same
+; glyph format/semantics as basix_draw_glyph (basix_runtime.inc) --
+; paints only SET pixels, leaving the rest alone -- but targets the
+; REAL framebuffer (FB_BASE/FB_STRIDE) instead of a task's back
+; buffer, since chrome text isn't drawn by any task. RBX must be
+; boot_info*.
+; -------------------------------------------------------------------------
+wm_fb_draw_glyph:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r15
+
+    mov r15, rbx                        ; save boot_info* (rbx is
+                                         ; about to become scratch,
+                                         ; same trick basix_draw_glyph
+                                         ; itself uses)
+
+    sub eax, 32
+    cmp eax, 95
+    jae .out
+    shl eax, 4
+    lea rsi, [rel font8x16]
+    add rsi, rax
+
+    xor ecx, ecx
+.row_loop:
+    cmp ecx, 16
+    jge .out
+    movzx ebx, byte [rsi + rcx]
+    mov edi, r10d
+    add edi, ecx
+    cmp edi, 0
+    jl .row_skip
+    cmp edi, [r15+FB_HEIGHT]
+    jge .row_skip
+
+    mov eax, edi
+    imul eax, [r15+FB_STRIDE]
+    mov r8d, eax                        ; r8d = rowbase = y*stride
+
+    xor edx, edx
+.col_loop:
+    cmp edx, 8
+    jge .row_skip
+    test ebx, 0x80
+    jz .col_skip
+    mov eax, r9d
+    add eax, edx
+    cmp eax, 0
+    jl .col_skip
+    cmp eax, [r15+FB_WIDTH]
+    jge .col_skip
+    add eax, r8d
+    mov rdi, [r15+FB_BASE]
+    lea rdi, [rdi + rax*4]
+    mov [rdi], r11d
+.col_skip:
+    shl ebx, 1
+    inc edx
+    jmp .col_loop
+
+.row_skip:
+    inc ecx
+    jmp .row_loop
+
+.out:
+    mov rbx, r15
+    pop r15
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; wm_fb_draw_title: RCX=task ptr, RDX=x, R8D=y, R9D=color. Draws that
+; task's TCB_WIN_TITLE (TCB_WIN_TITLE_LEN bytes) at the given pixel
+; position via wm_fb_draw_glyph, one 8px cell per character.
+; -------------------------------------------------------------------------
+wm_fb_draw_title:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+
+    mov r12, rcx                        ; task ptr
+    mov r13d, edx                       ; running x
+    mov r11d, r9d                       ; color
+    mov r10d, r8d                       ; y
+
+    lea rsi, [r12+TCB_WIN_TITLE]
+    xor ecx, ecx
+.loop:
+    cmp ecx, [r12+TCB_WIN_TITLE_LEN]
+    jge .out
+    movzx eax, byte [rsi+rcx]
+    mov r9d, r13d
+    call wm_fb_draw_glyph
+    add r13d, 8
+    inc ecx
+    jmp .loop
+.out:
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; wm_tick: called once per compositor pass, before compositing. Only
+; the frontmost windowed task (z-order[count-1], if count > 1 -- index
+; 0 is always main, which never has a window) has interactive chrome:
+; -------------------------------------------------------------------------
+; - Left button pressed down inside its title bar (excluding the close
+;   gadget) starts a drag; held, moves the window (updates TCB_WIN_X/Y
+;   to track the mouse, offset by where inside the title bar the drag
+;   started); released, ends it.
+; - Left button pressed down on its close gadget sets TCB_WIN_CLOSE_REQ
+;   -- cooperative, not a forced kill (see basix_rt_winclose).
+; A drag that actually moved the window sets basix_wm_force_full for
+; this pass, so compositor_task's own dirty-rect union (which only
+; ever reflects what a task itself drew) doesn't miss the OLD window
+; position -- something needs to repaint over wherever it used to be.
+; -------------------------------------------------------------------------
+wm_tick:
+    push rax
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+
+    mov dword [rel basix_wm_force_full], 0
+
+    mov eax, [rel basix_zorder_count]
+    cmp eax, 1
+    jle .no_front                       ; only main -- nothing windowed
+    dec eax
+    mov r12, [rel basix_zorder + rax*8] ; r12 = frontmost windowed task
+    test r12, r12
+    jz .no_front
+
+    mov eax, [rel mouse_x]
+    mov edx, [rel mouse_y]
+    mov ecx, [rel mouse_btn]
+    and ecx, 1                          ; left button bit only
+
+    mov r8, [rel basix_wm_dragging]
+    test r8, r8
+    jz .not_dragging
+
+    ; Currently dragging -- released?
+    test ecx, ecx
+    jnz .still_dragging
+    mov qword [rel basix_wm_dragging], 0
+    jmp .out
+
+.still_dragging:
+    ; Move the dragged task (r8, not necessarily still r12 if focus
+    ; somehow changed mid-drag -- track the ORIGINAL task) to track
+    ; the mouse, offset by the original grab point.
+    mov r9d, eax
+    sub r9d, [rel basix_wm_drag_off_x]
+    mov r10d, edx
+    sub r10d, [rel basix_wm_drag_off_y]
+    cmp dword [r8+TCB_WIN_X], r9d
+    je .same_x
+    mov [r8+TCB_WIN_X], r9d
+    mov dword [rel basix_wm_force_full], 1
+.same_x:
+    cmp dword [r8+TCB_WIN_Y], r10d
+    je .out
+    mov [r8+TCB_WIN_Y], r10d
+    mov dword [rel basix_wm_force_full], 1
+    jmp .out
+
+.not_dragging:
+    ; Not dragging -- a fresh left-button-down this pass (edge, not
+    ; level, so a held-down button from before wm_tick even started
+    ; polling doesn't retroactively grab anything)?
+    test ecx, ecx
+    jz .out
+    test dword [rel basix_wm_prev_btn], 1
+    jnz .out                            ; already was down last pass
+
+    ; Compute this window's title bar + close gadget rects.
+    mov r9d, [r12+TCB_WIN_X]
+    sub r9d, WM_BORDER                  ; title_x0
+    mov r10d, [r12+TCB_WIN_Y]
+    sub r10d, WM_TITLE_H
+    sub r10d, WM_BORDER                 ; title_y0
+    mov r11d, [r12+TCB_WIN_W]
+    add r11d, WM_BORDER*2               ; title_w
+
+    ; Close gadget: top-right corner of the title bar.
+    mov r8d, r9d
+    add r8d, r11d
+    sub r8d, WM_CLOSE_SIZE
+    sub r8d, 3                          ; close_x0
+    cmp eax, r8d
+    jl .not_close
+    mov ecx, r8d
+    add ecx, WM_CLOSE_SIZE
+    cmp eax, ecx
+    jge .not_close
+    cmp edx, r10d
+    jl .not_close
+    mov ecx, r10d
+    add ecx, WM_TITLE_H
+    cmp edx, ecx
+    jge .not_close
+    mov dword [r12+TCB_WIN_CLOSE_REQ], 1
+    jmp .out
+
+.not_close:
+    ; Anywhere else in the title bar starts a drag.
+    cmp eax, r9d
+    jl .out
+    mov ecx, r9d
+    add ecx, r11d
+    cmp eax, ecx
+    jge .out
+    cmp edx, r10d
+    jl .out
+    mov ecx, r10d
+    add ecx, WM_TITLE_H
+    cmp edx, ecx
+    jge .out
+
+    mov [rel basix_wm_dragging], r12
+    mov ecx, eax
+    sub ecx, [r12+TCB_WIN_X]
+    mov [rel basix_wm_drag_off_x], ecx
+    mov ecx, edx
+    sub ecx, [r12+TCB_WIN_Y]
+    mov [rel basix_wm_drag_off_y], ecx
+
+.no_front:
+.out:
+    mov eax, [rel mouse_btn]
+    mov [rel basix_wm_prev_btn], eax
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+    ret
 
 ; -------------------------------------------------------------------------
 ; compositor_task: R1's compositor, R2's z-order-aware version. RDI =
@@ -1356,7 +1753,16 @@ basix_zorder_count: dd 0
 compositor_task:
     mov rbx, rdi                        ; rbx = boot_info*
 .loop:
-    ; Phase 1: union together every z-order entry's dirty rect.
+    call wm_tick
+
+    ; Phase 1: union together every z-order entry's dirty rect, each
+    ; converted to SCREEN space first (a windowed entry's TCB_DIRTY_*
+    ; is in its own back buffer's LOCAL coordinates -- R4 gave
+    ; windowed tasks a back buffer sized to their own window, not the
+    ; screen, so local and screen coordinates aren't the same thing
+    ; anymore the way they were when every buffer was full-screen
+    ; origin-(0,0); TCB_WIN_X/Y, 0 for main, is the offset between
+    ; them).
     mov dword [rel basix_comp_any_dirty], 0
     mov dword [rel basix_comp_idx], 0
 .scan_loop:
@@ -1373,6 +1779,12 @@ compositor_task:
     mov r9d, [rcx+TCB_DIRTY_Y0]
     mov r10d, [rcx+TCB_DIRTY_X1]
     mov r11d, [rcx+TCB_DIRTY_Y1]
+    mov eax, [rcx+TCB_WIN_X]
+    add r8d, eax
+    add r10d, eax
+    mov eax, [rcx+TCB_WIN_Y]
+    add r9d, eax
+    add r11d, eax
     cmp dword [rel basix_comp_any_dirty], 0
     jne .union_merge
     mov [rel basix_comp_union_x0], r8d
@@ -1407,6 +1819,21 @@ compositor_task:
     mov [rel basix_comp_idx], eax
     jmp .scan_loop
 .scan_done:
+    ; A drag actually moving a window (wm_tick) means the OLD window
+    ; position needs covering too, which no task's own dirty rect
+    ; reflects (nothing drew there -- the window just moved away from
+    ; it) -- force a full-screen recomposite for this one pass rather
+    ; than tracking old-vs-new rects separately.
+    cmp dword [rel basix_wm_force_full], 0
+    je .check_any_dirty
+    mov dword [rel basix_comp_union_x0], 0
+    mov dword [rel basix_comp_union_y0], 0
+    mov eax, [rbx+FB_WIDTH]
+    mov [rel basix_comp_union_x1], eax
+    mov eax, [rbx+FB_HEIGHT]
+    mov [rel basix_comp_union_y1], eax
+    mov dword [rel basix_comp_any_dirty], 1
+.check_any_dirty:
     cmp dword [rel basix_comp_any_dirty], 0
     je .clear_pass
 
@@ -1416,7 +1843,7 @@ compositor_task:
 .blit_loop:
     mov eax, [rel basix_comp_idx]
     cmp eax, [rel basix_zorder_count]
-    jge .clear_pass
+    jge .chrome_phase
 
     mov eax, [rel basix_comp_idx]
     mov r15, [rel basix_zorder + rax*8] ; r15 = this entry's task ptr,
@@ -1429,10 +1856,20 @@ compositor_task:
     test rsi, rsi
     jz .blit_next
 
+    ; Convert the SCREEN-space union rect to THIS entry's LOCAL back-
+    ; buffer coordinates (subtract its own TCB_WIN_X/Y, 0 for main)
+    ; before clamping to its own buffer bounds -- see phase 1's
+    ; comment on why local and screen coordinates differ now.
     mov r8d, [rel basix_comp_union_x0]
     mov r9d, [rel basix_comp_union_y0]
     mov r10d, [rel basix_comp_union_x1]
     mov r11d, [rel basix_comp_union_y1]
+    mov eax, [r15+TCB_WIN_X]
+    sub r8d, eax
+    sub r10d, eax
+    mov eax, [r15+TCB_WIN_Y]
+    sub r9d, eax
+    sub r11d, eax
     mov r12d, [r15+TCB_BACKBUF_W]
     mov r13d, [r15+TCB_BACKBUF_H]
 
@@ -1458,7 +1895,7 @@ compositor_task:
     cmp r9d, r11d
     jge .blit_next
 
-    mov r14d, r9d                       ; r14d = row index
+    mov r14d, r9d                       ; r14d = LOCAL row index
 .row_loop:
     cmp r14d, r11d
     jge .blit_next
@@ -1467,11 +1904,14 @@ compositor_task:
     imul eax, r12d
     add eax, r8d
     mov rcx, rsi
-    lea rcx, [rcx + rax*4]              ; source: this row's union span
+    lea rcx, [rcx + rax*4]              ; source: this row's local span
 
     mov eax, r14d
+    add eax, [r15+TCB_WIN_Y]            ; eax = screen row
     imul eax, [rbx+FB_STRIDE]
-    add eax, r8d
+    mov edx, r8d
+    add edx, [r15+TCB_WIN_X]            ; edx = screen col start
+    add eax, edx
     mov rdx, [rbx+FB_BASE]
     lea rdx, [rdx + rax*4]              ; dest: same span in the real fb
 
@@ -1494,6 +1934,103 @@ compositor_task:
     inc eax
     mov [rel basix_comp_idx], eax
     jmp .blit_loop
+
+; Phase 3: redraw chrome (title bar/text/close gadget/border, straight
+; to the real framebuffer) for every windowed z-order entry -- index 0
+; (main) never has one. Redrawn unconditionally whenever anything at
+; all was dirty this pass, rather than intersecting the union rect
+; against each window's own chrome bounds first -- simpler, and cheap
+; relative to the content blits already just done.
+.chrome_phase:
+    mov dword [rel basix_comp_idx], 1   ; index 0 (main) never has chrome
+.chrome_loop:
+    mov eax, [rel basix_comp_idx]
+    cmp eax, [rel basix_zorder_count]
+    jge .clear_pass
+    mov eax, [rel basix_comp_idx]
+    mov r15, [rel basix_zorder + rax*8]
+    test r15, r15
+    jz .chrome_next
+    cmp dword [r15+TCB_WIN_W], 0
+    je .chrome_next
+
+    ; Title bar background.
+    mov ecx, [r15+TCB_WIN_X]
+    sub ecx, WM_BORDER
+    mov edx, [r15+TCB_WIN_Y]
+    sub edx, WM_TITLE_H
+    sub edx, WM_BORDER
+    mov r8d, [r15+TCB_WIN_W]
+    add r8d, WM_BORDER*2
+    mov r9d, WM_TITLE_H
+    mov r10d, WM_TITLE_BG
+    call wm_fb_fill_rect
+
+    ; Title text.
+    mov rcx, r15
+    mov edx, [r15+TCB_WIN_X]
+    mov r8d, [r15+TCB_WIN_Y]
+    sub r8d, WM_TITLE_H
+    add r8d, 2
+    mov r9d, WM_TITLE_FG
+    call wm_fb_draw_title
+
+    ; Close gadget.
+    mov ecx, [r15+TCB_WIN_X]
+    sub ecx, WM_BORDER
+    add ecx, [r15+TCB_WIN_W]
+    add ecx, WM_BORDER
+    sub ecx, WM_CLOSE_SIZE
+    sub ecx, 3
+    mov edx, [r15+TCB_WIN_Y]
+    sub edx, WM_TITLE_H
+    add edx, 3
+    mov r8d, WM_CLOSE_SIZE
+    mov r9d, WM_CLOSE_SIZE
+    mov r10d, WM_CLOSE_BG
+    call wm_fb_fill_rect
+
+    ; Border: left, right, bottom (the title bar above already covers
+    ; the top edge).
+    mov ecx, [r15+TCB_WIN_X]
+    sub ecx, WM_BORDER
+    mov edx, [r15+TCB_WIN_Y]
+    sub edx, WM_TITLE_H
+    sub edx, WM_BORDER
+    mov r8d, WM_BORDER
+    mov r9d, [r15+TCB_WIN_H]
+    add r9d, WM_TITLE_H
+    add r9d, WM_BORDER*2
+    mov r10d, WM_BORDER_COL
+    call wm_fb_fill_rect            ; left
+
+    mov ecx, [r15+TCB_WIN_X]
+    add ecx, [r15+TCB_WIN_W]
+    mov edx, [r15+TCB_WIN_Y]
+    sub edx, WM_TITLE_H
+    sub edx, WM_BORDER
+    mov r8d, WM_BORDER
+    mov r9d, [r15+TCB_WIN_H]
+    add r9d, WM_TITLE_H
+    add r9d, WM_BORDER*2
+    mov r10d, WM_BORDER_COL
+    call wm_fb_fill_rect            ; right
+
+    mov ecx, [r15+TCB_WIN_X]
+    sub ecx, WM_BORDER
+    mov edx, [r15+TCB_WIN_Y]
+    add edx, [r15+TCB_WIN_H]
+    mov r8d, [r15+TCB_WIN_W]
+    add r8d, WM_BORDER*2
+    mov r9d, WM_BORDER
+    mov r10d, WM_BORDER_COL
+    call wm_fb_fill_rect            ; bottom
+
+.chrome_next:
+    mov eax, [rel basix_comp_idx]
+    inc eax
+    mov [rel basix_comp_idx], eax
+    jmp .chrome_loop
 
 .clear_pass:
     ; Clear every z-order entry's dirty flag -- this pass (if anything

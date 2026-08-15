@@ -119,7 +119,32 @@ TCB_DIRTY_Y0    equ 96
 TCB_DIRTY_X1    equ 100
 TCB_DIRTY_Y1    equ 104
 TCB_DIRTY_VALID equ 108
-TCB_SIZE        equ 112
+; R4: window chrome/positioning. TCB_WIN_X/Y is the CLIENT area's
+; screen position (chrome -- title bar + border -- is drawn by the
+; compositor OUTSIDE this, not inside the task's own back buffer);
+; TCB_WIN_W/H is the client area's size, which is also what
+; TCB_BACKBUF_W/H end up being for a windowed task (see
+; basix_rt_ensure_backbuf) and what SCREENW/SCREENH report to that
+; task -- a program never needs to know it's not drawing directly to
+; the real screen. Only meaningful for LAUNCHed tasks (basix_rt_launch
+; sets all of these right after task_create); main (the desktop/
+; shell layer, z-order index 0) draws full-screen with no chrome and
+; never touches them -- see compositor_task's own z-order-index-0
+; special case. TCB_WIN_CLOSE_REQ is set by the compositor's own
+; window-manager pass when the user clicks this window's close gadget
+; -- cooperative, not a forced kill: see basix_rt_winclose, the
+; BASIX64-visible poll a program checks (same style as KEYHIT/
+; MOUSEBTN) to notice and act on it (typically END).
+TCB_WIN_X          equ 112
+TCB_WIN_Y           equ 116
+TCB_WIN_W           equ 120
+TCB_WIN_H           equ 124
+TCB_WIN_TITLE_LEN   equ 128
+TCB_WIN_TITLE       equ 132   ; 32 bytes, not NUL-terminated -- length
+                               ; is TCB_WIN_TITLE_LEN, same convention
+                               ; as every other BASIX64 name buffer
+TCB_WIN_CLOSE_REQ   equ 164
+TCB_SIZE            equ 168
 
 TCB_STATE_ALIVE      equ 0
 TCB_STATE_TERMINATED equ 1
@@ -303,6 +328,16 @@ task_create:
     mov qword [rbx+TCB_LAUNCH_ARG_BUF_PTR], 0
     mov dword [rbx+TCB_LAUNCH_ARG_LEN], 0
     mov dword [rbx+TCB_DIRTY_VALID], 0
+
+    ; R4 window geometry/title -- left zeroed here; only basix_rt_launch
+    ; (not every task_create caller, e.g. compositor_task itself) fills
+    ; these in, right after this call returns.
+    mov dword [rbx+TCB_WIN_X], 0
+    mov dword [rbx+TCB_WIN_Y], 0
+    mov dword [rbx+TCB_WIN_W], 0
+    mov dword [rbx+TCB_WIN_H], 0
+    mov dword [rbx+TCB_WIN_TITLE_LEN], 0
+    mov dword [rbx+TCB_WIN_CLOSE_REQ], 0
 
     mov rax, rbx
     jmp .out

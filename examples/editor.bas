@@ -154,6 +154,23 @@ ENDIF
 
 main_loop:
 GOSUB redraw
+
+' Poll WINCLOSE (the kernel-drawn close gadget, see kernel/kernel.asm's
+' wm_tick) alongside KEYHIT instead of blocking straight on GETKEY --
+' otherwise a click on the close gadget would only be noticed the next
+' time the user pressed some other key anyway, since GETKEY's own wait
+' has no way to also watch for a window-manager event. Once KEYHIT
+' confirms a key really is waiting, GETKEY itself won't actually block
+' (there's something there to read), so this doesn't change the
+' keyboard side of the loop at all -- WAIT 1 here just keeps the idle
+' poll from burning a full CPU share while nothing's happening, same
+' reasoning as workbench.bas's own WAIT-paced main loop.
+wait_key:
+IF WINCLOSE THEN END
+IF KEYHIT = 0 THEN
+  WAIT 1
+  GOTO wait_key
+ENDIF
 LET k = GETKEY
 
 ' NOT doing a CLS+FLIP cleanup pass here before END, on purpose: R1's
