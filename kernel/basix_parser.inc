@@ -1705,6 +1705,14 @@ basix_parse_primary:
     je .do_wblight
     cmp eax, TOK_WBDARK
     je .do_wbdark
+    cmp eax, TOK_WBTITLEH
+    je .do_wbtitleh
+    cmp eax, TOK_WBCLOSESZ
+    je .do_wbclosesz
+    cmp eax, TOK_WINX
+    je .do_winx
+    cmp eax, TOK_WINY
+    je .do_winy
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
@@ -1887,6 +1895,30 @@ basix_parse_primary:
 .do_wbdark:
     call basix_lex_next                  ; bare keyword, no parens/args
     lea rcx, [rel basix_rt_wbdark]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_wbtitleh:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_wbtitleh]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_wbclosesz:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_wbclosesz]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_winx:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_winx]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_winy:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_winy]
     call basix_emit_call_to
     xor r11d, r11d                       ; result type = int
     ret
@@ -3447,6 +3479,10 @@ basix_parse_statement:
     je .do_cls
     cmp r15d, TOK_FLIP
     je .do_flip
+    cmp r15d, TOK_PNGLOCK
+    je .do_pnglock
+    cmp r15d, TOK_PNGUNLOCK
+    je .do_pngunlock
     cmp r15d, TOK_TRIFILL
     je .do_trifill
     cmp r15d, TOK_PUTCHAR
@@ -3548,6 +3584,16 @@ basix_parse_statement:
 .do_flip:
     call basix_lex_next
     call basix_parse_flip
+    jmp .out
+.do_pnglock:
+    call basix_lex_next
+    lea rcx, [rel basix_rt_pnglock]
+    call basix_emit_call_to
+    jmp .out
+.do_pngunlock:
+    call basix_lex_next
+    lea rcx, [rel basix_rt_pngunlock]
+    call basix_emit_call_to
     jmp .out
 .do_trifill:
     call basix_lex_next

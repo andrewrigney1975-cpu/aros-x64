@@ -208,6 +208,7 @@ kbd_irq_stub:
 ; unread console is not worth crashing over).
 ; -------------------------------------------------------------------------
 kbd_buf_push:
+    push rax
     push rbx
     push rcx
     push rdx
@@ -244,6 +245,7 @@ kbd_buf_push:
     pop rdx
     pop rcx
     pop rbx
+    pop rax
     ret
 
 ; -------------------------------------------------------------------------

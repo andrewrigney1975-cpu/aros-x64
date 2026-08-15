@@ -67,19 +67,91 @@ def gen_folder(w=40, h=28):
     im.save(os.path.join(OUT, "icon_folder.png"))
 
 
-def gen_file(w=40, h=28):
-    im, d = new_icon(w, h)
+def file_outline(d, w, h):
+    """Shared "folded-corner document" silhouette every per-type file
+    icon below starts from -- bevel-edged (light top/left, dark
+    bottom/right on the corner fold) the same convention as bevel_rect,
+    not a flat black outline, so these read consistently with every
+    other beveled surface in the UI (window chrome, gadget boxes).
+    Returns the body's own (x0, y0, x1, y1) so callers can draw their
+    distinguishing mark inside it.
+    """
     x0, y0, x1, y1 = 6, 2, w - 7, h - 3
     fold = 7
     d.polygon(
         [(x0, y0), (x1 - fold, y0), (x1, y0 + fold), (x1, y1), (x0, y1)],
         fill=WHITE, outline=BLACK,
     )
+    # Bevel edges on the body -- light top/left, dark bottom/right,
+    # matching bevel_rect's own convention (kept as separate lines
+    # here rather than reusing bevel_rect itself since this shape
+    # isn't a plain rectangle -- the top-right corner is folded).
+    d.line([x0 + 1, y0 + 1, x1 - fold, y0 + 1], fill=HILITE)
+    d.line([x0 + 1, y0 + 1, x0 + 1, y1 - 1], fill=HILITE)
+    d.line([x0 + 1, y1 - 1, x1 - 1, y1 - 1], fill=SHADOW)
+    d.line([x1 - 1, y0 + fold, x1 - 1, y1 - 1], fill=SHADOW)
+    # The fold itself -- small triangle, its own light/dark pairing.
     d.polygon([(x1 - fold, y0), (x1, y0 + fold), (x1 - fold, y0 + fold)],
               fill=SHADOW, outline=BLACK)
+    d.line([x1 - fold, y0 + 1, x1 - fold, y0 + fold], fill=HILITE)
+    return x0, y0, x1, y1
+
+
+def gen_file(w=40, h=28):
+    """Fallback icon for any extension with no dedicated icon below --
+    the plain document silhouette, no distinguishing mark."""
+    im, d = new_icon(w, h)
+    file_outline(d, w, h)
+    im.save(os.path.join(OUT, "icon_file.png"))
+
+
+def gen_file_txt(w=40, h=28):
+    """.TXT -- horizontal ruled lines, like a page of text."""
+    im, d = new_icon(w, h)
+    x0, y0, x1, y1 = file_outline(d, w, h)
     for ly in range(y0 + 8, y1 - 2, 4):
         d.line([x0 + 3, ly, x1 - 3, ly], fill=SHADOW)
-    im.save(os.path.join(OUT, "icon_file.png"))
+    im.save(os.path.join(OUT, "icon_txt.png"))
+
+
+def gen_file_bas(w=40, h=28):
+    """.BAS -- a solid title-blue "code" bar plus a couple of short
+    ragged lines beneath it (suggesting indented source lines),
+    distinct at a glance from the plain ruled-line .TXT icon."""
+    im, d = new_icon(w, h)
+    x0, y0, x1, y1 = file_outline(d, w, h)
+    d.rectangle([x0 + 3, y0 + 4, x1 - 4, y0 + 8], fill=TITLE, outline=BLACK)
+    d.line([x0 + 3, y0 + 13, x0 + 14, y0 + 13], fill=SHADOW)
+    d.line([x0 + 6, y0 + 17, x0 + 20, y0 + 17], fill=SHADOW)
+    d.line([x0 + 3, y0 + 21, x0 + 11, y0 + 21], fill=SHADOW)
+    im.save(os.path.join(OUT, "icon_bas.png"))
+
+
+def gen_file_png(w=40, h=28):
+    """.PNG -- classic tiny mountain + sun "image file" glyph."""
+    im, d = new_icon(w, h)
+    x0, y0, x1, y1 = file_outline(d, w, h)
+    d.rectangle([x0 + 3, y0 + 5, x1 - 4, y1 - 5], fill=WHITE, outline=BLACK)
+    d.ellipse([x1 - 12, y0 + 7, x1 - 8, y0 + 11], fill=TITLE, outline=BLACK)
+    d.polygon(
+        [(x0 + 4, y1 - 6), (x0 + 11, y0 + 15), (x0 + 16, y1 - 10),
+         (x0 + 20, y0 + 18), (x1 - 5, y1 - 6)],
+        fill=SHADOW, outline=BLACK,
+    )
+    im.save(os.path.join(OUT, "icon_png.png"))
+
+
+def gen_file_axb(w=40, h=28):
+    """.AXB (compiled executable) -- a filled right-pointing "run"
+    triangle, distinct from the passive document-style icons above."""
+    im, d = new_icon(w, h)
+    x0, y0, x1, y1 = file_outline(d, w, h)
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2 + 1
+    d.polygon(
+        [(cx - 6, cy - 8), (cx - 6, cy + 8), (cx + 8, cy)],
+        fill=TITLE, outline=BLACK,
+    )
+    im.save(os.path.join(OUT, "icon_axb.png"))
 
 
 def gen_close_gadget(w=12, h=12):
@@ -93,5 +165,9 @@ def gen_close_gadget(w=12, h=12):
 gen_disk()
 gen_folder()
 gen_file()
+gen_file_txt()
+gen_file_bas()
+gen_file_png()
+gen_file_axb()
 gen_close_gadget()
-print("Wrote icon_disk.png, icon_folder.png, icon_file.png, icon_close.png to", OUT)
+print("Wrote icon_disk/folder/file/txt/bas/png/axb/close.png to", OUT)

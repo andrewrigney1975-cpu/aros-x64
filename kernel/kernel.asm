@@ -86,11 +86,66 @@ entry:
     test eax, eax
     jz .exfat_bad
 
+    ; Self-healing, like every other exFAT smoke-test further below
+    ; (crtest/wftest/lntest/etc all "create it if this is the first
+    ; boot against this VHD, then verify either way") -- this one used
+    ; to be the ONE exception, a hard prerequisite that TEST.TXT
+    ; already exist with an exact size and trailing marker, no
+    ; fallback creation path at all. On any VHD where that one
+    ; specific file was ever missing or resized (e.g. a shared dev/
+    ; test VHD used for lots of other things too), this printed a
+    ; scary "exFAT: mount, find, or read FAILED" even though the real
+    ; exFAT driver was working completely fine -- confirmed misleading
+    ; in exactly that scenario this session.
+    lea rcx, [rel exfat_test_name]
+    lea r8, [rel exfat_find_result]
+    call exfat_find_root_file
+    test eax, eax
+    jnz .exfat_have_file
+
+    ; exfat_write_file needs the allocation bitmap mounted first (to
+    ; find a free cluster to write into) -- normally done by btest,
+    ; much further down in this same boot sequence, too late for this
+    ; earlier self-heal write. Safe/idempotent to call again there.
+    call exfat_bitmap_mount
+    test eax, eax
+    jz .exfat_bad
+
+    lea rdi, [rel exfat_test_buf]
+    xor ecx, ecx
+.exfat_gen_fill:
+    cmp ecx, 5000 - 18
+    jge .exfat_gen_fill_done
+    mov eax, ecx
+    and eax, 0xFF
+    mov [rdi+rcx], al
+    inc ecx
+    jmp .exfat_gen_fill
+.exfat_gen_fill_done:
+    lea rsi, [rel exfat_marker]
+    lea rdi, [rel exfat_test_buf + 5000 - 18]
+    mov ecx, 18
+.exfat_gen_marker:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .exfat_gen_marker
+
+    lea rcx, [rel exfat_test_name]
+    lea r8, [rel exfat_test_buf]
+    mov r9, 5000
+    call exfat_write_file
+    test eax, eax
+    jz .exfat_bad
+
     lea rcx, [rel exfat_test_name]
     lea r8, [rel exfat_find_result]
     call exfat_find_root_file
     test eax, eax
     jz .exfat_bad
+.exfat_have_file:
 
     mov ecx, [rel exfat_find_result+0]  ; FirstCluster
     mov rdx, [rel exfat_find_result+8]  ; DataLength
@@ -1032,6 +1087,19 @@ entry:
     test rax, rax
     jz .sched_bad
     mov r13, rax                        ; r13 = task A's TCB
+    mov [rel test_task_a_tcb], rax      ; stashed so term_verify_done
+                                         ; (much later, after every
+                                         ; intervening exFAT self-test
+                                         ; has long since clobbered
+                                         ; r13/r14 for its own use) can
+                                         ; still terminate A once its
+                                         ; job -- proving the rest of
+                                         ; the system stays alive while
+                                         ; OTHER tasks terminate -- is
+                                         ; done, instead of leaving it
+                                         ; spinning and spamming serial
+                                         ; forever (see test_task_a's
+                                         ; own comment).
 
     mov rcx, test_task_b
     xor edx, edx
@@ -1040,6 +1108,7 @@ entry:
     test rax, rax
     jz .sched_bad
     mov r14, rax                        ; r14 = task B's TCB
+    mov [rel test_task_b_tcb], rax      ; see test_task_a_tcb's comment
 
     mov rcx, test_task_exit
     xor edx, edx
@@ -1186,6 +1255,32 @@ entry:
     lea r8, [rel msg_term_verify_bad]
     call fb_draw_string
 .term_verify_done:
+    ; test_task_a/b have now done their job -- every verification that
+    ; needed them alive and still counting (both the preemption check
+    ; above and the "rest of the system survives other tasks
+    ; terminating" check just above) is done. Originally they just
+    ; looped forever after this point (see their own comment) -- pure
+    ; leftover R0-era bring-up scaffolding, but a real, ongoing cost:
+    ; permanently occupying a ready-ring slot and spamming serial with
+    ; "[taskA]"/"[taskB]" for the entire remaining lifetime of the
+    ; system, competing for CPU with actual work (compositor_task,
+    ; LAUNCHed GUI programs) on every single round-robin cycle from
+    ; here on. Terminate them exactly the way task_exit terminates the
+    ; CALLING task (TCB_STATE_TERMINATED) -- safe to do to another,
+    ; not-currently-running task from here, since sched_pick_next
+    ; already splices out and zombie-queues any task it finds in this
+    ; state on its own, regardless of who set it.
+    mov rax, [rel test_task_a_tcb]
+    test rax, rax
+    jz .no_a_term
+    mov dword [rax+TCB_STATE], TCB_STATE_TERMINATED
+.no_a_term:
+    mov rax, [rel test_task_b_tcb]
+    test rax, rax
+    jz .no_b_term
+    mov dword [rax+TCB_STATE], TCB_STATE_TERMINATED
+.no_b_term:
+    call sched_reap_zombies
 
     ; Smoke-test the BASIX64 compiler: compile and run a trivial program.
     ; This only proves the pipeline works end to end (compiles without
@@ -1344,7 +1439,7 @@ basix_zorder_count: dd 0
 ; 2.0+ "3D look": there's no gradient/gloss anywhere in 2.04 itself --
 ; every surface is a flat fill, and all the depth comes from that one
 ; consistent light/dark edge-pair convention.
-WM_TITLE_H     equ 20   ; title bar height, px
+WM_TITLE_H     equ 22   ; title bar height, px
 WM_BORDER      equ 4    ; border thickness, px (matches wm_fb_bevel_rect's
                          ; own WM_EDGE bevel-line thickness below, so the
                          ; frame's raised edge fills the whole border,
@@ -1352,7 +1447,21 @@ WM_BORDER      equ 4    ; border thickness, px (matches wm_fb_bevel_rect's
 WM_EDGE        equ 2    ; bevel light/dark line thickness, px -- real
                          ; Workbench 2.04 frames read as thick/embossed,
                          ; not hairline; widened from 1px for that
-WM_CLOSE_SIZE  equ 14   ; close gadget square size, px
+WM_CLOSE_SIZE  equ 16   ; close gadget square size, px -- matches
+                         ; font8x16's own glyph height exactly (see the
+                         ; close-gadget 'X' glyph below), so it sits
+                         ; fully inside the box with no overflow/overlap
+                         ; onto the box's own bevel edges
+; Vertical margin that centers a 16px-tall glyph cell (title text, and
+; the close gadget's own WM_CLOSE_SIZE=16 box) inside the title bar's
+; own VISIBLE fill height (WM_TITLE_H minus the WM_EDGE border strip
+; along its top -- see the title-fill/close-gadget draw code, which
+; both need to measure their vertical position from the fill's own
+; top, not the window's outer frame top, or they end up offset by
+; WM_BORDER extra px from where the bar actually visually starts --
+; a real bug found this way: the close gadget's own box bled 1px past
+; the bottom of the title bar because of exactly that miscalculation).
+WM_TITLE_TEXT_MARGIN equ (WM_TITLE_H - WM_EDGE - 16) / 2
 WM_TITLE_BG    equ 0x6F87C6
 WM_TITLE_FG    equ 0x000000
 WM_BODY_BG     equ 0xAAAAAA   ; gadget box / border fill -- classic
@@ -1516,6 +1625,125 @@ wm_fb_bevel_rect:
     pop r8
     pop rdx
     pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; wm_cursor_bitmap: classic arrow-pointer shape, 16 rows, one 16-bit
+; mask per row (MSB = leftmost pixel), same row-major format as
+; font8x16's glyphs but word-wide instead of byte-wide. Replaces the
+; old plain-white-square cursor, which was drawn as part of
+; workbench.bas's own content (see its own comment on why that hid the
+; cursor behind any window in front of it) -- this is a real
+; compositor-level overlay instead, see wm_fb_draw_cursor below.
+; -------------------------------------------------------------------------
+wm_cursor_bitmap:
+    dw 1000000000000000b
+    dw 1100000000000000b
+    dw 1110000000000000b
+    dw 1111000000000000b
+    dw 1111100000000000b
+    dw 1111110000000000b
+    dw 1111111000000000b
+    dw 1111111100000000b
+    dw 1111111110000000b
+    dw 1111100000000000b
+    dw 1101100000000000b
+    dw 1000110000000000b
+    dw 0000110000000000b
+    dw 0000011000000000b
+    dw 0000011000000000b
+    dw 0000000000000000b
+
+WM_CURSOR_FG equ 0x000000
+WM_CURSOR_W  equ 16
+WM_CURSOR_H  equ 16
+
+; -------------------------------------------------------------------------
+; wm_fb_draw_cursor: RCX=x, RDX=y (top-left of the 16x16 cursor cell,
+; NOT a hotspot offset -- the shape's own "point" is already at its
+; top-left corner). Paints only SET bits, leaving the rest alone, same
+; convention as wm_fb_draw_glyph -- straight to the real framebuffer,
+; clipped to screen bounds. RBX must be boot_info*.
+; -------------------------------------------------------------------------
+wm_fb_draw_cursor:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r14
+
+    mov r9d, ecx                        ; r9d = x0
+    mov r10d, edx                       ; r10d = y0
+    lea rsi, [rel wm_cursor_bitmap]
+    xor r8d, r8d                        ; r8d = row index
+.row_loop:
+    cmp r8d, WM_CURSOR_H
+    jge .done
+    mov edi, r10d
+    add edi, r8d
+    cmp edi, 0
+    jl .row_next
+    cmp edi, [rbx+FB_HEIGHT]
+    jge .row_next
+
+    ; r11d holds this row's 16-bit mask for the WHOLE column loop below
+    ; -- must NOT be reused as scratch anywhere in that loop (an
+    ; earlier version of this function used ECX/RCX for both this AND
+    ; the pixel-write address math a few lines down, which clobbered
+    ; the mask after the first set bit in any row -- every row after
+    ; its own first pixel then tested garbage for the rest of its
+    ; columns, producing scattered/sparse pixels instead of a solid
+    ; shape).
+    movzx r11d, word [rsi + r8*2]
+    xor edx, edx                        ; edx = column index within row
+.col_loop:
+    cmp edx, WM_CURSOR_W
+    jge .row_next
+    mov eax, r11d
+    mov r14d, 15
+    sub r14d, edx
+    bt eax, r14d
+    jnc .col_next
+
+    mov eax, r9d
+    add eax, edx
+    cmp eax, 0
+    jl .col_next
+    cmp eax, [rbx+FB_WIDTH]
+    jge .col_next
+
+    push rax
+    mov eax, edi
+    imul eax, [rbx+FB_STRIDE]
+    pop rcx
+    add eax, ecx
+    mov rcx, [rbx+FB_BASE]
+    mov dword [rcx + rax*4], WM_CURSOR_FG
+
+.col_next:
+    inc edx
+    jmp .col_loop
+.row_next:
+    inc r8d
+    jmp .row_loop
+.done:
+    pop r14
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
     ret
 
 ; -------------------------------------------------------------------------
@@ -1860,6 +2088,20 @@ compositor_task:
     jz .scan_next
     cmp dword [rcx+TCB_DIRTY_VALID], 0
     je .scan_next
+    ; Clear this entry's dirty flag HERE, now, rather than in a
+    ; separate blind "clear every entry" pass at the very end (the
+    ; old approach) -- that indiscriminate final clear raced against
+    ; a task's own FLIP: if a task (e.g. a just-LAUNCHed editor.bas)
+    ; set TCB_DIRTY_VALID=1 AFTER this scan already passed it by this
+    ; pass, but BEFORE the old end-of-pass clear ran, its legitimate
+    ; new dirty notification got silently wiped WITHOUT ever being
+    ; blitted -- its content stayed correctly drawn in its own back
+    ; buffer forever, just never copied to the screen. Clearing right
+    ; here instead means only entries that are ACTUALLY being unioned
+    ; into (and therefore correctly blitted as part of) THIS pass ever
+    ; get cleared; anything that turns dirty in that race window keeps
+    ; its flag set for the very next pass's scan to pick up correctly.
+    mov dword [rcx+TCB_DIRTY_VALID], 0
     mov r8d, [rcx+TCB_DIRTY_X0]
     mov r9d, [rcx+TCB_DIRTY_Y0]
     mov r10d, [rcx+TCB_DIRTY_X1]
@@ -1904,6 +2146,81 @@ compositor_task:
     mov [rel basix_comp_idx], eax
     jmp .scan_loop
 .scan_done:
+    ; Cursor movement dirty-tracking: the compositor-drawn cursor
+    ; overlay (wm_fb_draw_cursor, drawn later in this same pass) is
+    ; outside any task's own dirty-rect tracking entirely -- moving it
+    ; needs the OLD position's pixels properly redrawn from whatever
+    ; window content is actually there, plus the NEW position painted,
+    ; so union in a small rect covering both bounds whenever the mouse
+    ; has moved since the last pass -- same "force a redraw for
+    ; something no task's own dirty rect reflects" pattern
+    ; basix_wm_force_full already uses for window drags/closes below,
+    ; just scoped to a small cursor-sized rect instead of the whole
+    ; screen.
+    mov eax, [rel mouse_x]
+    mov ecx, [rel mouse_y]
+    cmp eax, [rel basix_cursor_last_x]
+    jne .cursor_moved
+    cmp ecx, [rel basix_cursor_last_y]
+    je .cursor_not_moved
+.cursor_moved:
+    mov r8d, [rel basix_cursor_last_x]
+    cmp r8d, eax
+    jle .cx0_ok
+    mov r8d, eax
+.cx0_ok:
+    mov r9d, [rel basix_cursor_last_y]
+    cmp r9d, ecx
+    jle .cy0_ok
+    mov r9d, ecx
+.cy0_ok:
+    mov r10d, [rel basix_cursor_last_x]
+    cmp r10d, eax
+    jge .cx1_ok
+    mov r10d, eax
+.cx1_ok:
+    add r10d, WM_CURSOR_W
+    mov r11d, [rel basix_cursor_last_y]
+    cmp r11d, ecx
+    jge .cy1_ok
+    mov r11d, ecx
+.cy1_ok:
+    add r11d, WM_CURSOR_H
+
+    cmp dword [rel basix_comp_any_dirty], 0
+    jne .cursor_union_merge
+    mov [rel basix_comp_union_x0], r8d
+    mov [rel basix_comp_union_y0], r9d
+    mov [rel basix_comp_union_x1], r10d
+    mov [rel basix_comp_union_y1], r11d
+    mov dword [rel basix_comp_any_dirty], 1
+    jmp .cursor_not_moved
+.cursor_union_merge:
+    mov edx, [rel basix_comp_union_x0]
+    cmp r8d, edx
+    jge .ccx0_ok
+    mov [rel basix_comp_union_x0], r8d
+.ccx0_ok:
+    mov edx, [rel basix_comp_union_y0]
+    cmp r9d, edx
+    jge .ccy0_ok
+    mov [rel basix_comp_union_y0], r9d
+.ccy0_ok:
+    mov edx, [rel basix_comp_union_x1]
+    cmp r10d, edx
+    jle .ccx1_ok
+    mov [rel basix_comp_union_x1], r10d
+.ccx1_ok:
+    mov edx, [rel basix_comp_union_y1]
+    cmp r11d, edx
+    jle .cursor_not_moved
+    mov [rel basix_comp_union_y1], r11d
+.cursor_not_moved:
+    mov eax, [rel mouse_x]
+    mov [rel basix_cursor_last_x], eax
+    mov eax, [rel mouse_y]
+    mov [rel basix_cursor_last_y], eax
+
     ; A drag actually moving a window (wm_tick) means the OLD window
     ; position needs covering too, which no task's own dirty rect
     ; reflects (nothing drew there -- the window just moved away from
@@ -1922,68 +2239,188 @@ compositor_task:
     cmp dword [rel basix_comp_any_dirty], 0
     je .clear_pass
 
-    ; Phase 2: blit the union rect from every z-order entry's current
-    ; back buffer, back to front.
+    ; Phase 2: for each z-order entry, back to front, draw its chrome
+    ; (if windowed -- index 0/main never is) and THEN its own content
+    ; blit, as one interleaved per-entry pair -- NOT "every entry's
+    ; chrome, then every entry's content" as two separate passes (an
+    ; earlier version of this fix did exactly that, to solve a
+    ; DIFFERENT bug -- see the content-blit block's own comment on
+    ; that). Batching chrome-then-content phase-wide broke multi-
+    ; window z-order: with two overlapping chrome'd windows, the BACK
+    ; window's content blit (which only knows its own bounds, not
+    ; that a front window's chrome is sitting in part of them) ran
+    ; AFTER the FRONT window's chrome had already been drawn, so it
+    ; painted over that chrome wherever the two windows overlapped --
+    ; the front window visibly lost its title bar/border/close gadget
+    ; entirely. Interleaving per-entry, back to front, means each
+    ; window's own content always lands right after its own chrome
+    ; (fixing the original bug), and the NEXT entry forward in z-order
+    ; still correctly draws over everything from every entry behind it
+    ; -- chrome AND content both -- exactly like real window stacking.
     mov dword [rel basix_comp_idx], 0
-.blit_loop:
+.entry_loop:
     mov eax, [rel basix_comp_idx]
     cmp eax, [rel basix_zorder_count]
-    jge .chrome_phase
-
+    jge .cursor_draw
     mov eax, [rel basix_comp_idx]
-    mov r15, [rel basix_zorder + rax*8] ; r15 = this entry's task ptr,
-                                         ; stable across the row loop
-                                         ; below (unlike RAX, reused as
-                                         ; scratch in the address math)
+    mov r15, [rel basix_zorder + rax*8]
     test r15, r15
-    jz .blit_next
+    jz .entry_next
+    cmp dword [r15+TCB_WIN_W], 0
+    je .content_blit                    ; not windowed (main) -- no chrome
+
+    ; Outer frame: one raised bevel (see wm_fb_bevel_rect) around the
+    ; whole window -- title bar and client area together -- filled
+    ; gray. The title bar's own flat blue fill (next) draws right over
+    ; this frame's top edge, which is fine: the title bar's own
+    ; bottom edge, where it meets the gray client area, already reads
+    ; as a clear boundary on its own. Left/right/bottom stay visible
+    ; as the window's raised outline.
+    mov ecx, [r15+TCB_WIN_X]
+    sub ecx, WM_BORDER
+    mov edx, [r15+TCB_WIN_Y]
+    sub edx, WM_TITLE_H
+    sub edx, WM_BORDER
+    mov r8d, [r15+TCB_WIN_W]
+    add r8d, WM_BORDER*2
+    mov r9d, [r15+TCB_WIN_H]
+    add r9d, WM_TITLE_H
+    add r9d, WM_BORDER*2
+    mov r10d, WM_BODY_BG
+    call wm_fb_bevel_rect
+
+    ; Title bar background -- flat, no bevel of its own (real 2.04
+    ; chrome never puts a bevel on the title bar itself, only on
+    ; gadgets/frames), but inset by WM_EDGE on the top/left/right so
+    ; the outer frame's own border (drawn just above, wrapping the
+    ; WHOLE window) stays visible alongside and above the title bar
+    ; too, not just around the body -- previously this fill extended
+    ; all the way to the frame's own edges and painted directly over
+    ; its top/left/right border lines within the title bar's height,
+    ; so the border only ever looked like it wrapped the body.
+    mov ecx, [r15+TCB_WIN_X]
+    sub ecx, WM_BORDER
+    add ecx, WM_EDGE
+    mov edx, [r15+TCB_WIN_Y]
+    sub edx, WM_TITLE_H
+    sub edx, WM_BORDER
+    add edx, WM_EDGE
+    mov r8d, [r15+TCB_WIN_W]
+    add r8d, WM_BORDER*2
+    sub r8d, WM_EDGE*2
+    mov r9d, WM_TITLE_H
+    sub r9d, WM_EDGE
+    mov r10d, WM_TITLE_BG
+    call wm_fb_fill_rect
+
+    ; Title text -- vertically centered against the title bar's own
+    ; VISIBLE fill (WIN_Y - TITLE_H - BORDER + EDGE, matching the fill
+    ; rect's own y0 just above), not "WIN_Y - TITLE_H" alone -- that
+    ; earlier version silently forgot the -BORDER+EDGE terms, so it
+    ; measured from a point BORDER-EDGE=2px below where the bar
+    ; actually starts, throwing centering off (see
+    ; WM_TITLE_TEXT_MARGIN's own comment).
+    mov rcx, r15
+    mov edx, [r15+TCB_WIN_X]
+    mov r8d, [r15+TCB_WIN_Y]
+    sub r8d, WM_TITLE_H
+    sub r8d, WM_BORDER
+    add r8d, WM_EDGE
+    add r8d, WM_TITLE_TEXT_MARGIN
+    mov r9d, WM_TITLE_FG
+    call wm_fb_draw_title
+
+    ; Close gadget -- its own small raised bevel box, vertically
+    ; centered the same way (same fix as the title text just above --
+    ; this used to bleed 1px past the title bar's own bottom edge
+    ; because of the identical missing -BORDER+EDGE terms).
+    mov ecx, [r15+TCB_WIN_X]
+    sub ecx, WM_BORDER
+    add ecx, [r15+TCB_WIN_W]
+    add ecx, WM_BORDER
+    sub ecx, WM_CLOSE_SIZE
+    sub ecx, 3
+    mov edx, [r15+TCB_WIN_Y]
+    sub edx, WM_TITLE_H
+    sub edx, WM_BORDER
+    add edx, WM_EDGE
+    add edx, WM_TITLE_TEXT_MARGIN
+    mov r8d, WM_CLOSE_SIZE
+    mov r9d, WM_CLOSE_SIZE
+    mov r10d, WM_BODY_BG
+    call wm_fb_bevel_rect
+
+    ; 'X' glyph inside the close gadget box -- the kernel-drawn chrome
+    ; never had ANY icon here before (just the blank bevel box above),
+    ; unlike workbench.bas's own OLD hand-drawn window, which LOADPNGed
+    ; a real close icon for its own close button (that hand-drawn
+    ; window no longer exists -- see filebrowser.bas). ecx/edx still
+    ; hold the close gadget's own x0/y0 from the bevel_rect call just
+    ; above (wm_fb_bevel_rect preserves them). Glyph cell is 8x16 (see
+    ; basix_draw_glyph/font8x16) against a WM_CLOSE_SIZE=16 box -- an
+    ; EXACT height match (no vertical offset needed at all, unlike the
+    ; old WM_CLOSE_SIZE=14 box, which overflowed the glyph 1px into the
+    ; box's own top/bottom bevel edges), centered horizontally with a
+    ; 4px margin each side ((16-8)/2).
+    mov al, 'X'
+    mov r9d, ecx
+    add r9d, 4
+    mov r10d, edx
+    mov r11d, WM_CLOSE_FG
+    call wm_fb_draw_glyph
+
+    ; Content blit -- this entry's own current back buffer, straight
+    ; over whatever chrome (just above, if any) drew. Runs for EVERY
+    ; entry including index 0/main (no chrome, but still content), not
+    ; just windowed ones. Must come after chrome, not before: the
+    ; chrome frame's own fill covers this entry's ENTIRE window
+    ; rectangle, client area included (see the outer-frame comment
+    ; above), so drawing it after content would paint flat gray
+    ; straight over whatever this task just correctly drew -- never
+    ; visibly caught before this investigation because every window
+    ; tested up to that point happened to be blank (gray-on-gray
+    ; content is indistinguishable from the chrome fill covering it).
+.content_blit:
     mov rsi, [r15+TCB_BACKBUF_PTR]
     test rsi, rsi
-    jz .blit_next
+    jz .entry_next
 
-    ; Convert the SCREEN-space union rect to THIS entry's LOCAL back-
-    ; buffer coordinates (subtract its own TCB_WIN_X/Y, 0 for main)
-    ; before clamping to its own buffer bounds -- see phase 1's
-    ; comment on why local and screen coordinates differ now.
-    mov r8d, [rel basix_comp_union_x0]
-    mov r9d, [rel basix_comp_union_y0]
-    mov r10d, [rel basix_comp_union_x1]
-    mov r11d, [rel basix_comp_union_y1]
-    mov eax, [r15+TCB_WIN_X]
-    sub r8d, eax
-    sub r10d, eax
-    mov eax, [r15+TCB_WIN_Y]
-    sub r9d, eax
-    sub r11d, eax
+    ; Every entry repaints its own FULL bounds on any compositor pass,
+    ; rather than being clamped to the shared cross-window dirty union
+    ; (the old approach here). Clamping to the union meant an IDLE
+    ; window -- nothing of its OWN dirty this particular pass, e.g.
+    ; EDITOR.BAS blocked on GETKEY between keystrokes while
+    ; FILEBROWSER.BAS keeps redrawing every ~20ms -- only got re-
+    ; blitted within whatever narrow region some OTHER window's own
+    ; redraw (or even just the cursor moving) happened to cover that
+    ; pass. Confirmed live: EDITOR.BAS's content area visibly
+    ; contracted to exactly FILEBROWSER.BAS's overlapping screen
+    ; bounds, then expanded back to full width for one frame on
+    ; EDITOR's own next keystroke before contracting again. Re-
+    ; blitting a window's already-computed back buffer is a plain
+    ; memcpy (cheap) regardless of how much of it actually changed --
+    ; the expensive part (each program's own drawing) already happened
+    ; before FLIP -- so there's no real cost to always copying the
+    ; whole buffer once ANY pass is triggered at all (still gated by
+    ; basix_comp_any_dirty in phase 1, so a fully idle desktop doesn't
+    ; burn cycles compositing nothing).
     mov r12d, [r15+TCB_BACKBUF_W]
     mov r13d, [r15+TCB_BACKBUF_H]
-
-    cmp r8d, 0
-    jge .x0_clamped
     xor r8d, r8d
-.x0_clamped:
-    cmp r9d, 0
-    jge .y0_clamped
     xor r9d, r9d
-.y0_clamped:
-    cmp r10d, r12d
-    jle .x1_clamped
     mov r10d, r12d
-.x1_clamped:
-    cmp r11d, r13d
-    jle .y1_clamped
     mov r11d, r13d
-.y1_clamped:
+
     cmp r8d, r10d
-    jge .blit_next                      ; empty after clamping to this
-                                         ; entry's own (smaller?) buffer
+    jge .entry_next                      ; zero-size buffer -- nothing
+                                         ; to blit
     cmp r9d, r11d
-    jge .blit_next
+    jge .entry_next
 
     mov r14d, r9d                       ; r14d = LOCAL row index
 .row_loop:
     cmp r14d, r11d
-    jge .blit_next
+    jge .entry_next
 
     mov eax, r14d
     imul eax, r12d
@@ -2014,113 +2451,26 @@ compositor_task:
     inc r14d
     jmp .row_loop
 
-.blit_next:
+.entry_next:
     mov eax, [rel basix_comp_idx]
     inc eax
     mov [rel basix_comp_idx], eax
-    jmp .blit_loop
+    jmp .entry_loop
 
-; Phase 3: redraw chrome (title bar/text/close gadget/border, straight
-; to the real framebuffer) for every windowed z-order entry -- index 0
-; (main) never has one. Redrawn unconditionally whenever anything at
-; all was dirty this pass, rather than intersecting the union rect
-; against each window's own chrome bounds first -- simpler, and cheap
-; relative to the content blits already just done.
-.chrome_phase:
-    mov dword [rel basix_comp_idx], 1   ; index 0 (main) never has chrome
-.chrome_loop:
-    mov eax, [rel basix_comp_idx]
-    cmp eax, [rel basix_zorder_count]
-    jge .clear_pass
-    mov eax, [rel basix_comp_idx]
-    mov r15, [rel basix_zorder + rax*8]
-    test r15, r15
-    jz .chrome_next
-    cmp dword [r15+TCB_WIN_W], 0
-    je .chrome_next
-
-    ; Outer frame: one raised bevel (see wm_fb_bevel_rect) around the
-    ; whole window -- title bar and client area together -- filled
-    ; gray. The title bar's own flat blue fill (next) draws right over
-    ; this frame's top edge, which is fine: the title bar's own
-    ; bottom edge, where it meets the gray client area, already reads
-    ; as a clear boundary on its own. Left/right/bottom stay visible
-    ; as the window's raised outline.
-    mov ecx, [r15+TCB_WIN_X]
-    sub ecx, WM_BORDER
-    mov edx, [r15+TCB_WIN_Y]
-    sub edx, WM_TITLE_H
-    sub edx, WM_BORDER
-    mov r8d, [r15+TCB_WIN_W]
-    add r8d, WM_BORDER*2
-    mov r9d, [r15+TCB_WIN_H]
-    add r9d, WM_TITLE_H
-    add r9d, WM_BORDER*2
-    mov r10d, WM_BODY_BG
-    call wm_fb_bevel_rect
-
-    ; Title bar background -- flat, no bevel (real 2.04 chrome never
-    ; puts a bevel on the title bar itself, only on gadgets/frames).
-    mov ecx, [r15+TCB_WIN_X]
-    sub ecx, WM_BORDER
-    mov edx, [r15+TCB_WIN_Y]
-    sub edx, WM_TITLE_H
-    sub edx, WM_BORDER
-    mov r8d, [r15+TCB_WIN_W]
-    add r8d, WM_BORDER*2
-    mov r9d, WM_TITLE_H
-    mov r10d, WM_TITLE_BG
-    call wm_fb_fill_rect
-
-    ; Title text.
-    mov rcx, r15
-    mov edx, [r15+TCB_WIN_X]
-    mov r8d, [r15+TCB_WIN_Y]
-    sub r8d, WM_TITLE_H
-    add r8d, 2
-    mov r9d, WM_TITLE_FG
-    call wm_fb_draw_title
-
-    ; Close gadget -- its own small raised bevel box.
-    mov ecx, [r15+TCB_WIN_X]
-    sub ecx, WM_BORDER
-    add ecx, [r15+TCB_WIN_W]
-    add ecx, WM_BORDER
-    sub ecx, WM_CLOSE_SIZE
-    sub ecx, 3
-    mov edx, [r15+TCB_WIN_Y]
-    sub edx, WM_TITLE_H
-    add edx, 3
-    mov r8d, WM_CLOSE_SIZE
-    mov r9d, WM_CLOSE_SIZE
-    mov r10d, WM_BODY_BG
-    call wm_fb_bevel_rect
-
-.chrome_next:
-    mov eax, [rel basix_comp_idx]
-    inc eax
-    mov [rel basix_comp_idx], eax
-    jmp .chrome_loop
+; Cursor overlay: drawn dead last, after every window's own chrome and
+; content, so it's always on top regardless of which window the
+; pointer happens to be over -- see wm_fb_draw_cursor's own comment.
+.cursor_draw:
+    mov ecx, [rel mouse_x]
+    mov edx, [rel mouse_y]
+    call wm_fb_draw_cursor
 
 .clear_pass:
-    ; Clear every z-order entry's dirty flag -- this pass (if anything
-    ; was dirty) already blitted the union rect from every entry's
-    ; current buffer, dirty or not, so nothing is owed a follow-up.
-    mov dword [rel basix_comp_idx], 0
-.clear_loop:
-    mov eax, [rel basix_comp_idx]
-    cmp eax, [rel basix_zorder_count]
-    jge .delay
-    mov eax, [rel basix_comp_idx]
-    mov rcx, [rel basix_zorder + rax*8]
-    test rcx, rcx
-    jz .clear_next
-    mov dword [rcx+TCB_DIRTY_VALID], 0
-.clear_next:
-    mov eax, [rel basix_comp_idx]
-    inc eax
-    mov [rel basix_comp_idx], eax
-    jmp .clear_loop
+    ; Each entry's own dirty flag is already cleared as part of phase
+    ; 1's scan (see its own comment) -- nothing left to do here except
+    ; fall through to the delay. Label kept (rather than removed and
+    ; every jump retargeted) since both "nothing at all was dirty" and
+    ; "chrome_phase just finished" branch here.
 
 .delay:
     ; No explicit busy-wait: checking "is anything dirty" is a handful
@@ -2143,6 +2493,11 @@ basix_comp_union_x0: dd 0
 basix_comp_union_y0: dd 0
 basix_comp_union_x1: dd 0
 basix_comp_union_y1: dd 0
+; Last position the cursor overlay was actually drawn at (see
+; wm_fb_draw_cursor's own comment) -- sentinel far off-screen so the
+; very first compositor pass always treats it as "moved" and draws it.
+basix_cursor_last_x: dd -100000
+basix_cursor_last_y: dd -100000
 
 ; -------------------------------------------------------------------------
 ; test_task_a / test_task_b: preemptive-scheduling demo tasks. Each loops
@@ -5695,6 +6050,8 @@ msg_task_b:           db '[taskB]', 13, 10, 0
 
 test_task_a_counter: dq 0
 test_task_b_counter: dq 0
+test_task_a_tcb: dq 0
+test_task_b_tcb: dq 0
 test_task_exit_counter:  dq 0
 test_task_crash_counter: dq 0
 test_task_overflow_counter: dq 0

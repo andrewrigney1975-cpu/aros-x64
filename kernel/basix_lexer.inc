@@ -177,6 +177,27 @@ TOK_WBGRAY     equ 128
 TOK_WBLIGHT    equ 129
 TOK_WBDARK     equ 130
 
+; Single-source-of-truth UI geometry: WBTITLEH/WBCLOSESZ return the
+; kernel's own WM_TITLE_H/WM_CLOSE_SIZE, same reasoning as WBBLUE/
+; WBGRAY above but for chrome SIZES instead of colors.
+TOK_WBTITLEH   equ 131
+TOK_WBCLOSESZ  equ 132
+
+; WINX/WINY: current_task's own window screen offset (0 for main) -- see
+; basix_rt_winx/basix_rt_winy's own comment. Needed so a windowed program
+; can convert MOUSEX/MOUSEY (always screen coordinates) into its own
+; back buffer's local coordinates for click hit-testing.
+TOK_WINX       equ 133
+TOK_WINY       equ 134
+
+; PNGLOCK/PNGUNLOCK: bracket a LOADPNG...DRAWPNG (x several) batch so
+; another task's own concurrent LOADPNG can't swap out the shared
+; decoded-image slot mid-batch -- see basix_rt_pnglock's own comment
+; (png.inc). Statements, not expressions (like FLIP/CLS), not
+; value-returning bare keywords (like WINX/WINY above).
+TOK_PNGLOCK    equ 135
+TOK_PNGUNLOCK  equ 136
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -1338,5 +1359,29 @@ basix_keywords:
     db 6
     dd TOK_WBDARK
     db 'WBDARK', 0,0,0,0,0,0,0,0,0,0
+
+    db 8
+    dd TOK_WBTITLEH
+    db 'WBTITLEH', 0,0,0,0,0,0,0,0
+
+    db 9
+    dd TOK_WBCLOSESZ
+    db 'WBCLOSESZ', 0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_WINX
+    db 'WINX', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 4
+    dd TOK_WINY
+    db 'WINY', 0,0,0,0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_PNGLOCK
+    db 'PNGLOCK', 0,0,0,0,0,0,0,0,0
+
+    db 9
+    dd TOK_PNGUNLOCK
+    db 'PNGUNLOCK', 0,0,0,0,0,0,0
 
     db 0                                 ; end of table

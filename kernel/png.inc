@@ -89,6 +89,12 @@ dist_extra:   dd 0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,1
 ; pattern as basix_compile_lock (basix_symbols.inc) -- safe under this
 ; kernel's single-core scheduler.
 basix_png_lock: dd 0
+; Reentrancy tracking -- see basix_png_lock_acquire's own comment on
+; why a plain non-reentrant BTS/BTR spinlock isn't safe once a
+; program can hold the lock explicitly (PNGLOCK) across its own
+; LOADPNG/DRAWPNG calls, which ALSO acquire this same lock internally.
+basix_png_lock_owner: dq 0    ; current_task* holding it, or 0
+basix_png_lock_depth: dd 0    ; nesting depth for that owner
 
 align 8
 png_file_buf_ptr: dq 0
@@ -106,6 +112,48 @@ png_debug_inflate_len: dd 0  ; TEMP: actual png_inflate byte count, never overwr
 png_debug_abc: times 4 dd 0   ; TEMP: captured a,b,c,predictor for one probe pixel
 png_debug_gate: dd 0          ; TEMP: scratch flag for the above (avoids clobbering a live reg)
 png_debug_gate2: dd 0         ; TEMP: second scratch flag, dedicated/unused elsewhere
+
+; -------------------------------------------------------------------------
+; Decoded-icon cache: plenty of RAM available, and every icon LOADPNG
+; call in this codebase (workbench.bas's disk icon, filebrowser.bas's
+; per-type icons) reloads the exact same handful of never-changing
+; files from exFAT, byte-for-byte, on every single redraw -- exFAT
+; lookup plus this decoder's deliberately simple bit-serial inflate
+; (see its own header comment: "images here are small enough that this
+; never matters") is fine for ONE decode but was never meant to run
+; every ~20ms per icon per window. Once real concurrent GUI programs
+; started doing exactly that, redraw passes started taking multiple
+; real seconds (measured live: filebrowser.bas's grouped-by-type redraw
+; loop, holding PNGLOCK across a LOADPNG+several DRAWPNGs, still took
+; 60+ real seconds to produce a single visible frame under contention
+; with workbench.bas's own per-frame LOADPNG -- confirmed via QEMU
+; monitor "info registers" repeatedly landing inside exfat_read_file /
+; the inflate bit-reader, i.e. genuinely slow decode work, not a stuck
+; lock). Caching the decoded pixels by filename turns every repeat
+; LOADPNG of the same icon into a pointer swap -- no disk I/O, no
+; inflate, and the shared-globals critical section basix_png_lock
+; guards shrinks from "one full decode" to "a few field writes" even
+; on a cache hit under contention. Fixed-size, no eviction: the icon
+; set here is small (8 known art files) and never changes at runtime,
+; so a simple bump allocator is enough -- once full, later distinct
+; names just skip caching and fall back to the normal decode path.
+; -------------------------------------------------------------------------
+PNG_CACHE_SLOTS equ 16
+
+align 8
+png_cache_name:    times (PNG_CACHE_SLOTS*EXFAT_MAX_NAME_LEN) db 0
+png_cache_namelen: times PNG_CACHE_SLOTS dd 0   ; 0 = empty slot
+png_cache_pixels:  times PNG_CACHE_SLOTS dq 0
+png_cache_width:   times PNG_CACHE_SLOTS dd 0
+png_cache_height:  times PNG_CACHE_SLOTS dd 0
+png_cache_count:   dd 0   ; number of slots filled so far (bump index)
+png_cache_pending_namelen: dd 0   ; scratch: basix_rt_loadpng's clamped
+                                   ; namelen, read back at the
+                                   ; png_cache_insert call site rather
+                                   ; than trusted to survive r13 across
+                                   ; several intervening calls whose own
+                                   ; register-clobber behavior isn't
+                                   ; guaranteed here
 
 ; -------------------------------------------------------------------------
 ; png_heap_init: called once from basix_heap_init (kernel boot). Heap-
@@ -132,6 +180,189 @@ png_heap_init:
     call kmalloc_large
     mov [rel png_pixels_ptr], rax
     pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; png_cache_lookup: RCX = name ptr (nul-terminated), RDX = namelen.
+; Caller already holds basix_png_lock. On a hit, points png_pixels_ptr/
+; png_width/png_height at the cached copy and returns EAX=1; on a miss,
+; returns EAX=0 without touching those globals.
+; -------------------------------------------------------------------------
+png_cache_lookup:
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    push r9
+
+    mov rsi, rcx                        ; name ptr
+    mov r8d, edx                        ; namelen
+    xor r9d, r9d                        ; slot index
+.slot_loop:
+    cmp r9d, [rel png_cache_count]
+    jae .miss
+    mov eax, r9d
+    imul eax, EXFAT_MAX_NAME_LEN
+    lea rdi, [rel png_cache_name + rax]
+    mov ebx, [rel png_cache_namelen + r9*4]
+    cmp ebx, r8d
+    jne .next_slot
+    push rcx
+    push rdx
+    push r8                             ; r8d is the SEARCH namelen and
+                                         ; must survive to the next
+                                         ; iteration's cmp -- ebx (this
+                                         ; slot's namelen, already known
+                                         ; equal) goes in its own call arg
+    mov rcx, rsi
+    mov rdx, rdi
+    mov r8d, ebx
+    call png_bytes_equal
+    pop r8
+    pop rdx
+    pop rcx
+    test eax, eax
+    jz .next_slot
+
+    ; Hit.
+    mov rax, [rel png_cache_pixels + r9*8]
+    mov [rel png_pixels_ptr], rax
+    mov eax, [rel png_cache_width + r9*4]
+    mov [rel png_width], eax
+    mov eax, [rel png_cache_height + r9*4]
+    mov [rel png_height], eax
+    mov eax, 1
+    jmp .out
+.next_slot:
+    inc r9d
+    jmp .slot_loop
+.miss:
+    xor eax, eax
+.out:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+; -------------------------------------------------------------------------
+; png_bytes_equal: RCX = ptr a, RDX = ptr b, R8D = count. Returns EAX=1/0.
+; -------------------------------------------------------------------------
+png_bytes_equal:
+    push rsi
+    push rdi
+    push rcx
+    push rdx
+    push r8
+
+    mov rsi, rcx
+    mov rdi, rdx
+    xor ecx, ecx
+.loop:
+    cmp ecx, r8d
+    jge .eq
+    mov al, [rsi+rcx]
+    cmp al, [rdi+rcx]
+    jne .ne
+    inc ecx
+    jmp .loop
+.eq:
+    mov eax, 1
+    jmp .out
+.ne:
+    xor eax, eax
+.out:
+    pop r8
+    pop rdx
+    pop rcx
+    pop rdi
+    pop rsi
+    ret
+
+; -------------------------------------------------------------------------
+; png_cache_insert: RCX = name ptr, RDX = namelen. Caller already holds
+; basix_png_lock and has just decoded successfully, with png_pixels_ptr/
+; png_width/png_height populated in the shared scratch buffer. Copies
+; those decoded pixels into a freshly kmalloc_large'd, cache-owned
+; buffer and records the entry -- a no-op once PNG_CACHE_SLOTS are all
+; used (see this cache's own header comment). Clamps namelen to
+; EXFAT_MAX_NAME_LEN defensively (callers already do, but this function
+; shouldn't trust that).
+; -------------------------------------------------------------------------
+png_cache_insert:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    mov r9d, [rel png_cache_count]
+    cmp r9d, PNG_CACHE_SLOTS
+    jae .out                            ; cache full -- skip silently
+
+    mov r8d, edx
+    cmp r8d, EXFAT_MAX_NAME_LEN
+    jbe .len_ok
+    mov r8d, EXFAT_MAX_NAME_LEN
+.len_ok:
+
+    mov rbx, rcx                        ; save name ptr -- rcx doesn't
+                                         ; survive the rep movsb below
+
+    mov eax, [rel png_width]
+    mov ecx, [rel png_height]
+    imul eax, ecx
+    imul eax, 4
+    test eax, eax
+    jz .out                             ; nothing decoded -- nothing to cache
+    mov r10d, eax                       ; bytes to copy
+
+    push r8                             ; kmalloc_large clobbers r8/r9/r10
+    push r9                             ; as scratch (see its own header --
+    push r10                            ; only rbx/rsi/r12/r13/r14 survive)
+    mov rcx, r10
+    call kmalloc_large
+    pop r10
+    pop r9
+    pop r8
+    test rax, rax
+    jz .out                             ; allocation failed -- skip silently
+
+    mov [rel png_cache_pixels + r9*8], rax
+    mov rdi, rax
+    mov rsi, [rel png_pixels_ptr]
+    mov ecx, r10d
+    rep movsb
+
+    mov eax, [rel png_width]
+    mov [rel png_cache_width + r9*4], eax
+    mov eax, [rel png_height]
+    mov [rel png_cache_height + r9*4], eax
+
+    mov eax, r9d
+    imul eax, EXFAT_MAX_NAME_LEN
+    lea rdi, [rel png_cache_name + rax]
+    mov rsi, rbx
+    mov ecx, r8d
+    rep movsb
+    mov [rel png_cache_namelen + r9*4], r8d
+
+    inc dword [rel png_cache_count]
+.out:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
     ret
 
 ; =============================================================================
@@ -1486,18 +1717,110 @@ png_decode_file:
 ; BASIX64 entry points
 ; =============================================================================
 
+; -------------------------------------------------------------------------
+; basix_png_lock_acquire/release: reentrant per-task, unlike the plain
+; BTS/BTR spinlock this used to be. Became necessary once a program
+; could hold this lock explicitly across its own sequence of calls
+; (PNGLOCK/PNGUNLOCK, see basix_rt_pnglock's own comment) -- LOADPNG/
+; DRAWPNG each ALSO acquire/release this same lock internally for
+; their own single call, so a PNGLOCK'd program calling either of
+; them was trying to acquire a lock it already held, which a plain
+; non-reentrant spinlock can never satisfy: the second BTS spins
+; forever waiting for a release that can only come from that exact
+; same call stack, which is itself stuck spinning -- an instant,
+; total deadlock (found the hard way: it hung the WHOLE system, not
+; just the PNG code, since the deadlocked task never returned control
+; to the shell that RUN it).
+; -------------------------------------------------------------------------
 basix_png_lock_acquire:
     push rax
+    push rbx
+    mov rbx, [rel current_task]
+    test rbx, rbx
+    jz .acquire_untracked        ; scheduler not armed -- no reentrancy
+                                  ; possible yet, plain acquire is fine
+    cmp rbx, [rel basix_png_lock_owner]
+    jne .acquire_untracked       ; not already held by US
+    inc dword [rel basix_png_lock_depth]
+    jmp .out
+.acquire_untracked:
+    bts dword [rel basix_png_lock], 0    ; try the fast, uncontended path
+    jnc .out_untracked                   ; first with NO pause cost at all --
+                                          ; this lock is acquired/released on
+                                          ; every single LOADPNG/DRAWPNG call,
+                                          ; far too hot a path to tax every
+                                          ; call for the rare contended case.
 .retry:
+    pause                        ; unthrottled bts/jc spins are exactly
+                                  ; the sustained interrupt/stack load
+                                  ; that wedges the master PIC's IRQ0
+                                  ; in-service bit (see the PIC IRQ0
+                                  ; stuck-in-service bug note) -- every
+                                  ; other spin loop in this codebase
+                                  ; (basix_rt_wait) already throttles
+                                  ; with PAUSE for the same reason.
+                                  ; Without it, two tasks contending on
+                                  ; this lock at high frequency (e.g.
+                                  ; workbench.bas's per-frame LOADPNG
+                                  ; racing a PNGLOCK-held batch) can
+                                  ; wedge the timer interrupt entirely,
+                                  ; permanently freezing whichever task
+                                  ; was mid-spin. Only reached once the
+                                  ; fast path above has already missed,
+                                  ; so the common uncontended case never
+                                  ; pays this cost.
     bts dword [rel basix_png_lock], 0
     jc .retry
+.out_untracked:
+    cmp rbx, 0
+    je .out                      ; current_task==0 -- don't record an owner
+    mov [rel basix_png_lock_owner], rbx
+    mov dword [rel basix_png_lock_depth], 1
+.out:
+    pop rbx
     pop rax
     ret
 
 basix_png_lock_release:
     push rax
+    push rbx
+    mov rbx, [rel current_task]
+    test rbx, rbx
+    jz .release_real              ; untracked acquire -- always fully release
+    cmp rbx, [rel basix_png_lock_owner]
+    jne .release_real             ; not tracked as owner -- release anyway
+    dec dword [rel basix_png_lock_depth]
+    jnz .out                      ; still held by us at a shallower depth
+    mov qword [rel basix_png_lock_owner], 0
+.release_real:
     btr dword [rel basix_png_lock], 0
+.out:
+    pop rbx
     pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_pnglock / basix_rt_pngunlock: BASIX64-visible PNGLOCK/
+; PNGUNLOCK statements -- thin wrappers around the acquire/release
+; pair above. LOADPNG/DRAWPNG already each individually hold this lock
+; for their own single call (see their own header comments), which is
+; enough to stop one call corrupting another's mid-decode/mid-blit
+; state -- but NOT enough to keep a decode valid across a "LOADPNG
+; once, DRAWPNG several times" sequence a program might want to do
+; for its own performance (redecoding the same icon once per on-screen
+; copy is wasteful when several grid entries share one icon). Without
+; holding the lock across that whole sequence, another task's own
+; concurrent LOADPNG (e.g. workbench.bas's continuously-redrawing
+; desktop icon) can land in the gap and silently swap out the shared
+; decoded-image slot mid-batch. A program that wants to batch should
+; bracket the whole LOADPNG...DRAWPNG sequence in PNGLOCK/PNGUNLOCK.
+; -------------------------------------------------------------------------
+basix_rt_pnglock:
+    call basix_png_lock_acquire
+    ret
+
+basix_rt_pngunlock:
+    call basix_png_lock_release
     ret
 
 ; -------------------------------------------------------------------------
@@ -1539,6 +1862,13 @@ basix_rt_loadpng:
     jmp .name_copy
 .name_copy_done:
     mov byte [rdi+rcx], 0
+    mov [rel png_cache_pending_namelen], r13d
+
+    lea rcx, [rel basix_fsave_name_buf]
+    mov edx, r13d
+    call png_cache_lookup
+    test eax, eax
+    jnz .cache_hit
 
     mov eax, [rel exfat_cwd_cluster]
     mov [rel basix_path_saved_cwd], eax
@@ -1579,8 +1909,15 @@ basix_rt_loadpng:
     test eax, eax
     jz .fail
 
+    lea rcx, [rel basix_fsave_name_buf]
+    mov edx, [rel png_cache_pending_namelen]
+    call png_cache_insert
+
     mov eax, [rel basix_path_saved_cwd]
     mov [rel exfat_cwd_cluster], eax
+    mov eax, 1
+    jmp .out
+.cache_hit:
     mov eax, 1
     jmp .out
 .fail:

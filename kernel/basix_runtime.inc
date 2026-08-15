@@ -221,6 +221,7 @@ basix_rt_newline:
 basix_mark_dirty:
     push rax
     push rbx
+    push rcx
 
     mov rbx, [rel current_task]
     test rbx, rbx
@@ -257,6 +258,7 @@ basix_mark_dirty:
     mov [rbx+TCB_PEND_Y1], r9d
 
 .out:
+    pop rcx
     pop rbx
     pop rax
     ret
@@ -597,6 +599,7 @@ basix_rt_rect:
 basix_rt_flip:
     push rax
     push rbx
+    push rcx
 
     mov rbx, [rel current_task]
     test rbx, rbx
@@ -635,13 +638,27 @@ basix_rt_flip:
 .x1_ok:
     mov eax, [rbx+TCB_PEND_Y1]
     cmp eax, [rbx+TCB_DIRTY_Y1]
-    jle .clear_pending
+    jle .y1_ok
     mov [rbx+TCB_DIRTY_Y1], eax
+.y1_ok:
+    ; Always reassert VALID=1 here, even though this branch was only
+    ; reached because it looked like 1 already: the compositor task
+    ; could have raced in between this function's initial VALID check
+    ; and this union completing, consumed/blitted, and cleared VALID
+    ; back to 0 in the meantime. Skipping this (as an earlier version
+    ; of this fix did) meant that exact race silently dropped the
+    ; current frame's dirty notification entirely -- content was
+    ; correctly drawn into the back buffer, but the compositor was
+    ; never told to look, leaving it invisible until some later,
+    ; non-racing FLIP happened to fix it up. This write is idempotent
+    ; either way, so it's always safe to just do it unconditionally.
+    mov dword [rbx+TCB_DIRTY_VALID], 1
 
 .clear_pending:
     mov dword [rbx+TCB_PEND_VALID], 0
 
 .out:
+    pop rcx
     pop rbx
     pop rax
     ret
@@ -1569,6 +1586,43 @@ basix_rt_screenh:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_rt_winx / basix_rt_winy: no arguments. Return RAX = current_task's
+; own TCB_WIN_X/TCB_WIN_Y (the window's CLIENT area screen position -- 0
+; for main, which draws unwindowed straight to the real screen and so has
+; no offset of its own). MOUSEX/MOUSEY (basix_rt_mousex/basix_rt_mousey)
+; always return raw SCREEN coordinates -- a windowed program has to
+; subtract its own WINX/WINY from those before hit-testing a click
+; against anything it drew (which is in its own back buffer's LOCAL
+; coordinates, same as every RECT/DRAWTEXT/etc call already is). Same
+; SCREENW/SCREENH-style "windowed task ? own field : 0" shape just above.
+; -------------------------------------------------------------------------
+basix_rt_winx:
+    push rcx
+    xor eax, eax
+    mov rcx, [rel current_task]
+    test rcx, rcx
+    jz .out
+    cmp dword [rcx+TCB_WIN_W], 0
+    je .out
+    mov eax, [rcx+TCB_WIN_X]
+.out:
+    pop rcx
+    ret
+
+basix_rt_winy:
+    push rcx
+    xor eax, eax
+    mov rcx, [rel current_task]
+    test rcx, rcx
+    jz .out
+    cmp dword [rcx+TCB_WIN_W], 0
+    je .out
+    mov eax, [rcx+TCB_WIN_Y]
+.out:
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_rt_wbblue / basix_rt_wbgray: no arguments. Return RAX = the
 ; SAME packed-pixel color values the kernel's own window chrome uses
 ; (WM_TITLE_BG/WM_BODY_BG, kernel.asm) -- a single source of truth so
@@ -1596,6 +1650,24 @@ basix_rt_wblight:
 
 basix_rt_wbdark:
     mov eax, WM_BEVEL_DARK
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_wbtitleh / basix_rt_wbclosesz: geometry counterparts to the
+; WBBLUE-style color constants above -- expose the kernel's own
+; WM_TITLE_H/WM_CLOSE_SIZE so a hand-drawn window (workbench.bas) can
+; match the kernel-drawn chrome's title bar height and close-gadget
+; size exactly, not just its colors. Added after a real, visible
+; mismatch: workbench.bas hardcoded titleH=18/closeW=14 independently,
+; which put its own close button at a different size/inset than the
+; kernel-drawn one around a LAUNCHed window right next to it.
+; -------------------------------------------------------------------------
+basix_rt_wbtitleh:
+    mov eax, WM_TITLE_H
+    ret
+
+basix_rt_wbclosesz:
+    mov eax, WM_CLOSE_SIZE
     ret
 
 ; -------------------------------------------------------------------------
@@ -2141,6 +2213,23 @@ basix_resolve_dir_path:
     push r8
 
     mov rbx, rcx                         ; rbx = cursor into the path
+
+    ; A leading '/' resolves from exfat_root_dir_cluster instead of
+    ; the current cwd -- same convention exfat_resolve_path (exfat.inc,
+    ; used by RUN/COMPILE/LAUNCH) already uses. This function used to
+    ; have no such case at all: a leading '/' just became the first
+    ; "component" scanned, which is empty (the scan immediately hits
+    ; another '/' or the search starts on nothing), so exfat_find_
+    ; root_file looked up an empty name and failed instantly -- the
+    ; real bug LOADPNG/FSAVE/FLOAD callers (basix_rt_fsave/fload,
+    ; png.inc's basix_rt_loadpng) have had to work around with bare
+    ; cwd-relative paths ever since, while RUN/COMPILE/LAUNCH's own
+    ; resolver never needed to.
+    cmp byte [rbx], '/'
+    jne .next_component
+    inc rbx
+    mov eax, [rel exfat_root_dir_cluster]
+    mov [rel exfat_cwd_cluster], eax
 .next_component:
     mov rsi, rbx                         ; rsi = start of this component
 .scan:

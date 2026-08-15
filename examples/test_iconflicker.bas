@@ -102,6 +102,8 @@ LET lastClickTime = 0
 LET DBLCLICK_TICKS = 40
 LET needsRedraw = 1
 
+LAUNCH filebrowserProgName, 16, argbuf, 0
+
 WHILE 1
   IF KEYHIT THEN
     LET k = GETKEY
