@@ -1,9 +1,42 @@
 ' Simple text editor for arOS-X64/BASIX64.
 '
+' R3: rewritten to draw through the pixel back buffer (CLS/DRAWTEXT/
+' DRAWCHAR/RECT/FLIP) instead of the old text console (LOCATE/PUTCHAR/
+' PRINT/COLOR). The text console writes straight to the real,
+' currently-scanned-out framebuffer with no dirty-rect tracking at
+' all -- fine when this ran alone (blocking RUN), but since LAUNCH
+' (see workbench.bas) now runs this concurrently alongside Workbench's
+' own continuously-redrawing compositor-driven window, anything drawn
+' via the text console got overwritten by Workbench's very next frame
+' almost immediately (a visible flicker, then gone). Going through the
+' same back buffer + R1/R2 compositor path Workbench itself uses is
+' what keeps this editor's own content actually visible while it has
+' focus. See kernel/basix_rbx_clobber_bug.md's [[project_r2_zorder]]
+' note for the diagnosis this fix came from.
+'
+' curX/curY (pixel coordinates, 8x16 per cell -- see basix_draw_glyph)
+' replace the old LOCATE-set console cursor; curcolor replaces COLOR
+' (DRAWCHAR/DRAWTEXT take an explicit color argument every call rather
+' than an ambient console color, so curcolor is just tracked here the
+' same way hl_color already was). Both are purely DERIVED from
+' row/col wherever those already change -- row/col were already being
+' hand-tracked for cursor bookkeeping before this rewrite, so keeping
+' them as the single source of truth (rather than maintaining curX/
+' curY as their own independent counters) avoids the two ever
+' drifting out of sync.
+'
+' DRAWCHAR only paints a glyph's SET pixels (unlike the text console's
+' fb_draw_char, which paints set AND clear pixels, replacing the whole
+' cell -- see its own doc comment) -- so "erase by drawing a space"
+' (the text-console idiom the old version used for the filename
+' prompt's backspace) no longer erases anything; a space glyph has no
+' set pixels to paint. Replaced with an explicit black RECT over that
+' one cell instead (see prompt_filename's backspace handling).
+'
 ' Load/Save/Save As/Exit are reached through an ESC-triggered modal
-' menu (there's no mouse on this OS, and no other key the keyboard
-' driver decodes safely without shadowing normal typing -- see
-' keyboard.inc). Normal typing inserts at the cursor; arrow keys,
+' menu (there's no mouse-driven menu here, and no other key the
+' keyboard driver decodes safely without shadowing normal typing --
+' see keyboard.inc). Normal typing inserts at the cursor; arrow keys,
 ' Home/End, Backspace and Delete navigate/edit exactly like a
 ' conventional single-line-at-a-time text editor.
 '
@@ -56,6 +89,12 @@ DIM pfcancel AS INTEGER
 DIM saveok AS INTEGER
 DIM readn AS INTEGER
 
+' Pixel-cursor state (see header comment) -- curX/curY are re-derived
+' from row/col every time either changes, never advanced on their own.
+DIM curX AS INTEGER
+DIM curY AS INTEGER
+DIM curcolor AS INTEGER
+
 ' Syntax-highlighting state (see classify_char and friends, near the
 ' bottom of this file). in_comment persists across classify_char calls
 ' within one screen line (reset at every newline); hl_len/hl_color are
@@ -94,8 +133,6 @@ LET COL_BLUE = 5676246
 LET COL_YELLOW = 16776960
 LET COL_ORANGE = 14251863
 
-GOSUB clear_all
-
 ' If launched with an argument (e.g. Workbench double-clicking a .BAS
 ' icon -- see LAUNCH/ARGLEN/ARGCHAR), treat it as a filename to open
 ' immediately, same FLOAD call the L=Load menu action uses. ARGLEN is 0
@@ -119,13 +156,26 @@ main_loop:
 GOSUB redraw
 LET k = GETKEY
 
+' NOT doing a CLS+FLIP cleanup pass here before END, on purpose: R1's
+' compositor is a separate, asynchronously-scheduled task, so a CLS
+' here only QUEUES a full-screen dirty mark rather than presenting it
+' immediately -- tried it, and it actively raced the shell's own
+' prompt text (drawn straight to the real framebuffer via the text
+' console the instant this program's RUN returns): the compositor's
+' still-pending blit of this now-stale all-black back buffer could
+' land AFTER that prompt was drawn, silently erasing it. Leftover
+' pixels from this program's last frame are a real cosmetic gap when
+' run standalone via RUN (nothing else is guaranteed to redraw over
+' that region afterward), but it's the same class of "what happens to
+' a window's exposed leftover pixels when its owner exits" problem
+' R4/R5's window chrome/positioning work will need to solve properly
+' anyway -- not something safe to hack around per-program here. The
+' intended real use (LAUNCHed from workbench.bas) doesn't hit this at
+' all: workbench's own continuously-redrawing loop covers this
+' program's last frame on its very next pass regardless.
 IF k = 136 THEN
   GOSUB do_menu
-  IF exitreq = 1 THEN
-    GOSUB clear_all
-    LOCATE 0, 0
-    END
-  ENDIF
+  IF exitreq = 1 THEN END
   GOTO main_loop
 ENDIF
 
@@ -182,24 +232,6 @@ GOTO main_loop
 END
 
 ' -----------------------------------------------------------------------
-' clear_all: blanks every text-console row (there's no CLS for the text
-' console -- CLS only clears the pixel back buffer, see LOCATE's own
-' notes), so a full redraw never leaves stale characters on screen.
-' -----------------------------------------------------------------------
-clear_all:
-LET i = 0
-WHILE i < rows
-  LOCATE i, 0
-  LET j = 0
-  WHILE j < cols
-    PUTCHAR 32
-    LET j = j + 1
-  WEND
-  LET i = i + 1
-WEND
-RETURN
-
-' -----------------------------------------------------------------------
 ' redraw: everything that isn't file content is pinned to the TOP of the
 ' screen now -- row 0 = the Load/Save/Save As/Exit menu bar (always
 ' fixed -- see do_menu, which still gates the actual keys behind ESC so
@@ -216,51 +248,73 @@ RETURN
 ' simple pager uses. Content is scanned starting from scrolltop rather
 ' than 0, so rows 0-4 are never touched by file content regardless of
 ' file length. The cursor's own screen cell is overdrawn with an
-' underscore as the last drawing step, since LOCATE alone (unlike real
-' hardware text mode) has no visible caret of its own -- see
-' shell_cursor_to's comment for the same convention used by the shell's
-' own line editor.
+' underscore as the last drawing step, since there's no visible caret
+' of its own -- see shell_cursor_to's comment for the same convention
+' used by the text shell's own line editor. Ends with FLIP to present
+' the whole frame at once (CLS below marks it fully dirty either way,
+' so this is really about not leaving a half-drawn frame the
+' compositor could catch mid-update, same reasoning as workbench.bas's
+' own redraw).
 ' -----------------------------------------------------------------------
 redraw:
-GOSUB clear_all
-' a previous redraw's content scan may have left the console color set
-' to a syntax-highlight color -- the fixed header rows always draw white
-COLOR COL_WHITE
+CLS 0
+' a previous redraw's content scan may have left curcolor set to a
+' syntax-highlight color -- the fixed header rows always draw white
+LET curcolor = COL_WHITE
 
-LOCATE 0, 0
-PRINT "ESC=Menu  L=Load  S=Save  A=Save As  X=Exit"
+LET row = 0
+LET col = 0
+LET curX = 0
+LET curY = 0
+DRAWTEXT curX, curY, "ESC=Menu  L=Load  S=Save  A=Save As  X=Exit", curcolor
 
-LOCATE 1, 0
+LET row = 1
+LET col = 0
+LET curX = 0
+LET curY = 16
 LET i = 0
 WHILE i < fnamelen
   LET ch = fname[i]
-  PUTCHAR ch
+  GOSUB putch
   LET i = i + 1
 WEND
 IF fnamelen = 0 THEN
-  PRINT "(untitled)"
+  DRAWTEXT curX, curY, "(untitled)", curcolor
 ELSE
   IF modified = 1 THEN
-    PUTCHAR 32
-    PUTCHAR 42
+    LET ch = 32
+    GOSUB putch_skip_space
+    LET ch = 42
+    GOSUB putch_skip_space
   ENDIF
 ENDIF
 
-LOCATE 2, 0
-PRINT "Arrows=Move  Enter=NewLine  Backspace/Del=Delete"
+LET row = 2
+LET col = 0
+LET curX = 0
+LET curY = 32
+DRAWTEXT curX, curY, "Arrows=Move  Enter=NewLine  Backspace/Del=Delete", curcolor
 
-LOCATE 3, 0
-LET i = 0
-WHILE i < cols
-  PUTCHAR 61
-  LET i = i + 1
-WEND
+RECT 0, 48, cols * 8, 2, COL_WHITE
 
 LET lsq = cur
 GOSUB find_line_start
 LET ls = lsr
 IF ls < scrolltop THEN LET scrolltop = ls
 
+' scroll_count_loop can exit two different ways, and they mean
+' different things: hitting rows-5 lines counted (wi >= rows - 5)
+' means the display filled up before reaching the cursor's line, so
+' scroll_count_done below needs to check whether ls was actually
+' covered. Running out of buffer content first (ler >= buflen, the
+' probed line has no trailing newline -- it's the last line in the
+' file) means there's nothing left to scroll to at all, so the
+' cursor's line (always <= buflen) is trivially already visible --
+' jump straight to scroll_done rather than falling into the "not
+' visible yet, scroll down more" check, which would otherwise keep
+' advancing scrolltop PAST the buffer's only content forever (this bit
+' real: a brand new/short document's redraw_scan starts at a scrolltop
+' beyond buflen and draws nothing at all).
 scroll_check:
 LET wp = scrolltop
 LET wi = 0
@@ -268,7 +322,7 @@ scroll_count_loop:
 IF wi >= rows - 5 THEN GOTO scroll_count_done
 LET leq = wp
 GOSUB find_line_end
-IF ler >= buflen THEN GOTO scroll_count_done
+IF ler >= buflen THEN GOTO scroll_done
 LET wp = ler + 1
 LET wi = wi + 1
 GOTO scroll_count_loop
@@ -282,7 +336,8 @@ scroll_done:
 
 LET row = 5
 LET col = 0
-LOCATE row, col
+LET curX = 0
+LET curY = 80
 LET p = scrolltop
 LET curow = 5
 LET cucol = 0
@@ -299,16 +354,17 @@ IF ch = 10 THEN
   ENDIF
   LET row = row + 1
   LET col = 0
+  LET curX = 0
+  LET curY = row * 16
   LET in_comment = 0
   IF row > rows - 1 THEN GOTO redraw_done
-  LOCATE row, col
   LET p = p + 1
   GOTO redraw_scan
 ENDIF
 
 ' sets hl_len (>=1) / hl_color for buf[p], may set in_comment
 GOSUB classify_char
-COLOR hl_color
+LET curcolor = hl_color
 LET tki = 0
 classify_print_loop:
 IF tki >= hl_len THEN GOTO classify_print_done
@@ -319,8 +375,7 @@ IF p = cur THEN
 ENDIF
 LET ch = buf[p]
 IF col < cols THEN
-  PUTCHAR ch
-  LET col = col + 1
+  GOSUB putch_skip_space
 ENDIF
 LET p = p + 1
 LET tki = tki + 1
@@ -335,9 +390,40 @@ IF p = cur THEN
 ENDIF
 redraw_done:
 ' the cursor underscore itself is never syntax-colored
-COLOR COL_WHITE
-LOCATE curow, cucol
-PUTCHAR 95
+DRAWCHAR cucol * 8, curow * 16, 95, COL_WHITE
+FLIP
+RETURN
+
+' -----------------------------------------------------------------------
+' putch: draws buf/menu character ch at the current pixel cursor
+' (curX, curY) in curcolor, then advances col (and curX, derived from
+' it) by one cell -- the pixel-drawing replacement for the old text
+' console's PUTCHAR, which advanced its own implicit cursor the same
+' way.
+' -----------------------------------------------------------------------
+putch:
+DRAWCHAR curX, curY, ch, curcolor
+LET col = col + 1
+LET curX = col * 8
+RETURN
+
+' -----------------------------------------------------------------------
+' putch_skip_space: same as putch, but skips the actual DRAWCHAR call
+' for a space (code 32) -- DRAWCHAR only paints a glyph's SET pixels
+' (see this file's header comment), and a space glyph has none, so
+' calling it would be a pure no-op draw anyway. Used in redraw, where
+' the destination is already black from this frame's own CLS, so
+' skipping is purely an optimization, not a correctness fix (unlike
+' prompt_filename's backspace handling below, which genuinely needs an
+' explicit RECT erase since it does NOT redraw from a fresh CLS).
+' -----------------------------------------------------------------------
+putch_skip_space:
+IF ch = 32 THEN
+  LET col = col + 1
+  LET curX = col * 8
+  RETURN
+ENDIF
+GOSUB putch
 RETURN
 
 ' -----------------------------------------------------------------------
@@ -644,19 +730,21 @@ RETURN
 ' fname/fnamelen. Sets pfcancel = 1 if the user pressed ESC instead of
 ' Enter, leaving fname/fnamelen untouched by the caller's own logic
 ' (the caller is expected to check pfcancel before using the result).
+' Draws incrementally (one FLIP per keystroke) rather than through the
+' main redraw, so the compositor sees each character/backspace as it
+' happens instead of only once the whole prompt is done.
 ' -----------------------------------------------------------------------
 prompt_filename:
-LOCATE 0, 0
-LET i = 0
-WHILE i < cols
-  PUTCHAR 32
-  LET i = i + 1
-WEND
-LOCATE 0, 0
-PRINT "Filename: "
-LOCATE 0, 10
+RECT 0, 0, cols * 8, 16, 0
+LET curcolor = COL_WHITE
+LET curX = 0
+LET curY = 0
+DRAWTEXT curX, curY, "Filename: ", curcolor
+LET col = 10
+LET curX = 80
 LET fnamelen = 0
 LET pfcancel = 0
+FLIP
 pf_loop:
 LET k2 = GETKEY
 IF k2 = 13 THEN GOTO pf_done
@@ -667,9 +755,10 @@ ENDIF
 IF k2 = 8 THEN
   IF fnamelen > 0 THEN
     LET fnamelen = fnamelen - 1
-    LOCATE 0, 10 + fnamelen
-    PUTCHAR 32
-    LOCATE 0, 10 + fnamelen
+    LET col = 10 + fnamelen
+    LET curX = col * 8
+    RECT curX, curY, 8, 16, 0
+    FLIP
   ENDIF
   GOTO pf_loop
 ENDIF
@@ -678,27 +767,30 @@ IF k2 > 126 THEN GOTO pf_loop
 IF fnamelen >= 63 THEN GOTO pf_loop
 LET fname[fnamelen] = k2
 LET fnamelen = fnamelen + 1
-PUTCHAR k2
+LET ch = k2
+LET col = 10 + fnamelen - 1
+LET curX = col * 8
+DRAWCHAR curX, curY, ch, curcolor
+LET col = 10 + fnamelen
+LET curX = col * 8
+FLIP
 GOTO pf_loop
 pf_done:
 RETURN
 
 ' -----------------------------------------------------------------------
 ' do_menu: the ESC-triggered Load/Save/Save As/Exit menu. Sets exitreq
-' = 1 on Exit rather than using END directly -- END compiles to a bare
-' RET, which from inside a GOSUB'd subroutine would only unwind this
-' call, not actually end the program; the real END has to run from the
-' top-level main_loop once do_menu has returned.
+' = 1 on Exit -- the real END has to run from the top-level main_loop
+' once do_menu has returned, not here (a GOSUB'd END would only unwind
+' this call, not actually end the program).
 ' -----------------------------------------------------------------------
 do_menu:
-LOCATE 0, 0
-LET i = 0
-WHILE i < cols
-  PUTCHAR 32
-  LET i = i + 1
-WEND
-LOCATE 0, 0
-PRINT "L=Load  S=Save  A=Save As  X=Exit  ESC=Cancel"
+RECT 0, 0, cols * 8, 16, 0
+LET curcolor = COL_WHITE
+LET curX = 0
+LET curY = 0
+DRAWTEXT curX, curY, "L=Load  S=Save  A=Save As  X=Exit  ESC=Cancel", curcolor
+FLIP
 LET k2 = GETKEY
 
 IF k2 = 136 THEN RETURN

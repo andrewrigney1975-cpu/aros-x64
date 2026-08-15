@@ -992,12 +992,14 @@ entry:
     mov dword [r15+TCB_LAUNCH_ARG_LEN], 0
     mov dword [r15+TCB_DIRTY_VALID], 0
 
-    ; Main starts out as the sole keyboard-focused task -- exactly
-    ; today's behavior (the interactive shell and any RUN/GUI program
-    ; it launches synchronously are all still "main" at this point in
-    ; R0). Nothing yet moves focus elsewhere; that's a later GUI/
-    ; window-manager concern once real concurrent tasks exist.
+    ; Main starts out as the sole keyboard-focused task and the sole
+    ; (back-most) z-order entry -- R2's z-order list (basix_zorder,
+    ; see compositor_task) always has main seeded at index 0 so it's
+    ; never empty; LAUNCH pushes every concurrent GUI child on top of
+    ; it and pops them back off on exit.
     mov [rel basix_kbd_focus_task], r15
+    mov [rel basix_zorder], r15
+    mov dword [rel basix_zorder_count], 1
 
     ; R1: the compositor task -- see compositor_task's own comment.
     ; Needs boot_info* (RBX) to reach the real framebuffer, which
@@ -1218,27 +1220,133 @@ entry:
     jmp .hang
 
 ; -------------------------------------------------------------------------
-; compositor_task: R1's compositor. RDI = boot_info* (task_create's
-; argument delivery -- moved into RBX immediately, since a fresh
-; task's initial GPR frame doesn't carry the "RBX=boot_info* always"
-; convention the rest of the kernel relies on; every basix_rt_* caller
-; up to now only ever ran on a task that inherited RBX from `entry:`'s
-; own setup, never a brand-new one).
+; R2: z-order. basix_zorder is a back-to-front list of "windowed" task
+; pointers (index 0 = back-most, [count-1] = front-most/topmost); it's
+; the compositor's iteration order, and its front entry is always kept
+; in sync with basix_kbd_focus_task (the invariant "topmost == focused"
+; -- there's no independent click-to-focus routing yet, since no task
+; has real window bounds until R4/R5's chrome/positioning work, so
+; "which window is in front" and "which window gets the keyboard" are
+; the same question for now). Seeded with just main at boot (see
+; entry:); LAUNCH (basix_rt_launch) pushes a new child to the front,
+; and the child removes itself (basix_zorder_remove) right before
+; task_exit -- see basix_task_launch_wrapper.
+; -------------------------------------------------------------------------
+BASIX_ZORDER_MAX equ BASIX_SLOT_COUNT + 1   ; every execution slot, plus main
+
+; -------------------------------------------------------------------------
+; basix_zorder_push_front: RCX = task ptr to add as the new front
+; (topmost, keyboard-focused) entry. Assumes RCX isn't already present
+; -- true for every caller today (LAUNCH always creates a brand new
+; TCB via task_create, never reuses one already in the list).
+; -------------------------------------------------------------------------
+basix_zorder_push_front:
+    push rax
+    mov eax, [rel basix_zorder_count]
+    cmp eax, BASIX_ZORDER_MAX
+    jae .full                           ; shouldn't happen (sized for
+                                         ; every slot + main); drop
+                                         ; silently rather than overrun
+    mov [rel basix_zorder + rax*8], rcx
+    inc eax
+    mov [rel basix_zorder_count], eax
+.full:
+    mov [rel basix_kbd_focus_task], rcx
+    pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; basix_zorder_remove: RCX = task ptr to remove from the z-order list
+; (called by an exiting task on itself). Shifts every later entry down
+; by one slot, then re-derives basix_kbd_focus_task from whatever is
+; now the front entry -- main (index 0) is never removed, so the list
+; can't go empty.
+; -------------------------------------------------------------------------
+basix_zorder_remove:
+    push rax
+    push rcx
+    push rdx
+    push r8
+    mov eax, [rel basix_zorder_count]
+    xor edx, edx                        ; edx = search index
+.search:
+    cmp edx, eax
+    jge .not_found
+    cmp [rel basix_zorder + rdx*8], rcx
+    je .found
+    inc edx
+    jmp .search
+.found:
+    mov r8d, edx                        ; r8d = shift-write cursor
+.shift:
+    mov edx, r8d
+    inc edx                             ; edx = shift-read cursor (one ahead)
+    cmp edx, eax
+    jge .shift_done
+    mov rcx, [rel basix_zorder + rdx*8]
+    mov [rel basix_zorder + r8*8], rcx
+    inc r8d
+    jmp .shift
+.shift_done:
+    dec eax
+    mov [rel basix_zorder_count], eax
+    test eax, eax
+    jz .out                             ; shouldn't happen (main never
+                                         ; removed) -- leave focus alone
+    mov rdx, [rel basix_zorder + rax*8 - 8]
+    mov [rel basix_kbd_focus_task], rdx
+.not_found:
+.out:
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+basix_zorder: times BASIX_ZORDER_MAX dq 0
+basix_zorder_count: dd 0
+
+; -------------------------------------------------------------------------
+; compositor_task: R1's compositor, R2's z-order-aware version. RDI =
+; boot_info* (task_create's argument delivery -- moved into RBX
+; immediately, since a fresh task's initial GPR frame doesn't carry
+; the "RBX=boot_info* always" convention the rest of the kernel relies
+; on; every basix_rt_* caller up to now only ever ran on a task that
+; inherited RBX from `entry:`'s own setup, never a brand-new one).
 ;
-; Loop: find the current foreground task (basix_kbd_focus_task -- a
-; stand-in for real window z-order/stacking, which doesn't exist until
-; R2), and if it has a dirty rect (TCB_DIRTY_VALID) and a back buffer,
-; blit just that rect from its back buffer to the real framebuffer at
-; the same coordinates (no window offset yet -- every task's back
-; buffer is still full-screen-sized and origin-(0,0), see
-; basix_rt_ensure_backbuf; R4/R5's window chrome/positioning work is
-; what will give a task's own drawing a real screen offset), then
-; clear its dirty flag. This is what FLIP used to do synchronously,
-; inline, in the calling program itself -- now it happens
-; independently, on its own schedule, from a dedicated task, which is
-; the actual point of R1: presentation is decoupled from any one
-; program's own execution, so multiple concurrent programs no longer
-; each fight to blit their own frame straight to the screen.
+; Two-phase pass, not "blit only whichever tasks are individually
+; dirty": (1) scan basix_zorder and union together the dirty rects of
+; every entry that has one, (2) if anything was dirty at all, blit
+; THAT union rect from EVERY z-order entry's current back buffer
+; (back to front), not just the ones that happened to be dirty this
+; pass, then clear every dirty flag. Iterating back-to-front means a
+; frontmost task's content ends up painted last, on top -- the whole
+; point of tracking z-order.
+;
+; Blitting non-dirty entries too (using their unchanged, already-
+; current buffer content) is the part that actually makes z-order mean
+; something once a foreground window stops redrawing every single
+; frame -- e.g. EDITOR.BAS blocked on GETKEY between keystrokes, with
+; Workbench still running underneath and redrawing unconditionally
+; every ~20ms. The original single-phase version only ever blitted a
+; task when ITS OWN dirty flag was set: on any pass where only
+; Workbench (behind, in z-order) was dirty and Editor (in front)
+; wasn't, only Workbench's full-screen blit happened, painting its own
+; fresh frame straight over Editor's still-current, unchanged content
+; -- Editor flickered away until its own next keystroke redrew it.
+; There's still no real per-window bounds/clipping (R4/R5's job, once
+; back buffers stop all being full-screen origin-(0,0) -- see
+; basix_rt_ensure_backbuf), so this is a coarser "redraw everyone
+; whenever anyone changes" fix rather than true occlusion, but it's
+; enough to keep a topmost window visibly on top under real
+; preemption.
+;
+; This is what FLIP used to do synchronously, inline, in the calling
+; program itself -- now it happens independently, on its own
+; schedule, from a dedicated task, which is the actual point of R1:
+; presentation is decoupled from any one program's own execution, so
+; multiple concurrent programs no longer each fight to blit their own
+; frame straight to the screen.
 ;
 ; Paced with a plain busy-wait between passes (same style as
 ; test_task_a/b below) rather than tightly looping -- there's nothing
@@ -1248,21 +1356,85 @@ entry:
 compositor_task:
     mov rbx, rdi                        ; rbx = boot_info*
 .loop:
-    mov rax, [rel basix_kbd_focus_task]
-    test rax, rax
-    jz .delay
-    cmp dword [rax+TCB_DIRTY_VALID], 0
-    je .delay
-    mov rsi, [rax+TCB_BACKBUF_PTR]
-    test rsi, rsi
-    jz .delay
+    ; Phase 1: union together every z-order entry's dirty rect.
+    mov dword [rel basix_comp_any_dirty], 0
+    mov dword [rel basix_comp_idx], 0
+.scan_loop:
+    mov eax, [rel basix_comp_idx]
+    cmp eax, [rel basix_zorder_count]
+    jge .scan_done
+    mov eax, [rel basix_comp_idx]
+    mov rcx, [rel basix_zorder + rax*8]
+    test rcx, rcx
+    jz .scan_next
+    cmp dword [rcx+TCB_DIRTY_VALID], 0
+    je .scan_next
+    mov r8d, [rcx+TCB_DIRTY_X0]
+    mov r9d, [rcx+TCB_DIRTY_Y0]
+    mov r10d, [rcx+TCB_DIRTY_X1]
+    mov r11d, [rcx+TCB_DIRTY_Y1]
+    cmp dword [rel basix_comp_any_dirty], 0
+    jne .union_merge
+    mov [rel basix_comp_union_x0], r8d
+    mov [rel basix_comp_union_y0], r9d
+    mov [rel basix_comp_union_x1], r10d
+    mov [rel basix_comp_union_y1], r11d
+    mov dword [rel basix_comp_any_dirty], 1
+    jmp .scan_next
+.union_merge:
+    mov eax, [rel basix_comp_union_x0]
+    cmp r8d, eax
+    jge .ux0_ok
+    mov [rel basix_comp_union_x0], r8d
+.ux0_ok:
+    mov eax, [rel basix_comp_union_y0]
+    cmp r9d, eax
+    jge .uy0_ok
+    mov [rel basix_comp_union_y0], r9d
+.uy0_ok:
+    mov eax, [rel basix_comp_union_x1]
+    cmp r10d, eax
+    jle .ux1_ok
+    mov [rel basix_comp_union_x1], r10d
+.ux1_ok:
+    mov eax, [rel basix_comp_union_y1]
+    cmp r11d, eax
+    jle .scan_next
+    mov [rel basix_comp_union_y1], r11d
+.scan_next:
+    mov eax, [rel basix_comp_idx]
+    inc eax
+    mov [rel basix_comp_idx], eax
+    jmp .scan_loop
+.scan_done:
+    cmp dword [rel basix_comp_any_dirty], 0
+    je .clear_pass
 
-    mov r8d, [rax+TCB_DIRTY_X0]
-    mov r9d, [rax+TCB_DIRTY_Y0]
-    mov r10d, [rax+TCB_DIRTY_X1]
-    mov r11d, [rax+TCB_DIRTY_Y1]
-    mov r12d, [rax+TCB_BACKBUF_W]
-    mov r13d, [rax+TCB_BACKBUF_H]
+    ; Phase 2: blit the union rect from every z-order entry's current
+    ; back buffer, back to front.
+    mov dword [rel basix_comp_idx], 0
+.blit_loop:
+    mov eax, [rel basix_comp_idx]
+    cmp eax, [rel basix_zorder_count]
+    jge .clear_pass
+
+    mov eax, [rel basix_comp_idx]
+    mov r15, [rel basix_zorder + rax*8] ; r15 = this entry's task ptr,
+                                         ; stable across the row loop
+                                         ; below (unlike RAX, reused as
+                                         ; scratch in the address math)
+    test r15, r15
+    jz .blit_next
+    mov rsi, [r15+TCB_BACKBUF_PTR]
+    test rsi, rsi
+    jz .blit_next
+
+    mov r8d, [rel basix_comp_union_x0]
+    mov r9d, [rel basix_comp_union_y0]
+    mov r10d, [rel basix_comp_union_x1]
+    mov r11d, [rel basix_comp_union_y1]
+    mov r12d, [r15+TCB_BACKBUF_W]
+    mov r13d, [r15+TCB_BACKBUF_H]
 
     cmp r8d, 0
     jge .x0_clamped
@@ -1281,20 +1453,21 @@ compositor_task:
     mov r11d, r13d
 .y1_clamped:
     cmp r8d, r10d
-    jge .clear_dirty                    ; empty after clamping
+    jge .blit_next                      ; empty after clamping to this
+                                         ; entry's own (smaller?) buffer
     cmp r9d, r11d
-    jge .clear_dirty
+    jge .blit_next
 
     mov r14d, r9d                       ; r14d = row index
 .row_loop:
     cmp r14d, r11d
-    jge .clear_dirty
+    jge .blit_next
 
     mov eax, r14d
     imul eax, r12d
     add eax, r8d
     mov rcx, rsi
-    lea rcx, [rcx + rax*4]              ; source: this row's dirty span
+    lea rcx, [rcx + rax*4]              ; source: this row's union span
 
     mov eax, r14d
     imul eax, [rbx+FB_STRIDE]
@@ -1316,8 +1489,31 @@ compositor_task:
     inc r14d
     jmp .row_loop
 
-.clear_dirty:
-    mov dword [rax+TCB_DIRTY_VALID], 0
+.blit_next:
+    mov eax, [rel basix_comp_idx]
+    inc eax
+    mov [rel basix_comp_idx], eax
+    jmp .blit_loop
+
+.clear_pass:
+    ; Clear every z-order entry's dirty flag -- this pass (if anything
+    ; was dirty) already blitted the union rect from every entry's
+    ; current buffer, dirty or not, so nothing is owed a follow-up.
+    mov dword [rel basix_comp_idx], 0
+.clear_loop:
+    mov eax, [rel basix_comp_idx]
+    cmp eax, [rel basix_zorder_count]
+    jge .delay
+    mov eax, [rel basix_comp_idx]
+    mov rcx, [rel basix_zorder + rax*8]
+    test rcx, rcx
+    jz .clear_next
+    mov dword [rcx+TCB_DIRTY_VALID], 0
+.clear_next:
+    mov eax, [rel basix_comp_idx]
+    inc eax
+    mov [rel basix_comp_idx], eax
+    jmp .clear_loop
 
 .delay:
     ; No explicit busy-wait: checking "is anything dirty" is a handful
@@ -1333,6 +1529,13 @@ compositor_task:
     ; first composite pass) without changing the actual worst-case CPU
     ; share this task can consume.
     jmp .loop
+
+basix_comp_any_dirty: dd 0
+basix_comp_idx: dd 0
+basix_comp_union_x0: dd 0
+basix_comp_union_y0: dd 0
+basix_comp_union_x1: dd 0
+basix_comp_union_y1: dd 0
 
 ; -------------------------------------------------------------------------
 ; test_task_a / test_task_b: preemptive-scheduling demo tasks. Each loops

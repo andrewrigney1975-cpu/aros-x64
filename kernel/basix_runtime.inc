@@ -2358,6 +2358,13 @@ basix_task_launch_wrapper:
     mov rcx, rdi
     call kfree
 
+    ; R2: remove self from the z-order list before exiting, handing
+    ; keyboard focus/topmost status back to whatever's now front (see
+    ; basix_zorder_remove, kernel.asm) -- otherwise a stale pointer to
+    ; this about-to-be-reaped TCB would linger in the list.
+    mov rcx, [rel current_task]
+    call basix_zorder_remove
+
     jmp task_exit                       ; never returns
 
 ; -------------------------------------------------------------------------
@@ -2517,6 +2524,13 @@ basix_rt_launch:
     mov rcx, [rbx+TCB_NEXT]
     mov [r12+TCB_NEXT], rcx
     mov [rbx+TCB_NEXT], r12
+
+    ; R2: the newly LAUNCHed child becomes the new frontmost/focused
+    ; window -- see basix_zorder_push_front (kernel.asm). It removes
+    ; itself on exit (basix_task_launch_wrapper), handing focus back to
+    ; whatever's now front (typically the launching program).
+    mov rcx, r12
+    call basix_zorder_push_front
     jmp .done
 
 .task_create_failed:
