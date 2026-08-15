@@ -72,6 +72,24 @@ dist_extra:   dd 0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,1
 ; dimensions/format, and a pointer/length into the raw file buffer for
 ; PLTE (only valid during one decode call).
 ; -------------------------------------------------------------------------
+; basix_png_lock: guards every png_* global below (file/inflate/pixel
+; buffers, width/height/bitdepth/colortype) -- LOADPNG's decode writes
+; them, DRAWPNG's blit reads them, and there's only ONE decoded-image
+; slot shared by every task (see basix_rt_drawpng's own doc comment).
+; Fine when everything ran synchronously; not once real concurrent
+; GUI tasks exist (R0-R3) -- workbench.bas calls LOADPNG for its own
+; icons on EVERY redraw frame, so a LAUNCHed program's own LOADPNG
+; (e.g. viewer.bas loading a user's image) can genuinely interleave
+; with it mid-decode under preemption, corrupting shared state --
+; confirmed live: LAUNCHing VIEWER.BAS from Workbench first showed
+; "not a supported PNG" on a file that decodes fine standalone, and
+; a slower/larger image visibly wedged Workbench for a long stretch
+; (both symptoms of two tasks fighting over the same mutable decode
+; buffers, not a real decode failure or hang). Same BTS/BTR spinlock
+; pattern as basix_compile_lock (basix_symbols.inc) -- safe under this
+; kernel's single-core scheduler.
+basix_png_lock: dd 0
+
 align 8
 png_file_buf_ptr: dq 0
 png_idat_buf_ptr: dq 0
@@ -1468,6 +1486,20 @@ png_decode_file:
 ; BASIX64 entry points
 ; =============================================================================
 
+basix_png_lock_acquire:
+    push rax
+.retry:
+    bts dword [rel basix_png_lock], 0
+    jc .retry
+    pop rax
+    ret
+
+basix_png_lock_release:
+    push rax
+    btr dword [rel basix_png_lock], 0
+    pop rax
+    ret
+
 ; -------------------------------------------------------------------------
 ; basix_rt_loadpng: RCX = namearr base ptr, RDX = namelen. Looks the file
 ; up on exFAT exactly like basix_rt_fload (path may contain '/'
@@ -1482,6 +1514,12 @@ basix_rt_loadpng:
     push r13
     push r14
     push r15
+
+    call basix_png_lock_acquire         ; see basix_png_lock's own
+                                         ; comment -- guards every png_*
+                                         ; global (including
+                                         ; basix_path_saved_cwd) this
+                                         ; whole function touches
 
     mov r12, rcx                        ; namearr ptr
     mov r13d, edx                       ; namelen
@@ -1550,6 +1588,9 @@ basix_rt_loadpng:
     mov [rel exfat_cwd_cluster], eax
     xor eax, eax
 .out:
+    push rax
+    call basix_png_lock_release
+    pop rax
     pop r15
     pop r14
     pop r13
@@ -1578,6 +1619,13 @@ basix_rt_drawpng:
     push r11
     push r12
     push r13
+
+    call basix_png_lock_acquire         ; see basix_png_lock's own
+                                         ; comment -- this reads
+                                         ; png_width/height/pixels_ptr,
+                                         ; which a concurrent LOADPNG
+                                         ; elsewhere could be mid-
+                                         ; rewriting
 
     call basix_rt_ensure_backbuf
     cmp qword [rel basix_backbuf_ptr], 0
@@ -1652,6 +1700,7 @@ basix_rt_drawpng:
     jmp .row_loop
 
 .out:
+    call basix_png_lock_release
     pop r13
     pop r12
     pop r11
