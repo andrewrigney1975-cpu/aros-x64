@@ -1001,6 +1001,7 @@ entry:
     mov dword [r15+TCB_WIN_H], 0
     mov dword [r15+TCB_WIN_TITLE_LEN], 0
     mov dword [r15+TCB_WIN_CLOSE_REQ], 0
+    mov dword [r15+TCB_PEND_VALID], 0
 
     ; Main starts out as the sole keyboard-focused task and the sole
     ; (back-most) z-order entry -- R2's z-order list (basix_zorder,
@@ -1335,13 +1336,30 @@ basix_zorder_count: dd 0
 ; invariant; there's still no real click-to-focus-a-background-window
 ; routing.
 ; -------------------------------------------------------------------------
+; Palette + bevel style sampled from real Workbench 2.04 screenshots
+; (guidebookgallery.org/screenshots/amigaos204) -- a flat, solid blue
+; title bar with BLACK text (not white), light-gray gadget boxes, and
+; a raised 2px bevel (light top/left, dark bottom/right) around both
+; the window frame and each gadget box. This is the real Kickstart
+; 2.0+ "3D look": there's no gradient/gloss anywhere in 2.04 itself --
+; every surface is a flat fill, and all the depth comes from that one
+; consistent light/dark edge-pair convention.
 WM_TITLE_H     equ 20   ; title bar height, px
-WM_BORDER      equ 2    ; border thickness, px
+WM_BORDER      equ 4    ; border thickness, px (matches wm_fb_bevel_rect's
+                         ; own WM_EDGE bevel-line thickness below, so the
+                         ; frame's raised edge fills the whole border,
+                         ; not just a thin line inside a wider gray margin)
+WM_EDGE        equ 2    ; bevel light/dark line thickness, px -- real
+                         ; Workbench 2.04 frames read as thick/embossed,
+                         ; not hairline; widened from 1px for that
 WM_CLOSE_SIZE  equ 14   ; close gadget square size, px
-WM_TITLE_BG    equ 0x8888CC
-WM_TITLE_FG    equ 0xFFFFFF
-WM_BORDER_COL  equ 0xFFFFFF
-WM_CLOSE_BG    equ 0xFFFFFF
+WM_TITLE_BG    equ 0x6F87C6
+WM_TITLE_FG    equ 0x000000
+WM_BODY_BG     equ 0xAAAAAA   ; gadget box / border fill -- classic
+                               ; Amiga Workbench gray, matches
+                               ; workbench.bas's own desktop color
+WM_BEVEL_LIGHT equ 0xFFFFFF
+WM_BEVEL_DARK  equ 0x000000
 WM_CLOSE_FG    equ 0x000000
 
 basix_wm_dragging:    dq 0     ; task ptr currently being title-bar-
@@ -1431,6 +1449,73 @@ wm_fb_fill_rect:
     pop rdx
     pop rcx
     pop rax
+    ret
+
+; -------------------------------------------------------------------------
+; wm_fb_bevel_rect: RCX=x0, RDX=y0, R8=w, R9=h, R10d=fill color. Fills
+; the rect (via wm_fb_fill_rect), then outlines it with the real
+; Workbench 2.0+ "3D look": a 1px WM_BEVEL_LIGHT line along the top and
+; left edges, WM_BEVEL_DARK along the bottom and right -- reads as a
+; raised/embossed surface. Used for every gadget box and the window
+; frame itself; nowhere in real 2.04 chrome is there a gradient, only
+; this one flat-fill-plus-bevel-pair convention repeated everywhere.
+; -------------------------------------------------------------------------
+; Note: wm_fb_fill_rect preserves RCX/RDX/R8/R9 across its own call
+; (see its own push/pop list) -- but only if THIS function doesn't
+; overwrite them itself first. Each edge below needs a DIFFERENT w/h
+; (the true w or h for one dimension, a flat 1 for the other), so x0/
+; y0/w/h are reloaded from the stack before every single edge rather
+; than threaded through registers across calls. R10 (color) is never
+; preserved by wm_fb_fill_rect, but every call below sets it fresh
+; anyway.
+wm_fb_bevel_rect:
+    push rcx
+    push rdx
+    push r8
+    push r9
+
+    call wm_fb_fill_rect                ; fill, using the original args
+
+    ; top edge: (x0, y0, w, WM_EDGE)
+    mov rcx, [rsp+24]
+    mov rdx, [rsp+16]
+    mov r8, [rsp+8]
+    mov r9d, WM_EDGE
+    mov r10d, WM_BEVEL_LIGHT
+    call wm_fb_fill_rect
+
+    ; left edge: (x0, y0, WM_EDGE, h)
+    mov rcx, [rsp+24]
+    mov rdx, [rsp+16]
+    mov r8d, WM_EDGE
+    mov r9, [rsp+0]
+    mov r10d, WM_BEVEL_LIGHT
+    call wm_fb_fill_rect
+
+    ; bottom edge: (x0, y0+h-WM_EDGE, w, WM_EDGE)
+    mov rcx, [rsp+24]
+    mov edx, [rsp+16]
+    add edx, [rsp+0]
+    sub edx, WM_EDGE
+    mov r8, [rsp+8]
+    mov r9d, WM_EDGE
+    mov r10d, WM_BEVEL_DARK
+    call wm_fb_fill_rect
+
+    ; right edge: (x0+w-WM_EDGE, y0, WM_EDGE, h)
+    mov ecx, [rsp+24]
+    add ecx, [rsp+8]
+    sub ecx, WM_EDGE
+    mov rdx, [rsp+16]
+    mov r8d, WM_EDGE
+    mov r9, [rsp+0]
+    mov r10d, WM_BEVEL_DARK
+    call wm_fb_fill_rect
+
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
     ret
 
 ; -------------------------------------------------------------------------
@@ -1954,7 +2039,28 @@ compositor_task:
     cmp dword [r15+TCB_WIN_W], 0
     je .chrome_next
 
-    ; Title bar background.
+    ; Outer frame: one raised bevel (see wm_fb_bevel_rect) around the
+    ; whole window -- title bar and client area together -- filled
+    ; gray. The title bar's own flat blue fill (next) draws right over
+    ; this frame's top edge, which is fine: the title bar's own
+    ; bottom edge, where it meets the gray client area, already reads
+    ; as a clear boundary on its own. Left/right/bottom stay visible
+    ; as the window's raised outline.
+    mov ecx, [r15+TCB_WIN_X]
+    sub ecx, WM_BORDER
+    mov edx, [r15+TCB_WIN_Y]
+    sub edx, WM_TITLE_H
+    sub edx, WM_BORDER
+    mov r8d, [r15+TCB_WIN_W]
+    add r8d, WM_BORDER*2
+    mov r9d, [r15+TCB_WIN_H]
+    add r9d, WM_TITLE_H
+    add r9d, WM_BORDER*2
+    mov r10d, WM_BODY_BG
+    call wm_fb_bevel_rect
+
+    ; Title bar background -- flat, no bevel (real 2.04 chrome never
+    ; puts a bevel on the title bar itself, only on gadgets/frames).
     mov ecx, [r15+TCB_WIN_X]
     sub ecx, WM_BORDER
     mov edx, [r15+TCB_WIN_Y]
@@ -1975,7 +2081,7 @@ compositor_task:
     mov r9d, WM_TITLE_FG
     call wm_fb_draw_title
 
-    ; Close gadget.
+    ; Close gadget -- its own small raised bevel box.
     mov ecx, [r15+TCB_WIN_X]
     sub ecx, WM_BORDER
     add ecx, [r15+TCB_WIN_W]
@@ -1987,44 +2093,8 @@ compositor_task:
     add edx, 3
     mov r8d, WM_CLOSE_SIZE
     mov r9d, WM_CLOSE_SIZE
-    mov r10d, WM_CLOSE_BG
-    call wm_fb_fill_rect
-
-    ; Border: left, right, bottom (the title bar above already covers
-    ; the top edge).
-    mov ecx, [r15+TCB_WIN_X]
-    sub ecx, WM_BORDER
-    mov edx, [r15+TCB_WIN_Y]
-    sub edx, WM_TITLE_H
-    sub edx, WM_BORDER
-    mov r8d, WM_BORDER
-    mov r9d, [r15+TCB_WIN_H]
-    add r9d, WM_TITLE_H
-    add r9d, WM_BORDER*2
-    mov r10d, WM_BORDER_COL
-    call wm_fb_fill_rect            ; left
-
-    mov ecx, [r15+TCB_WIN_X]
-    add ecx, [r15+TCB_WIN_W]
-    mov edx, [r15+TCB_WIN_Y]
-    sub edx, WM_TITLE_H
-    sub edx, WM_BORDER
-    mov r8d, WM_BORDER
-    mov r9d, [r15+TCB_WIN_H]
-    add r9d, WM_TITLE_H
-    add r9d, WM_BORDER*2
-    mov r10d, WM_BORDER_COL
-    call wm_fb_fill_rect            ; right
-
-    mov ecx, [r15+TCB_WIN_X]
-    sub ecx, WM_BORDER
-    mov edx, [r15+TCB_WIN_Y]
-    add edx, [r15+TCB_WIN_H]
-    mov r8d, [r15+TCB_WIN_W]
-    add r8d, WM_BORDER*2
-    mov r9d, WM_BORDER
-    mov r10d, WM_BORDER_COL
-    call wm_fb_fill_rect            ; bottom
+    mov r10d, WM_BODY_BG
+    call wm_fb_bevel_rect
 
 .chrome_next:
     mov eax, [rel basix_comp_idx]

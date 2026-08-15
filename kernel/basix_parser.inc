@@ -1697,6 +1697,14 @@ basix_parse_primary:
     je .do_dirnamechar
     cmp eax, TOK_WINCLOSE
     je .do_winclose
+    cmp eax, TOK_WBBLUE
+    je .do_wbblue
+    cmp eax, TOK_WBGRAY
+    je .do_wbgray
+    cmp eax, TOK_WBLIGHT
+    je .do_wblight
+    cmp eax, TOK_WBDARK
+    je .do_wbdark
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
@@ -1855,6 +1863,30 @@ basix_parse_primary:
 .do_winclose:
     call basix_lex_next                  ; bare keyword, no parens/args
     lea rcx, [rel basix_rt_winclose]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_wbblue:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_wbblue]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_wbgray:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_wbgray]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_wblight:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_wblight]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_wbdark:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_wbdark]
     call basix_emit_call_to
     xor r11d, r11d                       ; result type = int
     ret

@@ -144,7 +144,23 @@ TCB_WIN_TITLE       equ 132   ; 32 bytes, not NUL-terminated -- length
                                ; is TCB_WIN_TITLE_LEN, same convention
                                ; as every other BASIX64 name buffer
 TCB_WIN_CLOSE_REQ   equ 164
-TCB_SIZE            equ 168
+; R1-flicker fix: drawing primitives (CLS/RECT/DRAWTEXT/etc, via
+; basix_mark_dirty) now accumulate into these PENDING fields instead of
+; TCB_DIRTY_* directly. TCB_DIRTY_* is only updated -- unioned in, in
+; case the compositor hasn't consumed a still-outstanding previous
+; dirty rect yet -- by basix_rt_flip, at the END of a program's frame.
+; Before this, the compositor (an independent, preemptively-scheduled
+; task) could observe TCB_DIRTY_VALID go 1 the instant the FIRST draw
+; call of a frame ran (e.g. right after CLS, before any text/shapes
+; were drawn) and blit that half-drawn buffer -- the exact
+; "flickers between grey and content" symptom this fixes. Same
+; [X0,Y0)-[X1,Y1) exclusive-upper-bound convention as TCB_DIRTY_*.
+TCB_PEND_X0         equ 168
+TCB_PEND_Y0         equ 172
+TCB_PEND_X1         equ 176
+TCB_PEND_Y1         equ 180
+TCB_PEND_VALID      equ 184
+TCB_SIZE            equ 188
 
 TCB_STATE_ALIVE      equ 0
 TCB_STATE_TERMINATED equ 1
@@ -338,6 +354,7 @@ task_create:
     mov dword [rbx+TCB_WIN_H], 0
     mov dword [rbx+TCB_WIN_TITLE_LEN], 0
     mov dword [rbx+TCB_WIN_CLOSE_REQ], 0
+    mov dword [rbx+TCB_PEND_VALID], 0
 
     mov rax, rbx
     jmp .out

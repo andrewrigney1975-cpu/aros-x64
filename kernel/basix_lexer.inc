@@ -167,6 +167,16 @@ TOK_DRAWCHAR   equ 125
 ; KEYHIT above.
 TOK_WINCLOSE   equ 126
 
+; Single-source-of-truth UI palette: WBBLUE/WBGRAY return the SAME
+; packed color the kernel's own chrome uses for title bars/window
+; bodies (WM_TITLE_BG/WM_BODY_BG, kernel.asm) -- bare-keyword functions
+; like WINCLOSE above, so a program never has to hardcode a literal
+; that can drift out of sync with the kernel's own chrome palette.
+TOK_WBBLUE     equ 127
+TOK_WBGRAY     equ 128
+TOK_WBLIGHT    equ 129
+TOK_WBDARK     equ 130
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -1312,5 +1322,21 @@ basix_keywords:
     db 8
     dd TOK_WINCLOSE
     db 'WINCLOSE', 0,0,0,0,0,0,0,0
+
+    db 6
+    dd TOK_WBBLUE
+    db 'WBBLUE', 0,0,0,0,0,0,0,0,0,0
+
+    db 6
+    dd TOK_WBGRAY
+    db 'WBGRAY', 0,0,0,0,0,0,0,0,0,0
+
+    db 7
+    dd TOK_WBLIGHT
+    db 'WBLIGHT', 0,0,0,0,0,0,0,0,0
+
+    db 6
+    dd TOK_WBDARK
+    db 'WBDARK', 0,0,0,0,0,0,0,0,0,0
 
     db 0                                 ; end of table

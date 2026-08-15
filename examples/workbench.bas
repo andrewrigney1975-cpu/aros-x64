@@ -377,10 +377,10 @@ WHILE 1
   LET prevBtn = btn
 
   ' ---- Redraw ----
-  CLS 11184810
+  CLS WBGRAY
 
-  RECT 0, 0, sw, 20, 8947660
-  RECT 0, 18, sw, 2, 0
+  RECT 0, 0, sw, 20, WBBLUE
+  RECT 0, 20, sw, 2, WBDARK
   DRAWTEXT 6, 3, "arOS-X64 Workbench", 16777215
 
   LET diskLoaded = LOADPNG(diskIconName, 12)
@@ -407,10 +407,20 @@ WHILE 1
   ENDIF
 
   IF winOpen = 1 THEN
-    RECT winX, winY, winW, winH, 11184810
-    RECT winX, winY, winW, titleH, 8947660
-    RECT winX, winY, winW, 1, 16777215
-    RECT winX, winY + titleH - 1, winW, 1, 0
+    ' Raised 2px bevel frame around the whole window (body + title bar
+    ' together) -- same "flat fill, light top/left, dark bottom/right"
+    ' convention as the kernel's own wm_fb_bevel_rect (kernel.asm), so
+    ' this hand-drawn window reads identically to a kernel-drawn one.
+    ' The title bar's own flat fill (next) draws right over this
+    ' frame's top edge on purpose -- its own bottom edge, where it
+    ' meets the gray body, is already a clear boundary on its own.
+    RECT winX, winY, winW, winH, WBGRAY
+    RECT winX, winY, winW, 2, WBLIGHT
+    RECT winX, winY, 2, winH, WBLIGHT
+    RECT winX, winY + winH - 2, winW, 2, WBDARK
+    RECT winX + winW - 2, winY, 2, winH, WBDARK
+
+    RECT winX, winY, winW, titleH, WBBLUE
     DRAWTEXT winX + 6, winY + 2, "AROSTEST", 16777215
 
     LET closeLoaded = LOADPNG(closeIconName, 13)

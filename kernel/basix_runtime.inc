@@ -208,11 +208,15 @@ basix_rt_newline:
 ; basix_mark_dirty: ECX=x0, EDX=y0, R8D=x1, R9D=y1 (exclusive upper
 ; bounds, screen/back-buffer pixel coordinates -- NOT clipped or
 ; validated here, callers pass whatever they already clipped to their
-; own back buffer). Unions this rect into current_task's own dirty
-; bounds (TCB_DIRTY_*, sched.inc) -- the compositor task reads these
-; to blit only the changed region of a task's back buffer instead of
-; the whole thing every pass. No-op before the scheduler is armed
-; (current_task==0) -- nothing composites yet at that point anyway.
+; own back buffer). Unions this rect into current_task's own PENDING
+; bounds (TCB_PEND_*, sched.inc) -- NOT the compositor-visible
+; TCB_DIRTY_* fields directly. basix_rt_flip is what commits pending
+; into TCB_DIRTY_* at the end of a frame -- see its own comment for
+; why: the compositor is an independent, preemptively-scheduled task
+; that could otherwise observe (and blit) a half-drawn buffer the
+; instant the FIRST draw call of a multi-call frame ran. No-op before
+; the scheduler is armed (current_task==0) -- nothing composites yet
+; at that point anyway.
 ; -------------------------------------------------------------------------
 basix_mark_dirty:
     push rax
@@ -222,35 +226,35 @@ basix_mark_dirty:
     test rbx, rbx
     jz .out
 
-    cmp dword [rbx+TCB_DIRTY_VALID], 0
+    cmp dword [rbx+TCB_PEND_VALID], 0
     jne .union
-    mov [rbx+TCB_DIRTY_X0], ecx
-    mov [rbx+TCB_DIRTY_Y0], edx
-    mov [rbx+TCB_DIRTY_X1], r8d
-    mov [rbx+TCB_DIRTY_Y1], r9d
-    mov dword [rbx+TCB_DIRTY_VALID], 1
+    mov [rbx+TCB_PEND_X0], ecx
+    mov [rbx+TCB_PEND_Y0], edx
+    mov [rbx+TCB_PEND_X1], r8d
+    mov [rbx+TCB_PEND_Y1], r9d
+    mov dword [rbx+TCB_PEND_VALID], 1
     jmp .out
 
 .union:
-    mov eax, [rbx+TCB_DIRTY_X0]
+    mov eax, [rbx+TCB_PEND_X0]
     cmp ecx, eax
     jge .x0_ok
-    mov [rbx+TCB_DIRTY_X0], ecx
+    mov [rbx+TCB_PEND_X0], ecx
 .x0_ok:
-    mov eax, [rbx+TCB_DIRTY_Y0]
+    mov eax, [rbx+TCB_PEND_Y0]
     cmp edx, eax
     jge .y0_ok
-    mov [rbx+TCB_DIRTY_Y0], edx
+    mov [rbx+TCB_PEND_Y0], edx
 .y0_ok:
-    mov eax, [rbx+TCB_DIRTY_X1]
+    mov eax, [rbx+TCB_PEND_X1]
     cmp r8d, eax
     jle .x1_ok
-    mov [rbx+TCB_DIRTY_X1], r8d
+    mov [rbx+TCB_PEND_X1], r8d
 .x1_ok:
-    mov eax, [rbx+TCB_DIRTY_Y1]
+    mov eax, [rbx+TCB_PEND_Y1]
     cmp r9d, eax
     jle .out
-    mov [rbx+TCB_DIRTY_Y1], r9d
+    mov [rbx+TCB_PEND_Y1], r9d
 
 .out:
     pop rbx
@@ -576,13 +580,70 @@ basix_rt_rect:
 ; presentation from any one program's own draw calls is the actual
 ; point of R1.
 ;
-; Kept as a real (if now-empty) entry point rather than deleted so
-; every existing .bas program's "draw a frame, then FLIP" structure
-; keeps compiling and running unchanged -- FLIP simply has nothing left
-; to do that basix_mark_dirty (called from within RECT/PSET/LINE/etc.
-; as they draw) and the compositor haven't already handled.
+; FLIP is where the frame becomes visible to the compositor: every
+; draw call so far (CLS/RECT/DRAWTEXT/etc) only accumulated into
+; current_task's PENDING rect (TCB_PEND_*, via basix_mark_dirty) --
+; here that pending rect is committed into the compositor-visible
+; TCB_DIRTY_* rect (unioned with whatever the compositor hasn't
+; consumed yet, rather than overwritten, so a not-yet-picked-up prior
+; frame's changed region doesn't get silently dropped), and pending is
+; cleared. Without this commit step, the compositor -- an independent,
+; preemptively-scheduled task -- could observe TCB_DIRTY_VALID go 1
+; the instant a frame's FIRST draw call ran (e.g. right after CLS,
+; before any of that frame's text/shapes were drawn) and blit that
+; half-drawn buffer straight to the screen: exactly the "flickers
+; between plain background and content" symptom this fixes.
 ; -------------------------------------------------------------------------
 basix_rt_flip:
+    push rax
+    push rbx
+
+    mov rbx, [rel current_task]
+    test rbx, rbx
+    jz .out
+    cmp dword [rbx+TCB_PEND_VALID], 0
+    je .out
+
+    cmp dword [rbx+TCB_DIRTY_VALID], 0
+    jne .union
+    mov eax, [rbx+TCB_PEND_X0]
+    mov [rbx+TCB_DIRTY_X0], eax
+    mov eax, [rbx+TCB_PEND_Y0]
+    mov [rbx+TCB_DIRTY_Y0], eax
+    mov eax, [rbx+TCB_PEND_X1]
+    mov [rbx+TCB_DIRTY_X1], eax
+    mov eax, [rbx+TCB_PEND_Y1]
+    mov [rbx+TCB_DIRTY_Y1], eax
+    mov dword [rbx+TCB_DIRTY_VALID], 1
+    jmp .clear_pending
+
+.union:
+    mov eax, [rbx+TCB_PEND_X0]
+    cmp eax, [rbx+TCB_DIRTY_X0]
+    jge .x0_ok
+    mov [rbx+TCB_DIRTY_X0], eax
+.x0_ok:
+    mov eax, [rbx+TCB_PEND_Y0]
+    cmp eax, [rbx+TCB_DIRTY_Y0]
+    jge .y0_ok
+    mov [rbx+TCB_DIRTY_Y0], eax
+.y0_ok:
+    mov eax, [rbx+TCB_PEND_X1]
+    cmp eax, [rbx+TCB_DIRTY_X1]
+    jle .x1_ok
+    mov [rbx+TCB_DIRTY_X1], eax
+.x1_ok:
+    mov eax, [rbx+TCB_PEND_Y1]
+    cmp eax, [rbx+TCB_DIRTY_Y1]
+    jle .clear_pending
+    mov [rbx+TCB_DIRTY_Y1], eax
+
+.clear_pending:
+    mov dword [rbx+TCB_PEND_VALID], 0
+
+.out:
+    pop rbx
+    pop rax
     ret
 
 ; -------------------------------------------------------------------------
@@ -1505,6 +1566,36 @@ basix_rt_screenh:
     mov eax, [rbx+FB_HEIGHT]
 .out:
     pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; basix_rt_wbblue / basix_rt_wbgray: no arguments. Return RAX = the
+; SAME packed-pixel color values the kernel's own window chrome uses
+; (WM_TITLE_BG/WM_BODY_BG, kernel.asm) -- a single source of truth so
+; a BASIX64 program's own hand-drawn UI (Workbench's top status bar
+; and its internal window, workbench.bas) can match the kernel-drawn
+; title bars/borders around LAUNCHed windows exactly, instead of each
+; independently hardcoding a decimal color literal that can silently
+; drift out of sync the next time one side's palette gets touched (as
+; happened once already: workbench.bas's own top bar kept the OLD
+; chrome blue after R4's chrome polish pass changed the kernel's own
+; WM_TITLE_BG to a more accurate sample of real Workbench 2.04's title
+; bar color). Prefer these over a raw literal in any new GUI program.
+; -------------------------------------------------------------------------
+basix_rt_wbblue:
+    mov eax, WM_TITLE_BG
+    ret
+
+basix_rt_wbgray:
+    mov eax, WM_BODY_BG
+    ret
+
+basix_rt_wblight:
+    mov eax, WM_BEVEL_LIGHT
+    ret
+
+basix_rt_wbdark:
+    mov eax, WM_BEVEL_DARK
     ret
 
 ; -------------------------------------------------------------------------
