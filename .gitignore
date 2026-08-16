@@ -6,3 +6,4 @@ debug.log
 disk/NvVars
 testdata/*.vhd
 testdata/*.img
+FUTURE-WORK.md
