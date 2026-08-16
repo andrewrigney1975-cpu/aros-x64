@@ -1415,6 +1415,21 @@ basix_zorder_remove:
     pop rax
     ret
 
+; -------------------------------------------------------------------------
+; basix_zorder_bring_front: RCX = task ptr already present somewhere in
+; the z-order. Moves it to the front (topmost, keyboard-focused) --
+; real click-to-focus, see wm_tick's own comment on when this gets
+; called. Just basix_zorder_remove followed by basix_zorder_push_front
+; on the same task: remove already preserves RCX across its own call
+; (pushed/popped internally, same as every other register it uses as
+; scratch) and re-derives a temporary focus/order that push_front then
+; correctly overrides, so no extra bookkeeping is needed here.
+; -------------------------------------------------------------------------
+basix_zorder_bring_front:
+    call basix_zorder_remove
+    call basix_zorder_push_front
+    ret
+
 basix_zorder: times BASIX_ZORDER_MAX dq 0
 basix_zorder_count: dd 0
 
@@ -2267,20 +2282,31 @@ wm_fb_draw_title:
     ret
 
 ; -------------------------------------------------------------------------
-; wm_tick: called once per compositor pass, before compositing. Only
-; the frontmost windowed task (z-order[count-1], if count > 1 -- index
-; 0 is always main, which never has a window) has interactive chrome:
+; wm_tick: called once per compositor pass, before compositing. Every
+; windowed task (index 0/main never has a window) is click-to-focus
+; interactive, not just the frontmost one:
 ; -------------------------------------------------------------------------
-; - Left button pressed down inside its title bar (excluding the close
-;   gadget) starts a drag; held, moves the window (updates TCB_WIN_X/Y
-;   to track the mouse, offset by where inside the title bar the drag
-;   started); released, ends it.
-; - Left button pressed down on its close gadget sets TCB_WIN_CLOSE_REQ
-;   -- cooperative, not a forced kill (see basix_rt_winclose).
-; A drag that actually moved the window sets basix_wm_force_full for
-; this pass, so compositor_task's own dirty-rect union (which only
-; ever reflects what a task itself drew) doesn't miss the OLD window
-; position -- something needs to repaint over wherever it used to be.
+; - A fresh left-button-down anywhere inside a window's full rect
+;   (title bar, body, or the scrollbar strips -- same widened bounds
+;   the compositor's own outer frame uses) brings THAT window to the
+;   front of the z-order and gives it keyboard focus (see
+;   basix_zorder_bring_front), if it wasn't already frontmost. The
+;   z-order is scanned front-to-back so an occluded window behind
+;   whatever's on top never steals a click meant for the visible one.
+; - THEN, on that same click and using the now-focused window's own
+;   geometry: left button down inside its title bar (excluding the
+;   close gadget) starts a drag; held, moves the window (updates
+;   TCB_WIN_X/Y to track the mouse, offset by where inside the title
+;   bar the drag started); released, ends it. Left button down on its
+;   close gadget sets TCB_WIN_CLOSE_REQ instead -- cooperative, not a
+;   forced kill (see basix_rt_winclose). A click anywhere else in the
+;   window (its body/content, or the not-yet-interactive scrollbar
+;   area) just focuses it, no drag or close.
+; A drag that actually moved the window, or any click that reordered
+; the z-order, sets basix_wm_force_full for this pass, so
+; compositor_task's own dirty-rect union (which only ever reflects
+; what a task itself drew) doesn't miss whatever's now exposed behind
+; the window's OLD position/stacking order.
 ; -------------------------------------------------------------------------
 wm_tick:
     push rax
@@ -2297,10 +2323,6 @@ wm_tick:
     mov eax, [rel basix_zorder_count]
     cmp eax, 1
     jle .no_front                       ; only main -- nothing windowed
-    dec eax
-    mov r12, [rel basix_zorder + rax*8] ; r12 = frontmost windowed task
-    test r12, r12
-    jz .no_front
 
     mov eax, [rel mouse_x]
     mov edx, [rel mouse_y]
@@ -2344,6 +2366,70 @@ wm_tick:
     jz .out
     test dword [rel basix_wm_prev_btn], 1
     jnz .out                            ; already was down last pass
+
+    ; Real click-to-focus: scan the z-order FRONT to back (skip index
+    ; 0/main, which is never windowed) for the topmost window whose
+    ; full chrome+content rect -- including the scrollbar strips, same
+    ; widened bounds the compositor's own outer frame uses -- contains
+    ; this click. First (topmost) match wins, matching what's actually
+    ; visible on screen; a window further back that happens to overlap
+    ; the same point is occluded and shouldn't steal the click.
+    mov r9d, [rel basix_zorder_count]
+    dec r9d
+.focus_scan:
+    cmp r9d, 0
+    jle .no_hit
+    mov r8, [rel basix_zorder + r9*8]
+    test r8, r8
+    jz .focus_scan_next
+    cmp dword [r8+TCB_WIN_W], 0
+    je .focus_scan_next
+
+    mov r10d, [r8+TCB_WIN_X]
+    sub r10d, WM_BORDER
+    cmp eax, r10d
+    jl .focus_scan_next
+    mov r11d, [r8+TCB_WIN_W]
+    add r11d, WM_BORDER*2
+    add r11d, WM_SCROLLBAR_W
+    add r11d, r10d
+    cmp eax, r11d
+    jge .focus_scan_next
+    mov r11d, [r8+TCB_WIN_Y]
+    sub r11d, WM_TITLE_H
+    sub r11d, WM_BORDER
+    cmp edx, r11d
+    jl .focus_scan_next
+    mov r10d, [r8+TCB_WIN_H]
+    add r10d, WM_TITLE_H
+    add r10d, WM_BORDER*2
+    add r10d, WM_SCROLLBAR_W
+    add r10d, r11d
+    cmp edx, r10d
+    jge .focus_scan_next
+    jmp .hit
+.focus_scan_next:
+    dec r9d
+    jmp .focus_scan
+.no_hit:
+    jmp .out
+
+.hit:
+    ; r8 = the window under the click. Bring it to front (z-order +
+    ; keyboard focus both, see basix_zorder_bring_front) if it isn't
+    ; already, BEFORE the close-gadget/drag hit-tests below -- so
+    ; clicking a background window's own close gadget or title bar
+    ; both focuses it AND performs that action in the same click, the
+    ; way real window managers do, instead of needing a second click
+    ; once it's already frontmost.
+    mov ecx, [rel basix_zorder_count]
+    dec ecx
+    cmp [rel basix_zorder + rcx*8], r8
+    je .already_front
+    mov rcx, r8
+    call basix_zorder_bring_front
+.already_front:
+    mov r12, r8
 
     ; Compute this window's title bar + close gadget rects.
     mov r9d, [r12+TCB_WIN_X]
@@ -2815,6 +2901,22 @@ compositor_task:
     ; for these; content_blit below still only touches the unwidened
     ; TCB_WIN_W/H area, so a program's own drawing never overlaps
     ; them.
+    ; Active/inactive gadget-background color: the focused (== frontmost,
+    ; per the kernel-wide "topmost == focused" invariant -- see R2's own
+    ; comment) window's scrollbar track/arrow/resize backgrounds fill
+    ; with the same blue as its own title bar; every other window's
+    ; fill gray, same as the rest of its chrome. Computed once here into
+    ; r12d (untouched by every wm_fb_* call below -- same reasoning as
+    ; r13d just above) and reused for every fill in this whole block;
+    ; the glyphs/bevel edges drawn on top stay their own fixed colors
+    ; regardless (only the flat background actually changes).
+    xor r12d, r12d
+    mov r12d, WM_BODY_BG
+    cmp r15, [rel basix_kbd_focus_task]
+    jne .scrollbar_bg_ready
+    mov r12d, WM_TITLE_BG
+.scrollbar_bg_ready:
+
     mov eax, [r15+TCB_WIN_X]
     add eax, [r15+TCB_WIN_W]            ; eax = content's right edge
                                          ; (screen x) -- where the
@@ -2836,7 +2938,7 @@ compositor_task:
     mov edx, [r15+TCB_WIN_Y]
     mov r8d, WM_SCROLLBAR_W
     mov r9d, [r15+TCB_WIN_H]
-    mov r10d, WM_BODY_BG
+    mov r10d, r12d
     call wm_fb_fill_rect
 
     ; Up arrow gadget (top of vertical bar).
@@ -2844,7 +2946,7 @@ compositor_task:
     mov edx, [r15+TCB_WIN_Y]
     mov r8d, WM_SCROLLBAR_W
     mov r9d, WM_SCROLLBAR_W
-    mov r10d, WM_BODY_BG
+    mov r10d, r12d
     call wm_fb_bevel_rect
     mov r10d, WM_BEVEL_DARK
     call wm_fb_draw_arrow_up
@@ -2856,7 +2958,7 @@ compositor_task:
     sub edx, WM_SCROLLBAR_W
     mov r8d, WM_SCROLLBAR_W
     mov r9d, WM_SCROLLBAR_W
-    mov r10d, WM_BODY_BG
+    mov r10d, r12d
     call wm_fb_bevel_rect
     mov r10d, WM_BEVEL_DARK
     call wm_fb_draw_arrow_down
@@ -2882,7 +2984,7 @@ compositor_task:
     mov r8d, WM_SCROLLBAR_W
     sub r8d, 4
     mov r9d, 32
-    mov r10d, WM_BODY_BG
+    mov r10d, r12d
     call wm_fb_bevel_rect_inset
 
     ; Horizontal scrollbar track (full content width).
@@ -2890,7 +2992,7 @@ compositor_task:
     mov edx, r13d
     mov r8d, [r15+TCB_WIN_W]
     mov r9d, WM_SCROLLBAR_W
-    mov r10d, WM_BODY_BG
+    mov r10d, r12d
     call wm_fb_fill_rect
 
     ; Left arrow gadget.
@@ -2898,7 +3000,7 @@ compositor_task:
     mov edx, r13d
     mov r8d, WM_SCROLLBAR_W
     mov r9d, WM_SCROLLBAR_W
-    mov r10d, WM_BODY_BG
+    mov r10d, r12d
     call wm_fb_bevel_rect
     mov r10d, WM_BEVEL_DARK
     call wm_fb_draw_arrow_left
@@ -2910,7 +3012,7 @@ compositor_task:
     mov edx, r13d
     mov r8d, WM_SCROLLBAR_W
     mov r9d, WM_SCROLLBAR_W
-    mov r10d, WM_BODY_BG
+    mov r10d, r12d
     call wm_fb_bevel_rect
     mov r10d, WM_BEVEL_DARK
     call wm_fb_draw_arrow_right
@@ -2936,7 +3038,7 @@ compositor_task:
     mov r8d, 32
     mov r9d, WM_SCROLLBAR_W
     sub r9d, 4
-    mov r10d, WM_BODY_BG
+    mov r10d, r12d
     call wm_fb_bevel_rect_inset
 
     ; Resize gadget -- corner box where the two scrollbars meet, with
@@ -2946,7 +3048,7 @@ compositor_task:
     mov edx, r13d
     mov r8d, WM_SCROLLBAR_W
     mov r9d, WM_SCROLLBAR_W
-    mov r10d, WM_BODY_BG
+    mov r10d, r12d
     call wm_fb_bevel_rect
     mov ecx, eax
     add ecx, 4
