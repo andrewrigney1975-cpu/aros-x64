@@ -2354,11 +2354,21 @@ wm_tick:
     mov r11d, [r12+TCB_WIN_W]
     add r11d, WM_BORDER*2               ; title_w
 
-    ; Close gadget: top-right corner of the title bar.
+    ; Close gadget: top-right corner of the title bar. Must match the
+    ; compositor's own drawn position exactly (see the close gadget
+    ; draw block, kernel.asm) -- close_x0 there is
+    ; TCB_WIN_X+TCB_WIN_W+WM_SCROLLBAR_W-WM_CLOSE_SIZE, and r9d+r11d
+    ; here is (TCB_WIN_X-WM_BORDER)+(TCB_WIN_W+WM_BORDER*2) =
+    ; TCB_WIN_X+TCB_WIN_W+WM_BORDER, so -WM_BORDER converts one to the
+    ; other. A stale copy of this hit-test (still using the OLD drawn
+    ; position, from before the scrollbar-width widening) is exactly
+    ; what silently broke clicking the close gadget after that change
+    ; -- the drawn X moved right but this rect didn't move with it.
     mov r8d, r9d
     add r8d, r11d
-    sub r8d, WM_CLOSE_SIZE
-    sub r8d, 3                          ; close_x0
+    sub r8d, WM_BORDER
+    add r8d, WM_SCROLLBAR_W
+    sub r8d, WM_CLOSE_SIZE               ; close_x0
     cmp eax, r8d
     jl .not_close
     mov ecx, r8d
@@ -2375,11 +2385,17 @@ wm_tick:
     jmp .out
 
 .not_close:
-    ; Anywhere else in the title bar starts a drag.
+    ; Anywhere else in the title bar starts a drag. Right bound
+    ; extended by WM_SCROLLBAR_W same as the close gadget's own
+    ; position above -- the title bar is drawn that far now (it meets
+    ; the close gadget in the true widened-frame corner), so the drag
+    ; region should cover the same visual strip instead of leaving a
+    ; thin non-draggable gap just left of the close gadget.
     cmp eax, r9d
     jl .out
     mov ecx, r9d
     add ecx, r11d
+    add ecx, WM_SCROLLBAR_W
     cmp eax, ecx
     jge .out
     cmp edx, r10d

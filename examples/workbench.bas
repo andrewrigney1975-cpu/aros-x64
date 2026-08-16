@@ -154,7 +154,7 @@ WHILE 1
 
     RECT 0, 0, sw, 20, WBBLUE
     RECT 0, 20, sw, 2, WBDARK
-    DRAWTEXT 6, 3, "arOS-X64 Workbench", 16777215
+    DRAWTEXT 6, 3, "arOS64X Desktop", 16777215
 
     LET diskLoaded = LOADPNG(diskIconName, 12)
     IF diskLoaded = 1 THEN
