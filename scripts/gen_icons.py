@@ -154,6 +154,24 @@ def gen_file_axb(w=40, h=28):
     im.save(os.path.join(OUT, "icon_axb.png"))
 
 
+def gen_file_terminal(w=40, h=28):
+    """TERMINAL.BAS -- a dedicated icon by exact filename (not just
+    .BAS extension, see filebrowser.bas's own entType comment), so it
+    reads as a distinct first-class app rather than an ordinary script:
+    a small black terminal screen with a green ">_" prompt glyph, set
+    into the same document silhouette every other file icon uses."""
+    im, d = new_icon(w, h)
+    x0, y0, x1, y1 = file_outline(d, w, h)
+    GREEN = (0, 200, 0)
+    d.rectangle([x0 + 3, y0 + 5, x1 - 4, y1 - 5], fill=BLACK, outline=BLACK)
+    d.line([x0 + 3, y0 + 5, x1 - 4, y0 + 5], fill=HILITE)
+    d.line([x0 + 3, y0 + 5, x0 + 3, y1 - 5], fill=HILITE)
+    d.line([x0 + 6, y0 + 10, x0 + 10, y0 + 14], fill=GREEN, width=2)
+    d.line([x0 + 6, y0 + 18, x0 + 10, y0 + 14], fill=GREEN, width=2)
+    d.line([x0 + 12, y0 + 18, x0 + 18, y0 + 18], fill=GREEN, width=2)
+    im.save(os.path.join(OUT, "icon_terminal.png"))
+
+
 def gen_close_gadget(w=12, h=12):
     im, d = new_icon(w, h)
     bevel_rect(d, 0, 0, w - 1, h - 1, WHITE)
@@ -169,5 +187,6 @@ gen_file_txt()
 gen_file_bas()
 gen_file_png()
 gen_file_axb()
+gen_file_terminal()
 gen_close_gadget()
-print("Wrote icon_disk/folder/file/txt/bas/png/axb/close.png to", OUT)
+print("Wrote icon_disk/folder/file/txt/bas/png/axb/terminal/close.png to", OUT)

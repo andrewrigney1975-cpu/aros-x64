@@ -6561,6 +6561,20 @@ shell_main:
     lea rcx, [rel msg_shell_banner]
     call console_puts
 
+    ; The GUI now opens by default once boot/self-test is complete,
+    ; instead of always dropping straight to the interactive text
+    ; prompt -- reuses the exact same path the "gui" shell command
+    ; itself dispatches through (shell_str_gui, already a NUL-
+    ; terminated "gui" string), so this is just "run the gui command
+    ; once at startup," not a separate GUI-launch implementation to
+    ; keep in sync. When workbench.bas eventually exits (there's no
+    ; way to do that today short of a future close/logout action),
+    ; .do_gui's own cleanup already falls through cleanly into the
+    ; ordinary prompt loop below -- the text shell is still there as
+    ; a fallback, just no longer the first thing shown.
+    lea rcx, [rel shell_str_gui]
+    call shell_dispatch
+
 .prompt:
     call sched_reap_zombies              ; free any tasks that ended since last prompt
 

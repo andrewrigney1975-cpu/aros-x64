@@ -49,7 +49,12 @@ DIM entNameLen(40) AS INTEGER
 ' each re-deriving it from the raw name characters independently (the
 ' exact "two places doing the same classification" pattern that's
 ' caused real drift bugs elsewhere in this codebase before).
-' 0=other/unclassified file, 1=folder, 2=.BAS, 3=.PNG, 4=.AXB, 5=.TXT
+' 0=other/unclassified file, 1=folder, 2=.BAS, 3=.PNG, 4=.AXB, 5=.TXT,
+' 6=TERMINAL.BAS specifically (an exact-filename match checked AFTER
+' the generic .BAS extension check, so it overrides that -- TERMINAL
+' is a real first-class app, not just another script to open in the
+' editor like an ordinary .BAS double-click does, so it needs its own
+' icon AND its own double-click dispatch, see both below).
 DIM entType(40) AS INTEGER
 DIM nameBuf(32) AS INTEGER
 DIM editorProgName(16) AS INTEGER
@@ -60,6 +65,8 @@ DIM txtIconName(16) AS INTEGER
 DIM basIconName(16) AS INTEGER
 DIM pngIconName(16) AS INTEGER
 DIM axbIconName(16) AS INTEGER
+DIM terminalIconName(16) AS INTEGER
+DIM termNameUC(12) AS INTEGER
 
 GOTO START
 
@@ -123,6 +130,23 @@ RESCAN:
             ENDIF
             ENDIF
           ENDIF
+        ENDIF
+
+        ' TERMINAL.BAS by exact name, checked (and so able to
+        ' override) AFTER the generic .BAS check above -- see
+        ' entType's own comment.
+        IF nlen = 12 THEN
+          LET tmI = 0
+          LET tmMatch = 1
+          WHILE tmI < 12
+            LET tmC = entChars[entCount * 32 + tmI]
+            IF tmC >= 97 THEN
+            IF tmC <= 122 THEN LET tmC = tmC - 32
+            ENDIF
+            IF tmC <> termNameUC[tmI] THEN LET tmMatch = 0
+            LET tmI = tmI + 1
+          WEND
+          IF tmMatch = 1 THEN LET entType[entCount] = 6
         ENDIF
       ENDIF
 
@@ -243,6 +267,37 @@ LET axbIconName[8] = 80
 LET axbIconName[9] = 78
 LET axbIconName[10] = 71
 
+LET terminalIconName[0] = 73
+LET terminalIconName[1] = 67
+LET terminalIconName[2] = 79
+LET terminalIconName[3] = 78
+LET terminalIconName[4] = 84
+LET terminalIconName[5] = 69
+LET terminalIconName[6] = 82
+LET terminalIconName[7] = 77
+LET terminalIconName[8] = 46
+LET terminalIconName[9] = 80
+LET terminalIconName[10] = 78
+LET terminalIconName[11] = 71
+
+' "TERMINAL.BAS" uppercased, for RESCAN's exact-filename check (see
+' entType's own comment) -- populated here, before the first GOSUB
+' RESCAN below, since DIM'd arrays start zeroed and RESCAN runs before
+' any of this file's OWN code after it would otherwise get a chance to
+' fill this in.
+LET termNameUC[0] = 84
+LET termNameUC[1] = 69
+LET termNameUC[2] = 82
+LET termNameUC[3] = 77
+LET termNameUC[4] = 73
+LET termNameUC[5] = 78
+LET termNameUC[6] = 65
+LET termNameUC[7] = 76
+LET termNameUC[8] = 46
+LET termNameUC[9] = 66
+LET termNameUC[10] = 65
+LET termNameUC[11] = 83
+
 ' Own client-area size (SCREENW/SCREENH already return a windowed
 ' task's own client size, not the real screen's -- see basix_rt_screenw
 ' /basix_rt_screenh, basix_runtime.inc).
@@ -357,6 +412,10 @@ WHILE 1
                 IF entType[ei] = 2 THEN LAUNCH editorProgName, 11, nameBuf, entNameLen[ei]
                 IF entType[ei] = 3 THEN LAUNCH viewerProgName, 11, nameBuf, entNameLen[ei]
                 IF entType[ei] = 4 THEN LAUNCH nameBuf, entNameLen[ei], nameBuf, 0
+                ' TERMINAL.BAS is a real app -- LAUNCH it directly
+                ' (same as .AXB above), not opened in the editor the
+                ' way an ordinary .BAS double-click is (entType=2).
+                IF entType[ei] = 6 THEN LAUNCH nameBuf, entNameLen[ei], nameBuf, 0
               ENDIF
             ENDIF
           ENDIF
@@ -430,7 +489,7 @@ WHILE 1
   ' corruption) at the same time.
   LET passType = 1
   LET passNum = 0
-  WHILE passNum < 6
+  WHILE passNum < 7
     PNGLOCK
     LET iconLoaded = 0
     IF passType = 1 THEN LET iconLoaded = LOADPNG(folderIconName, 14)
@@ -438,6 +497,7 @@ WHILE 1
     IF passType = 3 THEN LET iconLoaded = LOADPNG(pngIconName, 11)
     IF passType = 4 THEN LET iconLoaded = LOADPNG(axbIconName, 11)
     IF passType = 5 THEN LET iconLoaded = LOADPNG(txtIconName, 11)
+    IF passType = 6 THEN LET iconLoaded = LOADPNG(terminalIconName, 12)
     IF passType = 0 THEN LET iconLoaded = LOADPNG(fileIconName, 12)
 
     LET ei = 0
@@ -479,7 +539,7 @@ WHILE 1
     PNGUNLOCK
 
     LET passType = passType + 1
-    IF passType > 5 THEN LET passType = 0
+    IF passType > 6 THEN LET passType = 0
     LET passNum = passNum + 1
   WEND
 
