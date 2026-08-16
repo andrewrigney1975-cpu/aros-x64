@@ -1471,6 +1471,17 @@ WM_BEVEL_LIGHT equ 0xFFFFFF
 WM_BEVEL_DARK  equ 0x000000
 WM_CLOSE_FG    equ 0x000000
 
+WM_SCROLLBAR_W equ 16   ; scrollbar track/arrow-gadget/resize-gadget
+                         ; thickness, px -- matches WM_CLOSE_SIZE so
+                         ; every chrome gadget in this window system
+                         ; reads as the same size. Purely decorative
+                         ; for now (see the scrollbar/resize-gadget
+                         ; draw block below, right before content_blit)
+                         ; -- no scroll or resize behavior wired up
+                         ; yet, just the real Workbench 2.04 visual
+                         ; elements (arrow gadgets, track, thumb,
+                         ; corner resize gadget) on every open window.
+
 basix_wm_dragging:    dq 0     ; task ptr currently being title-bar-
                                 ; dragged, or 0
 basix_wm_drag_off_x:  dd 0
@@ -1621,6 +1632,390 @@ wm_fb_bevel_rect:
     mov r10d, WM_BEVEL_DARK
     call wm_fb_fill_rect
 
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; wm_fb_bevel_rect_inset: same args/fill as wm_fb_bevel_rect, but with
+; light/dark edges swapped (dark top/left, light bottom/right) --
+; reads as pressed-in rather than raised. Used for the scrollbar
+; thumbs (see the scrollbar draw block below): a raised bevel there
+; would look like another gadget button, but a real Workbench thumb
+; sits inside the sunken track, not on top of it.
+; -------------------------------------------------------------------------
+wm_fb_bevel_rect_inset:
+    push rcx
+    push rdx
+    push r8
+    push r9
+
+    call wm_fb_fill_rect                ; fill, using the original args
+
+    ; top edge: (x0, y0, w, WM_EDGE)
+    mov rcx, [rsp+24]
+    mov rdx, [rsp+16]
+    mov r8, [rsp+8]
+    mov r9d, WM_EDGE
+    mov r10d, WM_BEVEL_DARK
+    call wm_fb_fill_rect
+
+    ; left edge: (x0, y0, WM_EDGE, h)
+    mov rcx, [rsp+24]
+    mov rdx, [rsp+16]
+    mov r8d, WM_EDGE
+    mov r9, [rsp+0]
+    mov r10d, WM_BEVEL_DARK
+    call wm_fb_fill_rect
+
+    ; bottom edge: (x0, y0+h-WM_EDGE, w, WM_EDGE)
+    mov rcx, [rsp+24]
+    mov edx, [rsp+16]
+    add edx, [rsp+0]
+    sub edx, WM_EDGE
+    mov r8, [rsp+8]
+    mov r9d, WM_EDGE
+    mov r10d, WM_BEVEL_LIGHT
+    call wm_fb_fill_rect
+
+    ; right edge: (x0+w-WM_EDGE, y0, WM_EDGE, h)
+    mov ecx, [rsp+24]
+    add ecx, [rsp+8]
+    sub ecx, WM_EDGE
+    mov rdx, [rsp+16]
+    mov r8d, WM_EDGE
+    mov r9, [rsp+0]
+    mov r10d, WM_BEVEL_LIGHT
+    call wm_fb_fill_rect
+
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; wm_fb_outline_rect: RCX=x0, RDX=y0, R8=w, R9=h, R10D=color. Draws a
+; 1px unfilled rectangle outline (no interior fill, unlike
+; wm_fb_bevel_rect) -- used to mark the scrollbar track boundaries
+; (see the scrollbar draw block below) so the area a thumb can move
+; within reads as a distinct groove rather than blending into the
+; surrounding gray gadget-box fill.
+; -------------------------------------------------------------------------
+wm_fb_outline_rect:
+    push rcx
+    push rdx
+    push r8
+    push r9
+
+    ; top edge: (x0, y0, w, 1)
+    mov rcx, [rsp+24]
+    mov rdx, [rsp+16]
+    mov r8, [rsp+8]
+    mov r9d, 1
+    call wm_fb_fill_rect
+
+    ; bottom edge: (x0, y0+h-1, w, 1)
+    mov rcx, [rsp+24]
+    mov edx, [rsp+16]
+    add edx, [rsp+0]
+    sub edx, 1
+    mov r8, [rsp+8]
+    mov r9d, 1
+    call wm_fb_fill_rect
+
+    ; left edge: (x0, y0, 1, h)
+    mov rcx, [rsp+24]
+    mov rdx, [rsp+16]
+    mov r8d, 1
+    mov r9, [rsp+0]
+    call wm_fb_fill_rect
+
+    ; right edge: (x0+w-1, y0, 1, h)
+    mov ecx, [rsp+24]
+    add ecx, [rsp+8]
+    sub ecx, 1
+    mov rdx, [rsp+16]
+    mov r8d, 1
+    mov r9, [rsp+0]
+    call wm_fb_fill_rect
+
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    ret
+
+; -------------------------------------------------------------------------
+; wm_fb_draw_arrow_{up,down,left,right}: RCX=box x0, RDX=box y0, R10D=
+; color. Draws a small solid triangle glyph inside a WM_SCROLLBAR_W
+; (16px) square box, via four hardcoded RECT strips rather than a
+; generic per-row loop -- the box size is a fixed constant, so there's
+; no real variability to handle generically, and four literal strips
+; is far less to get wrong than a parameterized triangle rasterizer.
+; Used for the four scrollbar arrow gadgets below (purely decorative,
+; matching real Workbench 2.04's caret glyphs -- no scroll behavior).
+; -------------------------------------------------------------------------
+; Each of the four uses rbx=box x0, r14=box y0, r15=color -- all three
+; are callee-saved by wm_fb_fill_rect (see its own push/pop list), so
+; they survive every one of the four calls below untouched with no
+; per-call save/restore needed, unlike r8/r9/r10 (fill_rect's own
+; w/h/color args), which it's free to clobber as scratch internally.
+; -------------------------------------------------------------------------
+; Real bug found and fixed here (worth remembering if this ever needs
+; touching again): each of these originally stashed "box x0" in EBX
+; before calling wm_fb_fill_rect -- but RBX must stay boot_info*
+; everywhere in this compositor (see wm_fb_fill_rect's own "RBX must
+; be boot_info*" doc comment; it dereferences [rbx+FB_WIDTH] etc.).
+; Overwriting it with a small window-coordinate value made every
+; fill_rect call inside these functions read FB_WIDTH/HEIGHT/STRIDE/
+; BASE through a bogus pointer -- no crash (the address happened to be
+; mapped), just silently wrong/empty clip bounds, so the arrow gadget
+; BOXES rendered fine (drawn by the CALLER, which still had a valid
+; RBX) while the glyphs inside them never appeared at all. Confirmed
+; via byte-for-byte verification of the compiled call site and
+; function prologue (both correct) before finding this. Fixed by
+; using r13 for box x0 instead -- untouched by wm_fb_fill_rect (see
+; its own push list), same as r14/r15 already used here for box y0
+; and color.
+; -------------------------------------------------------------------------
+wm_fb_draw_arrow_up:
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r13
+    push r14
+    push r15
+    mov r13d, ecx                       ; box x0
+    mov r14d, edx                       ; box y0
+    mov r15d, r10d                      ; color
+
+    mov ecx, r13d
+    add ecx, 7
+    mov edx, r14d
+    add edx, 4
+    mov r8d, 2
+    mov r9d, 2
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    mov ecx, r13d
+    add ecx, 6
+    mov edx, r14d
+    add edx, 6
+    mov r8d, 4
+    mov r9d, 2
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    mov ecx, r13d
+    add ecx, 5
+    mov edx, r14d
+    add edx, 8
+    mov r8d, 6
+    mov r9d, 2
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    mov ecx, r13d
+    add ecx, 4
+    mov edx, r14d
+    add edx, 10
+    mov r8d, 8
+    mov r9d, 2
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    pop r15
+    pop r14
+    pop r13
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    ret
+
+; Same footprint as wm_fb_draw_arrow_up (8x8, margin 4 in the 16x16
+; box) so up/down glyphs read the same size as the left/right ones --
+; an earlier version used a flatter 8x4 footprint for up/down only,
+; which looked visibly smaller/squatter next to left/right's 8x8 (real
+; Workbench 2.04's caret glyphs are the same size in every direction).
+wm_fb_draw_arrow_down:
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r13
+    push r14
+    push r15
+    mov r13d, ecx
+    mov r14d, edx
+    mov r15d, r10d
+
+    mov ecx, r13d
+    add ecx, 4
+    mov edx, r14d
+    add edx, 4
+    mov r8d, 8
+    mov r9d, 2
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    mov ecx, r13d
+    add ecx, 5
+    mov edx, r14d
+    add edx, 6
+    mov r8d, 6
+    mov r9d, 2
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    mov ecx, r13d
+    add ecx, 6
+    mov edx, r14d
+    add edx, 8
+    mov r8d, 4
+    mov r9d, 2
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    mov ecx, r13d
+    add ecx, 7
+    mov edx, r14d
+    add edx, 10
+    mov r8d, 2
+    mov r9d, 2
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    pop r15
+    pop r14
+    pop r13
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    ret
+
+wm_fb_draw_arrow_left:
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r13
+    push r14
+    push r15
+    mov r13d, ecx
+    mov r14d, edx
+    mov r15d, r10d
+
+    mov ecx, r13d
+    add ecx, 4
+    mov edx, r14d
+    add edx, 7
+    mov r8d, 2
+    mov r9d, 2
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    mov ecx, r13d
+    add ecx, 6
+    mov edx, r14d
+    add edx, 6
+    mov r8d, 2
+    mov r9d, 4
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    mov ecx, r13d
+    add ecx, 8
+    mov edx, r14d
+    add edx, 5
+    mov r8d, 2
+    mov r9d, 6
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    mov ecx, r13d
+    add ecx, 10
+    mov edx, r14d
+    add edx, 4
+    mov r8d, 2
+    mov r9d, 8
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    pop r15
+    pop r14
+    pop r13
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    ret
+
+wm_fb_draw_arrow_right:
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r13
+    push r14
+    push r15
+    mov r13d, ecx
+    mov r14d, edx
+    mov r15d, r10d
+
+    mov ecx, r13d
+    add ecx, 4
+    mov edx, r14d
+    add edx, 4
+    mov r8d, 2
+    mov r9d, 8
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    mov ecx, r13d
+    add ecx, 6
+    mov edx, r14d
+    add edx, 5
+    mov r8d, 2
+    mov r9d, 6
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    mov ecx, r13d
+    add ecx, 8
+    mov edx, r14d
+    add edx, 6
+    mov r8d, 2
+    mov r9d, 4
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    mov ecx, r13d
+    add ecx, 10
+    mov edx, r14d
+    add edx, 7
+    mov r8d, 2
+    mov r9d, 2
+    mov r10d, r15d
+    call wm_fb_fill_rect
+
+    pop r15
+    pop r14
+    pop r13
+    pop r10
     pop r9
     pop r8
     pop rdx
@@ -2283,9 +2678,13 @@ compositor_task:
     sub edx, WM_BORDER
     mov r8d, [r15+TCB_WIN_W]
     add r8d, WM_BORDER*2
+    add r8d, WM_SCROLLBAR_W             ; room for the right-edge
+                                         ; vertical scrollbar strip
     mov r9d, [r15+TCB_WIN_H]
     add r9d, WM_TITLE_H
     add r9d, WM_BORDER*2
+    add r9d, WM_SCROLLBAR_W             ; room for the bottom-edge
+                                         ; horizontal scrollbar strip
     mov r10d, WM_BODY_BG
     call wm_fb_bevel_rect
 
@@ -2308,6 +2707,17 @@ compositor_task:
     mov r8d, [r15+TCB_WIN_W]
     add r8d, WM_BORDER*2
     sub r8d, WM_EDGE*2
+    add r8d, WM_SCROLLBAR_W             ; span the full widened frame
+                                         ; (see the outer-frame comment
+                                         ; above) -- without this the
+                                         ; title bar stopped short of
+                                         ; the frame's true right edge,
+                                         ; leaving a gray notch there
+                                         ; with the close gadget (still
+                                         ; positioned off the OLD,
+                                         ; unwidened edge) sitting to
+                                         ; its left instead of in the
+                                         ; actual top-right corner.
     mov r9d, WM_TITLE_H
     sub r9d, WM_EDGE
     mov r10d, WM_TITLE_BG
@@ -2322,6 +2732,7 @@ compositor_task:
     ; WM_TITLE_TEXT_MARGIN's own comment).
     mov rcx, r15
     mov edx, [r15+TCB_WIN_X]
+    add edx, 4
     mov r8d, [r15+TCB_WIN_Y]
     sub r8d, WM_TITLE_H
     sub r8d, WM_BORDER
@@ -2338,8 +2749,18 @@ compositor_task:
     sub ecx, WM_BORDER
     add ecx, [r15+TCB_WIN_W]
     add ecx, WM_BORDER
-    sub ecx, WM_CLOSE_SIZE
-    sub ecx, 3
+    add ecx, WM_SCROLLBAR_W             ; same widened-frame fix as the
+                                         ; title bar fill above -- the
+                                         ; close gadget belongs in the
+                                         ; TRUE top-right corner
+    sub ecx, WM_CLOSE_SIZE               ; no extra right-margin trim
+                                         ; here anymore -- WM_CLOSE_SIZE
+                                         ; == WM_SCROLLBAR_W, so this
+                                         ; now lines the close gadget's
+                                         ; own left edge up exactly
+                                         ; with the vertical scrollbar
+                                         ; arrow gadgets' left edge
+                                         ; below it, per request
     mov edx, [r15+TCB_WIN_Y]
     sub edx, WM_TITLE_H
     sub edx, WM_BORDER
@@ -2368,6 +2789,165 @@ compositor_task:
     mov r10d, edx
     mov r11d, WM_CLOSE_FG
     call wm_fb_draw_glyph
+
+    ; Scrollbars + resize gadget -- real Workbench 2.04 visual elements
+    ; on every open window (right-edge vertical bar, bottom-edge
+    ; horizontal bar, corner resize gadget where they meet), but purely
+    ; decorative for now: no scroll or resize behavior wired up to
+    ; them yet, just the graphics. The outer frame above was already
+    ; widened by WM_SCROLLBAR_W on the right and bottom to make room
+    ; for these; content_blit below still only touches the unwidened
+    ; TCB_WIN_W/H area, so a program's own drawing never overlaps
+    ; them.
+    mov eax, [r15+TCB_WIN_X]
+    add eax, [r15+TCB_WIN_W]            ; eax = content's right edge
+                                         ; (screen x) -- where the
+                                         ; vertical scrollbar starts
+    mov r13d, [r15+TCB_WIN_Y]
+    add r13d, [r15+TCB_WIN_H]           ; r13d = content's bottom edge
+                                         ; (screen y) -- where the
+                                         ; horizontal scrollbar starts.
+                                         ; NOT rbx: every wm_fb_* call
+                                         ; below requires RBX to still
+                                         ; be boot_info* (see their own
+                                         ; "RBX must be boot_info*"
+                                         ; doc comments) -- r13 is
+                                         ; untouched by all of them.
+
+    ; Vertical scrollbar track (full content height, behind the arrow
+    ; gadgets -- they're drawn on top right after).
+    mov ecx, eax
+    mov edx, [r15+TCB_WIN_Y]
+    mov r8d, WM_SCROLLBAR_W
+    mov r9d, [r15+TCB_WIN_H]
+    mov r10d, WM_BODY_BG
+    call wm_fb_fill_rect
+
+    ; Up arrow gadget (top of vertical bar).
+    mov ecx, eax
+    mov edx, [r15+TCB_WIN_Y]
+    mov r8d, WM_SCROLLBAR_W
+    mov r9d, WM_SCROLLBAR_W
+    mov r10d, WM_BODY_BG
+    call wm_fb_bevel_rect
+    mov r10d, WM_BEVEL_DARK
+    call wm_fb_draw_arrow_up
+
+    ; Down arrow gadget (bottom of vertical bar).
+    mov ecx, eax
+    mov edx, [r15+TCB_WIN_Y]
+    add edx, [r15+TCB_WIN_H]
+    sub edx, WM_SCROLLBAR_W
+    mov r8d, WM_SCROLLBAR_W
+    mov r9d, WM_SCROLLBAR_W
+    mov r10d, WM_BODY_BG
+    call wm_fb_bevel_rect
+    mov r10d, WM_BEVEL_DARK
+    call wm_fb_draw_arrow_down
+
+    ; Vertical track outline -- marks the groove the thumb (drawn
+    ; next) travels within, between the two arrow gadgets.
+    mov ecx, eax
+    mov edx, [r15+TCB_WIN_Y]
+    add edx, WM_SCROLLBAR_W
+    mov r8d, WM_SCROLLBAR_W
+    mov r9d, [r15+TCB_WIN_H]
+    sub r9d, WM_SCROLLBAR_W*2
+    mov r10d, WM_BEVEL_LIGHT
+    call wm_fb_outline_rect
+
+    ; Vertical thumb -- static (no real scroll position yet), placed a
+    ; short way below the up arrow.
+    mov ecx, eax
+    add ecx, 2
+    mov edx, [r15+TCB_WIN_Y]
+    add edx, WM_SCROLLBAR_W
+    add edx, 6
+    mov r8d, WM_SCROLLBAR_W
+    sub r8d, 4
+    mov r9d, 32
+    mov r10d, WM_BODY_BG
+    call wm_fb_bevel_rect_inset
+
+    ; Horizontal scrollbar track (full content width).
+    mov ecx, [r15+TCB_WIN_X]
+    mov edx, r13d
+    mov r8d, [r15+TCB_WIN_W]
+    mov r9d, WM_SCROLLBAR_W
+    mov r10d, WM_BODY_BG
+    call wm_fb_fill_rect
+
+    ; Left arrow gadget.
+    mov ecx, [r15+TCB_WIN_X]
+    mov edx, r13d
+    mov r8d, WM_SCROLLBAR_W
+    mov r9d, WM_SCROLLBAR_W
+    mov r10d, WM_BODY_BG
+    call wm_fb_bevel_rect
+    mov r10d, WM_BEVEL_DARK
+    call wm_fb_draw_arrow_left
+
+    ; Right arrow gadget.
+    mov ecx, [r15+TCB_WIN_X]
+    add ecx, [r15+TCB_WIN_W]
+    sub ecx, WM_SCROLLBAR_W
+    mov edx, r13d
+    mov r8d, WM_SCROLLBAR_W
+    mov r9d, WM_SCROLLBAR_W
+    mov r10d, WM_BODY_BG
+    call wm_fb_bevel_rect
+    mov r10d, WM_BEVEL_DARK
+    call wm_fb_draw_arrow_right
+
+    ; Horizontal track outline -- same as the vertical one above, the
+    ; groove between the two arrow gadgets.
+    mov ecx, [r15+TCB_WIN_X]
+    add ecx, WM_SCROLLBAR_W
+    mov edx, r13d
+    mov r8d, [r15+TCB_WIN_W]
+    sub r8d, WM_SCROLLBAR_W*2
+    mov r9d, WM_SCROLLBAR_W
+    mov r10d, WM_BEVEL_LIGHT
+    call wm_fb_outline_rect
+
+    ; Horizontal thumb -- static, placed a short way right of the left
+    ; arrow.
+    mov ecx, [r15+TCB_WIN_X]
+    add ecx, WM_SCROLLBAR_W
+    add ecx, 6
+    mov edx, r13d
+    add edx, 2
+    mov r8d, 32
+    mov r9d, WM_SCROLLBAR_W
+    sub r9d, 4
+    mov r10d, WM_BODY_BG
+    call wm_fb_bevel_rect_inset
+
+    ; Resize gadget -- corner box where the two scrollbars meet, with
+    ; a couple of short ridge lines suggesting a grip (purely
+    ; decorative, same as everything else in this block).
+    mov ecx, eax
+    mov edx, r13d
+    mov r8d, WM_SCROLLBAR_W
+    mov r9d, WM_SCROLLBAR_W
+    mov r10d, WM_BODY_BG
+    call wm_fb_bevel_rect
+    mov ecx, eax
+    add ecx, 4
+    mov edx, r13d
+    add edx, 10
+    mov r8d, 8
+    mov r9d, 1
+    mov r10d, WM_BEVEL_DARK
+    call wm_fb_fill_rect
+    mov ecx, eax
+    add ecx, 4
+    mov edx, r13d
+    add edx, 6
+    mov r8d, 8
+    mov r9d, 1
+    mov r10d, WM_BEVEL_DARK
+    call wm_fb_fill_rect
 
     ; Content blit -- this entry's own current back buffer, straight
     ; over whatever chrome (just above, if any) drew. Runs for EVERY
