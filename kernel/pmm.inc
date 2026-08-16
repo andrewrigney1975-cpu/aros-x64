@@ -40,6 +40,17 @@ EFI_BOOT_SERVICES_CODE  equ 3
 EFI_BOOT_SERVICES_DATA  equ 4
 EFI_CONVENTIONAL_MEMORY equ 7
 
+; Live page counters, kept O(1)-updated at every alloc/free rather than
+; rescanning the 4MB bitmap on demand -- pmm_total_pages is the total
+; frame count ever handed to the allocator as usable (set once, during
+; pmm_init's free-range pass over the UEFI memory map); pmm_used_pages
+; tracks currently-allocated frames, incremented in pmm_alloc_page's
+; success path and decremented in pmm_free_page's. Used by the
+; RAMUSEDKB/RAMTOTALKB BASIX64 keywords (basix_runtime.inc) for
+; workbench.bas's desktop status line.
+pmm_total_pages: dd 0
+pmm_used_pages:  dd 0
+
 ; -------------------------------------------------------------------------
 ; pmm_init: RCX = boot_info pointer. Marks every tracked frame reserved,
 ; then frees the ones covered by usable-type regions in the memory map.
@@ -91,7 +102,11 @@ pmm_init:
     ; Frame 0 (physical address 0) is deliberately kept reserved even if
     ; the memory map says it's free: pmm_alloc_page returns 0 to signal
     ; "out of memory", so 0 must never also be a real, valid allocation.
+    ; This bypasses pmm_reserve_range (a single bit, not worth a call),
+    ; so it has to decrement pmm_total_pages itself too -- same
+    ; reasoning as pmm_reserve_range's own decrement just below.
     or byte [abs PMM_BITMAP_ADDR], 1
+    dec dword [rel pmm_total_pages]
 
     ; The bitmap's own backing memory must never be handed out, even
     ; though it likely sits inside a region the memory map calls free.
@@ -146,6 +161,10 @@ pmm_free_range:
     shl al, cl
     not al
     and [rdi+r8], al
+    inc dword [rel pmm_total_pages]     ; only caller is pmm_init's own
+                                         ; one-time free-range pass over
+                                         ; the UEFI memory map -- see
+                                         ; this global's own comment
     inc rsi
     jmp .loop
 
@@ -195,6 +214,11 @@ pmm_reserve_range:
     mov al, 1
     shl al, cl
     or [rdi+r8], al
+    dec dword [rel pmm_total_pages]     ; mirror of pmm_free_range's
+                                         ; increment -- both callers
+                                         ; (pmm_init) reserve frames
+                                         ; that were just freed moments
+                                         ; earlier in the same init pass
     inc rsi
     jmp .loop
 
@@ -241,6 +265,7 @@ pmm_alloc_page:
 
 .found:
     or byte [rdi+rbx], al                ; mark used
+    inc dword [rel pmm_used_pages]
     mov rax, rbx
     shl rax, 3
     add rax, rdx                          ; rax = frame index
@@ -279,6 +304,7 @@ pmm_free_page:
     not al
     mov rdi, PMM_BITMAP_ADDR
     and [rdi+rbx], al
+    dec dword [rel pmm_used_pages]
 .out:
     pop rdi
     pop rcx

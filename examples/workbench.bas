@@ -91,6 +91,8 @@ LET diskIconName[11] = 71
 LET sw = SCREENW
 LET sh = SCREENH
 
+DIM digitBuf(10) AS INTEGER
+
 LET iconX = 20
 LET iconY = 40
 LET iconW = 48
@@ -102,6 +104,39 @@ LET lastClickTime = 0
 LET DBLCLICK_TICKS = 40
 LET needsRedraw = 1
 
+GOTO START
+
+' ---- DRAWNUM: draws drawNumVal's decimal digits at (drawNumX,
+' drawNumY) in drawNumColor, left to right, and advances drawNumX past
+' the last digit (so callers can chain several DRAWNUM/DRAWTEXT calls
+' to build up one line, the way this codebase always builds "text"
+' with numbers in it -- no native string type or number-to-string
+' conversion, just char codes drawn directly). Extracts digits into
+' digitBuf in reverse (least-significant first, the only order
+' MOD 10/integer-divide naturally produce) then draws them back to
+' front. ----
+DRAWNUM:
+  LET dnCount = 0
+  LET dnTmp = drawNumVal
+  IF dnTmp = 0 THEN
+    LET digitBuf[0] = 48
+    LET dnCount = 1
+  ELSE
+    WHILE dnTmp > 0
+      LET digitBuf[dnCount] = 48 + (dnTmp MOD 10)
+      LET dnTmp = dnTmp / 10
+      LET dnCount = dnCount + 1
+    WEND
+  ENDIF
+  LET dnI = dnCount - 1
+  WHILE dnI >= 0
+    DRAWCHAR drawNumX, drawNumY, digitBuf[dnI], drawNumColor
+    LET drawNumX = drawNumX + 8
+    LET dnI = dnI - 1
+  WEND
+  RETURN
+
+START:
 WHILE 1
   IF KEYHIT THEN
     LET k = GETKEY
@@ -155,6 +190,21 @@ WHILE 1
     RECT 0, 0, sw, 20, WBBLUE
     RECT 0, 20, sw, 2, WBDARK
     DRAWTEXT 6, 3, "arOS64X Desktop", 16777215
+
+    ' RAM stat, real-Workbench style ("2013088 graphics mem  8212144
+    ' other mem") -- see DRAWNUM's own comment for why this is built
+    ' out of digit-draws and DRAWTEXT chained together instead of one
+    ' string.
+    LET drawNumX = 200
+    LET drawNumY = 3
+    LET drawNumColor = 16777215
+    LET drawNumVal = RAMUSEDKB
+    GOSUB DRAWNUM
+    DRAWTEXT drawNumX, drawNumY, "KB used of ", 16777215
+    LET drawNumX = drawNumX + 88
+    LET drawNumVal = RAMTOTALKB
+    GOSUB DRAWNUM
+    DRAWTEXT drawNumX, drawNumY, "KB total", 16777215
 
     LET diskLoaded = LOADPNG(diskIconName, 12)
     IF diskLoaded = 1 THEN

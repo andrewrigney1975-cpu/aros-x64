@@ -1713,6 +1713,10 @@ basix_parse_primary:
     je .do_winx
     cmp eax, TOK_WINY
     je .do_winy
+    cmp eax, TOK_RAMUSEDKB
+    je .do_ramusedkb
+    cmp eax, TOK_RAMTOTALKB
+    je .do_ramtotalkb
 
     mov dword [rel basix_compile_ok], 0
     call basix_lex_next
@@ -1919,6 +1923,18 @@ basix_parse_primary:
 .do_winy:
     call basix_lex_next                  ; bare keyword, no parens/args
     lea rcx, [rel basix_rt_winy]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_ramusedkb:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_ramusedkb]
+    call basix_emit_call_to
+    xor r11d, r11d                       ; result type = int
+    ret
+.do_ramtotalkb:
+    call basix_lex_next                  ; bare keyword, no parens/args
+    lea rcx, [rel basix_rt_ramtotalkb]
     call basix_emit_call_to
     xor r11d, r11d                       ; result type = int
     ret

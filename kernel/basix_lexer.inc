@@ -198,6 +198,12 @@ TOK_WINY       equ 134
 TOK_PNGLOCK    equ 135
 TOK_PNGUNLOCK  equ 136
 
+; RAMUSEDKB/RAMTOTALKB: bare-keyword functions (like WBBLUE etc above),
+; return pmm.inc's live page counters in KB -- see
+; basix_rt_ramusedkb/basix_rt_ramtotalkb's own comment.
+TOK_RAMUSEDKB  equ 137
+TOK_RAMTOTALKB equ 138
+
 ; -------------------------------------------------------------------------
 ; basix_is_digit: AL = char. Returns EAX=1/0.
 ; -------------------------------------------------------------------------
@@ -1383,5 +1389,13 @@ basix_keywords:
     db 9
     dd TOK_PNGUNLOCK
     db 'PNGUNLOCK', 0,0,0,0,0,0,0
+
+    db 9
+    dd TOK_RAMUSEDKB
+    db 'RAMUSEDKB', 0,0,0,0,0,0,0
+
+    db 10
+    dd TOK_RAMTOTALKB
+    db 'RAMTOTALKB', 0,0,0,0,0,0
 
     db 0                                 ; end of table

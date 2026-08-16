@@ -1653,6 +1653,24 @@ basix_rt_wbdark:
     ret
 
 ; -------------------------------------------------------------------------
+; basix_rt_ramusedkb / basix_rt_ramtotalkb: no arguments. Return RAX =
+; currently-allocated / total-manageable physical RAM in KB (pmm.inc's
+; pmm_used_pages/pmm_total_pages, each a 4KB-page count -- shift left
+; 2 for KB). Used by workbench.bas's desktop status line, matching
+; real Workbench's own top-bar memory readout (see the reference
+; screenshot this session's chrome work was modeled on).
+; -------------------------------------------------------------------------
+basix_rt_ramusedkb:
+    mov eax, [rel pmm_used_pages]
+    shl eax, 2
+    ret
+
+basix_rt_ramtotalkb:
+    mov eax, [rel pmm_total_pages]
+    shl eax, 2
+    ret
+
+; -------------------------------------------------------------------------
 ; basix_rt_wbtitleh / basix_rt_wbclosesz: geometry counterparts to the
 ; WBBLUE-style color constants above -- expose the kernel's own
 ; WM_TITLE_H/WM_CLOSE_SIZE so a hand-drawn window (workbench.bas) can
